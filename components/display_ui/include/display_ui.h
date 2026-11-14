@@ -31,6 +31,12 @@ typedef struct {
     uint8_t preset;
     uint8_t scene; // 0=A, 1=B, 2=C, 3=D
 
+    // Stage 04.3 snapshot amp editor.
+    bool amp_editing;
+    bool scene_amp_configured;
+    uint8_t scene_amp_type;
+    uint8_t amp_edit_candidate;
+
     ui_block_state_t fx1;
     ui_block_state_t fx2;
     ui_block_state_t amp;
