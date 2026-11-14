@@ -316,24 +316,47 @@ static void draw_main_value(const display_ui_state_t *s)
     }
 }
 
+static inline uint16_t rgb565_byte_swap(uint16_t v)
+{
+    return (uint16_t)((v << 8) | (v >> 8));
+}
+
+static void framebuffer_byte_swap(void)
+{
+    // ESP32 stores uint16_t in little-endian memory, while this ST7789
+    // module is proven with MSB-first RGB565 transfers (same behaviour
+    // as Adafruit_GFX/SPI_WRITE16). esp_lcd transmits the framebuffer
+    // as raw bytes, so swap each RGB565 word around the DMA transfer.
+    const size_t pixels = (size_t)LCD_WIDTH * LCD_HEIGHT;
+    for (size_t i = 0; i < pixels; ++i) {
+        s_fb[i] = rgb565_byte_swap(s_fb[i]);
+    }
+}
+
 static esp_err_t flush_framebuffer(void)
 {
     while (xSemaphoreTake(s_flush_done, 0) == pdTRUE) {
         // drain stale completion token
     }
 
+    framebuffer_byte_swap();
+
     esp_err_t rc = esp_lcd_panel_draw_bitmap(
         s_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, s_fb);
 
     if (rc != ESP_OK) {
+        framebuffer_byte_swap();
         return rc;
     }
 
     if (xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(250)) != pdTRUE) {
+        // DMA may still own the buffer after a timeout. Do not swap it
+        // back in that exceptional case.
         ESP_LOGW(TAG, "LCD flush timeout");
         return ESP_ERR_TIMEOUT;
     }
 
+    framebuffer_byte_swap();
     return ESP_OK;
 }
 
@@ -414,10 +437,10 @@ esp_err_t display_ui_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, false));
 
-    // This panel is RGB. With native esp_lcd the previous Arduino
-    // invertDisplay(true) setting produces inverted colors, so keep
-    // the panel in normal color mode here.
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, false));
+    // Match the proven Arduino configuration for this exact module:
+    // RGB order + display inversion enabled. RGB565 byte order is
+    // corrected in flush_framebuffer() before DMA transfer.
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     memset(s_fb, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
