@@ -64,3 +64,6 @@ Demo scenes are deliberately deterministic and send full ON/OFF states:
 | D Ambient | OFF | ON | ON | ON |
 
 These are only Stage 04 test scenes. Persistent user snapshots will be implemented later.
+
+
+CI target: ESP32-S3 / ESP-IDF v5.5.6.
