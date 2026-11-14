@@ -8,4 +8,5 @@ idf_component_register(
         esp_driver_gpio
         nanocore_midi
         display_ui
+        snapshots
 )
