@@ -67,3 +67,37 @@ These are only Stage 04 test scenes. Persistent user snapshots will be implement
 
 
 CI target: ESP32-S3 / ESP-IDF v5.5.6.
+
+
+## Stage 04.3 - Amp-only snapshot prototype
+
+Scene mode no longer assumes that FX2/Mod/Delay/Reverb define the scene.
+For the current prototype, each Scene A-D can store **only one Amp Type ID**.
+
+This is intentional: the controller does not label captures as Clean/Crunch/Lead/Metal.
+The user auditions the actual NanoCore/NAM order by ear and saves the ID they prefer.
+
+### Controls
+
+- PROGRAM: previous Scene and apply only its saved Amp Type.
+- STOP: next Scene and apply only its saved Amp Type.
+- ENC1 press: enter Amp Edit for the current Scene.
+- ENC1 turn: audition CC43 values 0-127.
+- ENC1 press again: save the current Amp Type ID to NVS.
+
+### Safety
+
+A Scene with no configured Amp does not transmit CC43 and leaves the NanoCore unchanged.
+Amp IDs are persistent across power cycles.
+
+### Snapshot model
+
+```text
+Scene A -> amp_type_id = optional
+Scene B -> amp_type_id = optional
+Scene C -> amp_type_id = optional
+Scene D -> amp_type_id = optional
+```
+
+Future snapshot fields will also be optional, allowing a snapshot to change only the Amp
+while leaving Cab, FX2, Mod, Delay, Reverb, EQ and all other state untouched.
