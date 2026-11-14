@@ -56,14 +56,27 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define NANOCORE_PRESET_MIN         0
 #define NANOCORE_PRESET_MAX        63
 
+#define CC_FX1_ONOFF               20
 #define CC_FX2_ONOFF               21
+#define CC_AMP_ONOFF               23
+#define CC_CAB_ONOFF               24
 #define CC_MOD_ONOFF               25
 #define CC_DELAY_ONOFF             26
 #define CC_REVERB_ONOFF            27
+#define CC_EQ_ONOFF                28
 
 #define BUTTON_POLL_MS             10
 #define BUTTON_DEBOUNCE_MS         35
 #define MODE_CHORD_HOLD_MS        700
+
+// Stage 04.1 scene transport tuning.
+// Previous 4 ms spacing was too aggressive for the real NANOCORE.
+// Absolute CC values are safe to repeat, so each scene action is sent
+// twice with a conservative gap.
+#define SCENE_RETRY_GAP_MS         25
+#define SCENE_ACTION_GAP_MS        45
+#define SCENE_PHASE_GAP_MS         80
+#define SCENE_FEEDBACK_WAIT_MS    140
 
 static bool s_target_found = false;
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
@@ -214,6 +227,45 @@ static bool conn_data_is_midi_io(const esp_ble_conn_data_t *d)
                   sizeof(d->uuid.uuid128)) == 0;
 }
 
+static ui_block_state_t block_state_from_midi_value(uint8_t value)
+{
+    return value >= 64 ? UI_BLOCK_ON : UI_BLOCK_OFF;
+}
+
+static bool apply_received_block_cc(uint8_t cc, uint8_t value)
+{
+    ui_block_state_t state = block_state_from_midi_value(value);
+
+    switch (cc) {
+    case CC_FX1_ONOFF:
+        s_ui.fx1 = state;
+        return true;
+    case CC_FX2_ONOFF:
+        s_ui.fx2 = state;
+        return true;
+    case CC_AMP_ONOFF:
+        s_ui.amp = state;
+        return true;
+    case CC_CAB_ONOFF:
+        s_ui.cab = state;
+        return true;
+    case CC_MOD_ONOFF:
+        s_ui.mod = state;
+        return true;
+    case CC_DELAY_ONOFF:
+        s_ui.delay = state;
+        return true;
+    case CC_REVERB_ONOFF:
+        s_ui.reverb = state;
+        return true;
+    case CC_EQ_ONOFF:
+        s_ui.eq = state;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void midi_rx_cb(const uint8_t *data, uint16_t len, void *user_ctx)
 {
     (void)user_ctx;
@@ -231,10 +283,38 @@ static void midi_evt_cb(uint16_t ts_ms,
         return;
     }
 
-    if (msg && msg_len > 0) {
-        ESP_LOGD(TAG, "MIDI RX decoded ts=%u len=%u", ts_ms, msg_len);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, msg_len, ESP_LOG_DEBUG);
+    if (!msg || msg_len == 0) {
+        return;
     }
+
+    const uint8_t status = msg[0] & 0xF0;
+
+    if (status == 0xB0 && msg_len >= 3) {
+        const uint8_t cc = msg[1] & 0x7F;
+        const uint8_t value = msg[2] & 0x7F;
+
+        ESP_LOGI(TAG,
+                 "MIDI FEEDBACK RX: CC%u=%u -> %s",
+                 cc,
+                 value,
+                 value >= 64 ? "ON/HIGH" : "OFF/LOW");
+
+        if (apply_received_block_cc(cc, value)) {
+            // Do not render from the BLE callback. Scene execution waits
+            // briefly for feedback and renders from the button task.
+        }
+        return;
+    }
+
+    if (status == 0xC0 && msg_len >= 2) {
+        ESP_LOGI(TAG, "MIDI FEEDBACK RX: Program Change %u",
+                 msg[1] & 0x7F);
+        return;
+    }
+
+    ESP_LOGI(TAG, "MIDI FEEDBACK RX: status=0x%02X len=%u",
+             msg[0], msg_len);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, msg_len, ESP_LOG_INFO);
 }
 
 static void subscribe_midi_notifications(uint16_t conn_handle)
@@ -384,6 +464,43 @@ static const demo_scene_t DEMO_SCENES[4] = {
     {false, true,  true,  true,  "AMBIENT"},
 };
 
+static ui_block_state_t pending_state(bool on)
+{
+    return on ? UI_BLOCK_PENDING_ON : UI_BLOCK_PENDING_OFF;
+}
+
+static esp_err_t send_scene_cc_reliable(uint8_t cc,
+                                        bool on,
+                                        const char *label)
+{
+    const uint8_t value = on ? 127 : 0;
+
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        esp_err_t rc = nanocore_midi_send_cc(
+            NANOCORE_MIDI_CHANNEL,
+            cc,
+            value);
+
+        if (rc != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "SCENE TX %s CC%u=%u attempt %d failed: %s",
+                     label, cc, value, attempt, esp_err_to_name(rc));
+            return rc;
+        }
+
+        ESP_LOGI(TAG,
+                 "SCENE TX %s CC%u=%u attempt %d/2",
+                 label, cc, value, attempt);
+
+        if (attempt == 1) {
+            vTaskDelay(pdMS_TO_TICKS(SCENE_RETRY_GAP_MS));
+        }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(SCENE_ACTION_GAP_MS));
+    return ESP_OK;
+}
+
 static void apply_demo_scene(uint8_t scene)
 {
     scene &= 0x03;
@@ -395,39 +512,68 @@ static void apply_demo_scene(uint8_t scene)
 
     const demo_scene_t *sc = &DEMO_SCENES[scene];
 
-    struct {
+    // A scene request is not the same thing as confirmed device state.
+    // Show ON?/OFF? until the NANOCORE sends matching MIDI feedback.
+    s_ui.scene = scene;
+    s_ui.fx2 = pending_state(sc->fx2);
+    s_ui.mod = pending_state(sc->mod);
+    s_ui.delay = pending_state(sc->delay);
+    s_ui.reverb = pending_state(sc->reverb);
+    render_ui();
+
+    typedef struct {
         uint8_t cc;
         bool on;
-    } actions[] = {
-        {CC_FX2_ONOFF, sc->fx2},
-        {CC_MOD_ONOFF, sc->mod},
-        {CC_DELAY_ONOFF, sc->delay},
-        {CC_REVERB_ONOFF, sc->reverb},
+        const char *label;
+    } scene_action_t;
+
+    const scene_action_t actions[] = {
+        {CC_FX2_ONOFF,    sc->fx2,    "FX2"},
+        {CC_MOD_ONOFF,    sc->mod,    "MOD"},
+        {CC_DELAY_ONOFF,  sc->delay,  "DELAY"},
+        {CC_REVERB_ONOFF, sc->reverb, "REVERB"},
     };
 
+    ESP_LOGI(TAG, "SCENE %c / %s: phase 1 OFF commands",
+             (char)('A' + scene), sc->name);
+
+    // First turn blocks OFF. This avoids rapid simultaneous bypass/enable
+    // transitions inside the NANOCORE DSP graph.
     for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
-        esp_err_t rc = nanocore_midi_send_cc(
-            NANOCORE_MIDI_CHANNEL,
-            actions[i].cc,
-            actions[i].on ? 127 : 0);
-
-        if (rc != ESP_OK) {
-            ESP_LOGE(TAG, "Scene action CC%u failed: %s",
-                     actions[i].cc, esp_err_to_name(rc));
-            return;
+        if (!actions[i].on) {
+            if (send_scene_cc_reliable(actions[i].cc,
+                                       false,
+                                       actions[i].label) != ESP_OK) {
+                ESP_LOGE(TAG, "Scene aborted during OFF phase");
+                render_ui();
+                return;
+            }
         }
-
-        // Avoid an unnecessary burst while we validate the transport.
-        vTaskDelay(pdMS_TO_TICKS(4));
     }
 
-    s_ui.scene = scene;
-    s_ui.fx2 = sc->fx2 ? UI_BLOCK_ON : UI_BLOCK_OFF;
-    s_ui.mod = sc->mod ? UI_BLOCK_ON : UI_BLOCK_OFF;
-    s_ui.delay = sc->delay ? UI_BLOCK_ON : UI_BLOCK_OFF;
-    s_ui.reverb = sc->reverb ? UI_BLOCK_ON : UI_BLOCK_OFF;
+    vTaskDelay(pdMS_TO_TICKS(SCENE_PHASE_GAP_MS));
 
-    ESP_LOGI(TAG, "SCENE %c / %s applied",
+    ESP_LOGI(TAG, "SCENE %c / %s: phase 2 ON commands",
+             (char)('A' + scene), sc->name);
+
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
+        if (actions[i].on) {
+            if (send_scene_cc_reliable(actions[i].cc,
+                                       true,
+                                       actions[i].label) != ESP_OK) {
+                ESP_LOGE(TAG, "Scene aborted during ON phase");
+                render_ui();
+                return;
+            }
+        }
+    }
+
+    // If the NANOCORE echoes/returns MIDI state, midi_evt_cb() converts
+    // matching pending states into confirmed ON/OFF during this window.
+    vTaskDelay(pdMS_TO_TICKS(SCENE_FEEDBACK_WAIT_MS));
+
+    ESP_LOGI(TAG,
+             "SCENE %c / %s commands sent. ON?/OFF? means unconfirmed.",
              (char)('A' + scene), sc->name);
 
     render_ui();
