@@ -231,6 +231,8 @@ static uint16_t block_color(ui_block_state_t state)
     switch (state) {
         case UI_BLOCK_ON: return C_GREEN;
         case UI_BLOCK_OFF: return C_RED;
+        case UI_BLOCK_PENDING_ON:
+        case UI_BLOCK_PENDING_OFF: return C_YELLOW;
         case UI_BLOCK_UNKNOWN:
         default: return C_MUTED;
     }
@@ -241,6 +243,8 @@ static const char *block_suffix(ui_block_state_t state)
     switch (state) {
         case UI_BLOCK_ON: return "ON";
         case UI_BLOCK_OFF: return "OFF";
+        case UI_BLOCK_PENDING_ON: return "ON?";
+        case UI_BLOCK_PENDING_OFF: return "OFF?";
         case UI_BLOCK_UNKNOWN:
         default: return "?";
     }
@@ -410,8 +414,10 @@ esp_err_t display_ui_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, false));
 
-    // Original board was proven with invertDisplay(true).
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    // This panel is RGB. With native esp_lcd the previous Arduino
+    // invertDisplay(true) setting produces inverted colors, so keep
+    // the panel in normal color mode here.
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     memset(s_fb, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
