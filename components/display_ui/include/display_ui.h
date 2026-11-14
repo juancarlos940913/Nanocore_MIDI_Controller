@@ -18,7 +18,9 @@ typedef enum {
 typedef enum {
     UI_BLOCK_UNKNOWN = 0,
     UI_BLOCK_OFF,
-    UI_BLOCK_ON
+    UI_BLOCK_ON,
+    UI_BLOCK_PENDING_OFF,
+    UI_BLOCK_PENDING_ON
 } ui_block_state_t;
 
 typedef struct {
