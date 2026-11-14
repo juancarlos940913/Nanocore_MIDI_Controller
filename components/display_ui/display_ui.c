@@ -278,7 +278,12 @@ static void draw_softkeys(ui_mode_t mode)
 
     draw_text(10, 214, left, C_WHITE, 1);
     draw_text(LCD_WIDTH - 10 - text_width(right, 1), 214, right, C_WHITE, 1);
-    draw_text_center(LCD_WIDTH / 2, 226, "HOLD BOTH: MODE", C_MUTED, 1);
+
+    if (mode == UI_MODE_SCENE) {
+        draw_text_center(LCD_WIDTH / 2, 226, "ENC1: AMP EDIT", C_MUTED, 1);
+    } else {
+        draw_text_center(LCD_WIDTH / 2, 226, "HOLD BOTH: MODE", C_MUTED, 1);
+    }
 }
 
 static void draw_header(const display_ui_state_t *s)
@@ -308,7 +313,21 @@ static void draw_main_value(const display_ui_state_t *s)
     if (s->mode == UI_MODE_SCENE) {
         char scene_letter = (char)('A' + (s->scene & 0x03));
         snprintf(buf, sizeof(buf), "SCENE %c", scene_letter);
-        draw_text_center(LCD_WIDTH / 2, 40, buf, C_ORANGE, 2);
+        draw_text_center(LCD_WIDTH / 2, 38, buf, C_ORANGE, 2);
+
+        if (s->amp_editing) {
+            snprintf(buf, sizeof(buf), "AMP ID %03u EDIT",
+                     s->amp_edit_candidate);
+            draw_text_center(LCD_WIDTH / 2, 64, buf, C_YELLOW, 1);
+        } else if (s->scene_amp_configured) {
+            snprintf(buf, sizeof(buf), "AMP ID %03u",
+                     s->scene_amp_type);
+            draw_text_center(LCD_WIDTH / 2, 64, buf, C_CYAN, 1);
+        } else {
+            draw_text_center(LCD_WIDTH / 2, 64,
+                             "AMP --  NOT SET",
+                             C_MUTED, 1);
+        }
     } else {
         snprintf(buf, sizeof(buf), "PC %02u", s->preset);
         draw_text_center(LCD_WIDTH / 2, 40, buf,
