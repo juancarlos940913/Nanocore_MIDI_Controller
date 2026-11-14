@@ -1,15 +1,17 @@
 /*
  * Nanocore MIDI Controller
- * Stage 01 - BLE Scan
+ * Stage 02 - BLE Connect + GATT discovery
  *
  * Goal:
- *   - Bring up ESP32-S3 as BLE Central using ESP-NimBLE.
- *   - Perform active BLE scanning.
- *   - Log advertiser name, address, RSSI and whether the standard
- *     BLE-MIDI service UUID is present.
- *   - DO NOT connect yet.
+ *   - Scan as BLE Central.
+ *   - Match NANOCORE by standard BLE-MIDI UUID or advertised name.
+ *   - Connect automatically.
+ *   - Request MTU 185.
+ *   - Initiate BLE security/bonding when supported.
+ *   - Discover the peer BLE-MIDI characteristic.
+ *   - Subscribe to MIDI I/O notifications.
  *
- * Expected Nanocore name from the user manual: "Nanocore Midi".
+ * No MIDI commands are transmitted in this stage.
  */
 
 #include <stdbool.h>
@@ -22,11 +24,17 @@
 #include "nvs_flash.h"
 
 #include "esp_ble_conn_mgr.h"
+#include "esp_ble_midi.h"
 #include "esp_ble_midi_svc.h"
 
-static const char *TAG = "NC_STAGE01";
+static const char *TAG = "NC_STAGE02";
 
 static const uint8_t MIDI_SERVICE_UUID[16] = BLE_MIDI_SERVICE_UUID128;
+static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
+
+static bool s_target_found = false;
+static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
+static uint16_t s_midi_char_handle = 0;
 
 static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
 {
@@ -111,7 +119,7 @@ static bool scan_cb(const esp_ble_conn_scan_result_t *result, void *arg)
 {
     (void)arg;
 
-    if (!result) {
+    if (!result || s_target_found) {
         return false;
     }
 
@@ -121,18 +129,115 @@ static bool scan_cb(const esp_ble_conn_scan_result_t *result, void *arg)
     const bool midi_uuid = adv_has_midi_uuid(result->adv_data,
                                              result->adv_data_len);
     const bool nanocore_name = contains_nanocore(name);
+    const bool match = midi_uuid || nanocore_name;
 
-    ESP_LOGI(TAG,
-             "BLE addr=" BLE_CONN_MGR_ADDR_STR
-             " RSSI=%d name=\"%s\" MIDI_UUID=%s%s",
-             BLE_CONN_MGR_ADDR_HEX(result->addr),
-             result->rssi,
-             name[0] ? name : "<no-name>",
-             midi_uuid ? "YES" : "no",
-             nanocore_name ? "  <== NANOCORE candidate" : "");
+    if (match) {
+        ESP_LOGI(TAG,
+                 "NANOCORE candidate: addr=" BLE_CONN_MGR_ADDR_STR
+                 " RSSI=%d name=\"%s\" MIDI_UUID=%s",
+                 BLE_CONN_MGR_ADDR_HEX(result->addr),
+                 result->rssi,
+                 name[0] ? name : "<no-name>",
+                 midi_uuid ? "YES" : "no");
 
-    // Stage 01 is scan-only. Returning false prevents auto-connect.
+        ESP_LOGI(TAG, "Requesting connection...");
+        s_target_found = true;
+
+        // With ble_conn_mgr Central role, returning true initiates
+        // the connection to this scan result automatically.
+        return true;
+    }
+
     return false;
+}
+
+static bool conn_data_is_midi_io(const esp_ble_conn_data_t *d)
+{
+    if (!d || d->type != BLE_CONN_UUID_TYPE_128) {
+        return false;
+    }
+
+    return memcmp(d->uuid.uuid128,
+                  MIDI_CHAR_UUID,
+                  sizeof(d->uuid.uuid128)) == 0;
+}
+
+static void midi_rx_cb(const uint8_t *data, uint16_t len, void *user_ctx)
+{
+    (void)user_ctx;
+
+    ESP_LOGI(TAG, "BLE-MIDI RX packet: %u bytes", len);
+    ESP_LOG_BUFFER_HEX(TAG, data, len);
+}
+
+static void midi_evt_cb(uint16_t ts_ms,
+                        esp_ble_midi_event_type_t event_type,
+                        const uint8_t *msg,
+                        uint16_t msg_len)
+{
+    if (event_type == ESP_BLE_MIDI_EVENT_SYSEX_OVERFLOW) {
+        ESP_LOGW(TAG, "MIDI RX ts=%u: SysEx overflow", ts_ms);
+        return;
+    }
+
+    if (!msg || msg_len == 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "MIDI RX decoded ts=%u len=%u", ts_ms, msg_len);
+    ESP_LOG_BUFFER_HEX(TAG, msg, msg_len);
+}
+
+static void subscribe_midi_notifications(uint16_t conn_handle)
+{
+    static uint8_t cccd_notify[2] = {0x01, 0x00};
+
+    esp_ble_conn_data_t sub = {
+        .type = BLE_CONN_UUID_TYPE_128,
+        .write_conn_id = conn_handle,
+        .data = cccd_notify,
+        .data_len = sizeof(cccd_notify),
+    };
+    memcpy(sub.uuid.uuid128, MIDI_CHAR_UUID, sizeof(sub.uuid.uuid128));
+
+    esp_err_t rc = esp_ble_conn_subscribe_by_handle(
+        conn_handle,
+        ESP_BLE_CONN_DESC_CIENT_CONFIG,
+        &sub);
+
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "Subscribed to BLE-MIDI notifications");
+    } else {
+        ESP_LOGW(TAG, "MIDI notification subscribe failed: %s",
+                 esp_err_to_name(rc));
+    }
+}
+
+static void resolve_peer_midi_handle(uint16_t conn_handle)
+{
+    esp_ble_conn_uuid_t svc_uuid = {0};
+    esp_ble_conn_uuid_t chr_uuid = {0};
+
+    memcpy(svc_uuid.uuid128, MIDI_SERVICE_UUID, sizeof(svc_uuid.uuid128));
+    memcpy(chr_uuid.uuid128, MIDI_CHAR_UUID, sizeof(chr_uuid.uuid128));
+
+    s_midi_char_handle = 0;
+
+    esp_err_t rc = esp_ble_conn_get_peer_chr_handle(
+        conn_handle,
+        BLE_CONN_UUID_TYPE_128,
+        svc_uuid,
+        BLE_CONN_UUID_TYPE_128,
+        chr_uuid,
+        &s_midi_char_handle);
+
+    if (rc == ESP_OK && s_midi_char_handle != 0) {
+        ESP_LOGI(TAG, "BLE-MIDI characteristic found: handle=0x%04X",
+                 s_midi_char_handle);
+    } else {
+        ESP_LOGE(TAG, "BLE-MIDI characteristic NOT found: %s",
+                 esp_err_to_name(rc));
+    }
 }
 
 static void ble_event_handler(void *handler_args,
@@ -141,7 +246,6 @@ static void ble_event_handler(void *handler_args,
                               void *event_data)
 {
     (void)handler_args;
-    (void)event_data;
 
     if (base != BLE_CONN_MGR_EVENTS) {
         return;
@@ -149,15 +253,87 @@ static void ble_event_handler(void *handler_args,
 
     switch (id) {
     case ESP_BLE_CONN_EVENT_STARTED:
-        ESP_LOGI(TAG, "BLE manager started");
+        ESP_LOGI(TAG, "BLE manager started; scanning...");
         break;
 
-    case ESP_BLE_CONN_EVENT_CONNECTED:
-        ESP_LOGW(TAG, "Unexpected connection in Stage 01");
+    case ESP_BLE_CONN_EVENT_CONNECTED: {
+        esp_ble_conn_event_data_t *evt =
+            (esp_ble_conn_event_data_t *)event_data;
+
+        if (esp_ble_conn_get_conn_handle(&s_conn_handle) != ESP_OK ||
+            s_conn_handle == BLE_CONN_HANDLE_INVALID) {
+            ESP_LOGE(TAG, "Connected event but no valid connection handle");
+            break;
+        }
+
+        ESP_LOGI(TAG, "CONNECTED: conn_handle=%u", s_conn_handle);
+
+        if (evt) {
+            ESP_LOGI(TAG,
+                     "Peer=" BLE_CONN_MGR_ADDR_STR,
+                     BLE_CONN_MGR_ADDR_HEX(evt->connected.peer_addr));
+        }
+
+        esp_err_t mtu_rc = esp_ble_conn_mtu_update(s_conn_handle, 185);
+        if (mtu_rc != ESP_OK) {
+            ESP_LOGW(TAG, "MTU request failed: %s",
+                     esp_err_to_name(mtu_rc));
+        }
+
+        // BLE-MIDI commonly uses an encrypted/bonded link.
+        // If the peer does not require it, failure here is non-fatal.
+        esp_err_t sec_rc = esp_ble_conn_security_initiate(s_conn_handle);
+        if (sec_rc == ESP_OK) {
+            ESP_LOGI(TAG, "BLE security/pairing initiated");
+        } else {
+            ESP_LOGW(TAG, "Security initiate returned: %s",
+                     esp_err_to_name(sec_rc));
+        }
         break;
+    }
+
+    case ESP_BLE_CONN_EVENT_MTU: {
+        esp_ble_conn_event_data_t *evt =
+            (esp_ble_conn_event_data_t *)event_data;
+        if (evt) {
+            ESP_LOGI(TAG, "MTU negotiated: %u",
+                     evt->mtu_update.mtu);
+        }
+        break;
+    }
+
+    case ESP_BLE_CONN_EVENT_DISC_COMPLETE:
+        ESP_LOGI(TAG, "GATT discovery complete");
+
+        if (s_conn_handle != BLE_CONN_HANDLE_INVALID) {
+            resolve_peer_midi_handle(s_conn_handle);
+            subscribe_midi_notifications(s_conn_handle);
+        }
+        break;
+
+    case ESP_BLE_CONN_EVENT_DATA_RECEIVE: {
+        esp_ble_conn_data_t *conn_data =
+            (esp_ble_conn_data_t *)event_data;
+
+        if (conn_data &&
+            conn_data->data &&
+            conn_data->data_len > 0 &&
+            conn_data_is_midi_io(conn_data)) {
+            esp_ble_midi_on_bep_received(conn_data->data,
+                                         conn_data->data_len);
+        }
+        break;
+    }
 
     case ESP_BLE_CONN_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "Disconnected");
+        ESP_LOGW(TAG, "DISCONNECTED; restarting scan");
+        s_conn_handle = BLE_CONN_HANDLE_INVALID;
+        s_midi_char_handle = 0;
+        s_target_found = false;
+
+        if (esp_ble_conn_scan_start() != ESP_OK) {
+            ESP_LOGW(TAG, "Could not restart scan");
+        }
         break;
 
     default:
@@ -181,8 +357,8 @@ static void nvs_init_safe(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "======================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 01");
-    ESP_LOGI(TAG, " BLE SCAN / DISCOVERY");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 02");
+    ESP_LOGI(TAG, " BLE CONNECT + GATT DISCOVERY");
     ESP_LOGI(TAG, "======================================");
 
     nvs_init_safe();
@@ -200,19 +376,27 @@ void app_main(void)
             sizeof(config.device_name) - 1);
 
     ESP_ERROR_CHECK(esp_ble_conn_init(&config));
+    ESP_ERROR_CHECK(esp_ble_conn_set_pairing_allowed(true));
     ESP_ERROR_CHECK(esp_ble_conn_register_scan_callback(scan_cb, NULL));
 
-    // Active scan is important because some devices put their name in
-    // the scan response instead of the primary advertising packet.
     esp_ble_conn_scan_params_t scan_params = {
         .passive = false,
         .filter_duplicates = true,
     };
     ESP_ERROR_CHECK(esp_ble_conn_scan_params_set(&scan_params));
 
+    // Same service/profile setup used by Espressif's official BLE-MIDI
+    // Central example. This lets ble_conn_mgr discover and route the
+    // standard MIDI service/characteristic.
+    ESP_ERROR_CHECK(esp_ble_midi_svc_init());
+    ESP_ERROR_CHECK(esp_ble_midi_profile_init());
+    ESP_ERROR_CHECK(esp_ble_midi_register_rx_cb(midi_rx_cb, NULL));
+    ESP_ERROR_CHECK(esp_ble_midi_register_event_cb(midi_evt_cb));
+
     ESP_ERROR_CHECK(esp_ble_conn_start());
 
-    ESP_LOGI(TAG, "Scanning...");
-    ESP_LOGI(TAG, "Look for 'Nanocore Midi' and/or MIDI_UUID=YES.");
-    ESP_LOGI(TAG, "Stage 01 never connects; copy the serial log after test.");
+    ESP_LOGI(TAG, "Waiting for NANOCORE...");
+    ESP_LOGI(TAG,
+             "Success criteria: CONNECTED -> GATT discovery complete -> "
+             "BLE-MIDI characteristic found.");
 }
