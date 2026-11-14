@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - stage-03-midi-program-change
+      - stage-04-ui-modes-stomp
   workflow_dispatch:
 
 jobs:
