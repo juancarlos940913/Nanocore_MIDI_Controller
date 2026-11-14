@@ -1,0 +1,9 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+.vscode/settings.json
+*.elf
+*.bin
+*.map
+.DS_Store
