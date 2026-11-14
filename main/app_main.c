@@ -1,17 +1,13 @@
 /*
  * Nanocore MIDI Controller
- * Stage 02 - BLE Connect + GATT discovery
+ * Stage 03 - BLE-MIDI Program Change
  *
- * Goal:
- *   - Scan as BLE Central.
- *   - Match NANOCORE by standard BLE-MIDI UUID or advertised name.
- *   - Connect automatically.
- *   - Request MTU 185.
- *   - Initiate BLE security/bonding when supported.
- *   - Discover the peer BLE-MIDI characteristic.
- *   - Subscribe to MIDI I/O notifications.
+ * Hardware test controls:
+ *   BTN_PROGRAM  GPIO18 -> previous preset
+ *   BTN_STOP     GPIO21 -> next preset
+ *   BTN_FUNCTION GPIO47 -> resend current preset
  *
- * No MIDI commands are transmitted in this stage.
+ * For the first test, set NANOCORE MIDI Channel = 0 (Omni).
  */
 
 #include <stdbool.h>
@@ -19,22 +15,37 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_ble_conn_mgr.h"
 #include "esp_ble_midi.h"
 #include "esp_ble_midi_svc.h"
 
-static const char *TAG = "NC_STAGE02";
+#include "board_pins.h"
+#include "nanocore_midi.h"
+
+static const char *TAG = "NC_STAGE03";
 
 static const uint8_t MIDI_SERVICE_UUID[16] = BLE_MIDI_SERVICE_UUID128;
 static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 
+#define NANOCORE_MIDI_CHANNEL       1
+#define NANOCORE_PRESET_MIN         0
+#define NANOCORE_PRESET_MAX        63
+
+#define BUTTON_POLL_MS             10
+#define BUTTON_DEBOUNCE_MS         40
+
 static bool s_target_found = false;
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
 static uint16_t s_midi_char_handle = 0;
+static uint8_t s_program = 0;
 
 static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
 {
@@ -129,9 +140,8 @@ static bool scan_cb(const esp_ble_conn_scan_result_t *result, void *arg)
     const bool midi_uuid = adv_has_midi_uuid(result->adv_data,
                                              result->adv_data_len);
     const bool nanocore_name = contains_nanocore(name);
-    const bool match = midi_uuid || nanocore_name;
 
-    if (match) {
+    if (midi_uuid || nanocore_name) {
         ESP_LOGI(TAG,
                  "NANOCORE candidate: addr=" BLE_CONN_MGR_ADDR_STR
                  " RSSI=%d name=\"%s\" MIDI_UUID=%s",
@@ -140,11 +150,8 @@ static bool scan_cb(const esp_ble_conn_scan_result_t *result, void *arg)
                  name[0] ? name : "<no-name>",
                  midi_uuid ? "YES" : "no");
 
-        ESP_LOGI(TAG, "Requesting connection...");
         s_target_found = true;
-
-        // With ble_conn_mgr Central role, returning true initiates
-        // the connection to this scan result automatically.
+        ESP_LOGI(TAG, "Connecting...");
         return true;
     }
 
@@ -165,9 +172,8 @@ static bool conn_data_is_midi_io(const esp_ble_conn_data_t *d)
 static void midi_rx_cb(const uint8_t *data, uint16_t len, void *user_ctx)
 {
     (void)user_ctx;
-
-    ESP_LOGI(TAG, "BLE-MIDI RX packet: %u bytes", len);
-    ESP_LOG_BUFFER_HEX(TAG, data, len);
+    ESP_LOGD(TAG, "BLE-MIDI RX packet: %u bytes", len);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, data, len, ESP_LOG_DEBUG);
 }
 
 static void midi_evt_cb(uint16_t ts_ms,
@@ -180,12 +186,10 @@ static void midi_evt_cb(uint16_t ts_ms,
         return;
     }
 
-    if (!msg || msg_len == 0) {
-        return;
+    if (msg && msg_len > 0) {
+        ESP_LOGD(TAG, "MIDI RX decoded ts=%u len=%u", ts_ms, msg_len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, msg_len, ESP_LOG_DEBUG);
     }
-
-    ESP_LOGI(TAG, "MIDI RX decoded ts=%u len=%u", ts_ms, msg_len);
-    ESP_LOG_BUFFER_HEX(TAG, msg, msg_len);
 }
 
 static void subscribe_midi_notifications(uint16_t conn_handle)
@@ -213,7 +217,7 @@ static void subscribe_midi_notifications(uint16_t conn_handle)
     }
 }
 
-static void resolve_peer_midi_handle(uint16_t conn_handle)
+static bool resolve_peer_midi_handle(uint16_t conn_handle)
 {
     esp_ble_conn_uuid_t svc_uuid = {0};
     esp_ble_conn_uuid_t chr_uuid = {0};
@@ -231,13 +235,18 @@ static void resolve_peer_midi_handle(uint16_t conn_handle)
         chr_uuid,
         &s_midi_char_handle);
 
-    if (rc == ESP_OK && s_midi_char_handle != 0) {
-        ESP_LOGI(TAG, "BLE-MIDI characteristic found: handle=0x%04X",
-                 s_midi_char_handle);
-    } else {
-        ESP_LOGE(TAG, "BLE-MIDI characteristic NOT found: %s",
+    if (rc != ESP_OK || s_midi_char_handle == 0) {
+        ESP_LOGE(TAG,
+                 "BLE-MIDI characteristic NOT found: %s",
                  esp_err_to_name(rc));
+        return false;
     }
+
+    ESP_LOGI(TAG,
+             "BLE-MIDI characteristic found: handle=0x%04X",
+             s_midi_char_handle);
+
+    return true;
 }
 
 static void ble_event_handler(void *handler_args,
@@ -256,10 +265,7 @@ static void ble_event_handler(void *handler_args,
         ESP_LOGI(TAG, "BLE manager started; scanning...");
         break;
 
-    case ESP_BLE_CONN_EVENT_CONNECTED: {
-        esp_ble_conn_event_data_t *evt =
-            (esp_ble_conn_event_data_t *)event_data;
-
+    case ESP_BLE_CONN_EVENT_CONNECTED:
         if (esp_ble_conn_get_conn_handle(&s_conn_handle) != ESP_OK ||
             s_conn_handle == BLE_CONN_HANDLE_INVALID) {
             ESP_LOGE(TAG, "Connected event but no valid connection handle");
@@ -268,33 +274,30 @@ static void ble_event_handler(void *handler_args,
 
         ESP_LOGI(TAG, "CONNECTED: conn_handle=%u", s_conn_handle);
 
-        if (evt) {
-            ESP_LOGI(TAG,
-                     "Peer=" BLE_CONN_MGR_ADDR_STR,
-                     BLE_CONN_MGR_ADDR_HEX(evt->connected.peer_addr));
+        {
+            esp_err_t mtu_rc = esp_ble_conn_mtu_update(s_conn_handle, 185);
+            if (mtu_rc != ESP_OK) {
+                ESP_LOGW(TAG, "MTU request failed: %s",
+                         esp_err_to_name(mtu_rc));
+            }
         }
 
-        esp_err_t mtu_rc = esp_ble_conn_mtu_update(s_conn_handle, 185);
-        if (mtu_rc != ESP_OK) {
-            ESP_LOGW(TAG, "MTU request failed: %s",
-                     esp_err_to_name(mtu_rc));
-        }
-
-        // BLE-MIDI commonly uses an encrypted/bonded link.
-        // If the peer does not require it, failure here is non-fatal.
-        esp_err_t sec_rc = esp_ble_conn_security_initiate(s_conn_handle);
-        if (sec_rc == ESP_OK) {
-            ESP_LOGI(TAG, "BLE security/pairing initiated");
-        } else {
-            ESP_LOGW(TAG, "Security initiate returned: %s",
-                     esp_err_to_name(sec_rc));
+        {
+            esp_err_t sec_rc =
+                esp_ble_conn_security_initiate(s_conn_handle);
+            if (sec_rc == ESP_OK) {
+                ESP_LOGI(TAG, "BLE security/pairing initiated");
+            } else {
+                ESP_LOGW(TAG, "Security initiate returned: %s",
+                         esp_err_to_name(sec_rc));
+            }
         }
         break;
-    }
 
     case ESP_BLE_CONN_EVENT_MTU: {
         esp_ble_conn_event_data_t *evt =
             (esp_ble_conn_event_data_t *)event_data;
+
         if (evt) {
             ESP_LOGI(TAG, "MTU negotiated: %u",
                      evt->mtu_update.mtu);
@@ -305,9 +308,22 @@ static void ble_event_handler(void *handler_args,
     case ESP_BLE_CONN_EVENT_DISC_COMPLETE:
         ESP_LOGI(TAG, "GATT discovery complete");
 
-        if (s_conn_handle != BLE_CONN_HANDLE_INVALID) {
-            resolve_peer_midi_handle(s_conn_handle);
+        if (s_conn_handle != BLE_CONN_HANDLE_INVALID &&
+            resolve_peer_midi_handle(s_conn_handle)) {
+
             subscribe_midi_notifications(s_conn_handle);
+
+            nanocore_midi_set_link(
+                s_conn_handle,
+                s_midi_char_handle);
+
+            ESP_LOGI(TAG, "======================================");
+            ESP_LOGI(TAG, " BLE-MIDI READY");
+            ESP_LOGI(TAG, " GPIO18 = PREVIOUS PRESET");
+            ESP_LOGI(TAG, " GPIO21 = NEXT PRESET");
+            ESP_LOGI(TAG, " GPIO47 = RESEND CURRENT PRESET");
+            ESP_LOGI(TAG, " Current PC = %u", s_program);
+            ESP_LOGI(TAG, "======================================");
         }
         break;
 
@@ -319,14 +335,18 @@ static void ble_event_handler(void *handler_args,
             conn_data->data &&
             conn_data->data_len > 0 &&
             conn_data_is_midi_io(conn_data)) {
-            esp_ble_midi_on_bep_received(conn_data->data,
-                                         conn_data->data_len);
+            esp_ble_midi_on_bep_received(
+                conn_data->data,
+                conn_data->data_len);
         }
         break;
     }
 
     case ESP_BLE_CONN_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "DISCONNECTED; restarting scan");
+
+        nanocore_midi_clear_link();
+
         s_conn_handle = BLE_CONN_HANDLE_INVALID;
         s_midi_char_handle = 0;
         s_target_found = false;
@@ -338,6 +358,136 @@ static void ble_event_handler(void *handler_args,
 
     default:
         break;
+    }
+}
+
+static void send_current_program(void)
+{
+    if (!nanocore_midi_is_ready()) {
+        ESP_LOGW(TAG,
+                 "MIDI not ready; PC %u not sent",
+                 s_program);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Request PC -> %u", s_program);
+
+    esp_err_t rc = nanocore_midi_send_program_change(
+        NANOCORE_MIDI_CHANNEL,
+        s_program);
+
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Program Change failed: %s",
+                 esp_err_to_name(rc));
+    }
+}
+
+typedef struct {
+    gpio_num_t gpio;
+    bool stable_pressed;
+    bool last_raw_pressed;
+    TickType_t last_change_tick;
+} button_state_t;
+
+static bool button_update(button_state_t *btn, TickType_t now)
+{
+    // Existing board buttons are treated as active LOW.
+    const bool raw_pressed = gpio_get_level(btn->gpio) == 0;
+
+    if (raw_pressed != btn->last_raw_pressed) {
+        btn->last_raw_pressed = raw_pressed;
+        btn->last_change_tick = now;
+    }
+
+    const TickType_t debounce_ticks =
+        pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS);
+
+    if ((now - btn->last_change_tick) >= debounce_ticks &&
+        btn->stable_pressed != raw_pressed) {
+
+        btn->stable_pressed = raw_pressed;
+
+        // Return true only on the debounced press edge.
+        if (btn->stable_pressed) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void buttons_init(void)
+{
+    const uint64_t pin_mask =
+        (1ULL << BTN_PROGRAM) |
+        (1ULL << BTN_STOP) |
+        (1ULL << BTN_FUNCTION);
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+}
+
+static void button_task(void *arg)
+{
+    (void)arg;
+
+    button_state_t prev = {
+        .gpio = BTN_PROGRAM,
+        .stable_pressed = false,
+        .last_raw_pressed = false,
+        .last_change_tick = xTaskGetTickCount(),
+    };
+
+    button_state_t next = {
+        .gpio = BTN_STOP,
+        .stable_pressed = false,
+        .last_raw_pressed = false,
+        .last_change_tick = xTaskGetTickCount(),
+    };
+
+    button_state_t resend = {
+        .gpio = BTN_FUNCTION,
+        .stable_pressed = false,
+        .last_raw_pressed = false,
+        .last_change_tick = xTaskGetTickCount(),
+    };
+
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+
+        if (button_update(&prev, now)) {
+            if (s_program <= NANOCORE_PRESET_MIN) {
+                s_program = NANOCORE_PRESET_MAX;
+            } else {
+                --s_program;
+            }
+
+            send_current_program();
+        }
+
+        if (button_update(&next, now)) {
+            if (s_program >= NANOCORE_PRESET_MAX) {
+                s_program = NANOCORE_PRESET_MIN;
+            } else {
+                ++s_program;
+            }
+
+            send_current_program();
+        }
+
+        if (button_update(&resend, now)) {
+            send_current_program();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
     }
 }
 
@@ -357,11 +507,12 @@ static void nvs_init_safe(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "======================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 02");
-    ESP_LOGI(TAG, " BLE CONNECT + GATT DISCOVERY");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 03");
+    ESP_LOGI(TAG, " BLE-MIDI PROGRAM CHANGE");
     ESP_LOGI(TAG, "======================================");
 
     nvs_init_safe();
+    buttons_init();
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_event_handler_register(
@@ -385,9 +536,6 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_ble_conn_scan_params_set(&scan_params));
 
-    // Same service/profile setup used by Espressif's official BLE-MIDI
-    // Central example. This lets ble_conn_mgr discover and route the
-    // standard MIDI service/characteristic.
     ESP_ERROR_CHECK(esp_ble_midi_svc_init());
     ESP_ERROR_CHECK(esp_ble_midi_profile_init());
     ESP_ERROR_CHECK(esp_ble_midi_register_rx_cb(midi_rx_cb, NULL));
@@ -395,8 +543,13 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_ble_conn_start());
 
-    ESP_LOGI(TAG, "Waiting for NANOCORE...");
-    ESP_LOGI(TAG,
-             "Success criteria: CONNECTED -> GATT discovery complete -> "
-             "BLE-MIDI characteristic found.");
+    xTaskCreate(
+        button_task,
+        "nc_buttons",
+        3072,
+        NULL,
+        5,
+        NULL);
+
+    ESP_LOGI(TAG, "Waiting for NANOCORE BLE-MIDI...");
 }
