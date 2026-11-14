@@ -46,6 +46,7 @@
 #include "board_pins.h"
 #include "display_ui.h"
 #include "nanocore_midi.h"
+#include "snapshot_manager.h"
 
 static const char *TAG = "NC_STAGE04";
 
@@ -64,6 +65,7 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CC_DELAY_ONOFF             26
 #define CC_REVERB_ONOFF            27
 #define CC_EQ_ONOFF                28
+#define CC_AMP_TYPE                43
 
 #define BUTTON_POLL_MS             10
 #define BUTTON_DEBOUNCE_MS         35
@@ -77,6 +79,7 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define SCENE_ACTION_GAP_MS        45
 #define SCENE_PHASE_GAP_MS         80
 #define SCENE_FEEDBACK_WAIT_MS    140
+#define AMP_AUDITION_GAP_MS        45
 
 static bool s_target_found = false;
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
@@ -115,6 +118,68 @@ static void set_blocks_unknown(void)
     s_ui.delay = UI_BLOCK_UNKNOWN;
     s_ui.reverb = UI_BLOCK_UNKNOWN;
     s_ui.eq = UI_BLOCK_UNKNOWN;
+}
+
+static void refresh_scene_amp_ui(void)
+{
+    const snapshot_t *snap = snapshot_manager_get(s_ui.scene);
+
+    s_ui.scene_amp_configured = snap && snap->amp_configured;
+    s_ui.scene_amp_type = (snap && snap->amp_configured)
+                            ? snap->amp_type_id : 0;
+
+    if (!s_ui.amp_editing) {
+        s_ui.amp_edit_candidate = s_ui.scene_amp_type;
+    }
+}
+
+static esp_err_t send_amp_type(uint8_t amp_type_id)
+{
+    if (!nanocore_midi_is_ready()) {
+        ESP_LOGW(TAG, "MIDI not ready; Amp Type %u not sent",
+                 amp_type_id);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t rc = nanocore_midi_send_cc(
+        NANOCORE_MIDI_CHANNEL,
+        CC_AMP_TYPE,
+        amp_type_id & 0x7F);
+
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "AMP TYPE audition -> CC43=%u",
+                 amp_type_id & 0x7F);
+    } else {
+        ESP_LOGE(TAG, "Amp Type CC43 failed: %s",
+                 esp_err_to_name(rc));
+    }
+
+    return rc;
+}
+
+static void apply_snapshot_amp(uint8_t scene)
+{
+    scene &= 0x03;
+    s_ui.scene = scene;
+    s_ui.amp_editing = false;
+    refresh_scene_amp_ui();
+    render_ui();
+
+    const snapshot_t *snap = snapshot_manager_get(scene);
+    if (!snap || !snap->amp_configured) {
+        ESP_LOGW(TAG,
+                 "SCENE %c has no Amp configured; NANOCORE left unchanged",
+                 (char)('A' + scene));
+        return;
+    }
+
+    ESP_LOGI(TAG, "SCENE %c -> Amp Type ID %u only",
+             (char)('A' + scene),
+             snap->amp_type_id);
+
+    if (send_amp_type(snap->amp_type_id) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
+    }
 }
 
 static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
@@ -449,145 +514,25 @@ static void toggle_delay(void)
                  "DELAY");
 }
 
-typedef struct {
-    bool fx2;
-    bool mod;
-    bool delay;
-    bool reverb;
-    const char *name;
-} demo_scene_t;
-
-static const demo_scene_t DEMO_SCENES[4] = {
-    {false, false, false, true,  "CLEAN"},
-    {true,  false, false, true,  "RHYTHM"},
-    {true,  false, true,  true,  "LEAD"},
-    {false, true,  true,  true,  "AMBIENT"},
-};
-
-static ui_block_state_t pending_state(bool on)
+static void cycle_mode(void)
 {
-    return on ? UI_BLOCK_PENDING_ON : UI_BLOCK_PENDING_OFF;
-}
-
-static esp_err_t send_scene_cc_reliable(uint8_t cc,
-                                        bool on,
-                                        const char *label)
-{
-    const uint8_t value = on ? 127 : 0;
-
-    for (int attempt = 1; attempt <= 2; ++attempt) {
-        esp_err_t rc = nanocore_midi_send_cc(
-            NANOCORE_MIDI_CHANNEL,
-            cc,
-            value);
-
-        if (rc != ESP_OK) {
-            ESP_LOGE(TAG,
-                     "SCENE TX %s CC%u=%u attempt %d failed: %s",
-                     label, cc, value, attempt, esp_err_to_name(rc));
-            return rc;
-        }
-
-        ESP_LOGI(TAG,
-                 "SCENE TX %s CC%u=%u attempt %d/2",
-                 label, cc, value, attempt);
-
-        if (attempt == 1) {
-            vTaskDelay(pdMS_TO_TICKS(SCENE_RETRY_GAP_MS));
-        }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(SCENE_ACTION_GAP_MS));
-    return ESP_OK;
-}
-
-static void apply_demo_scene(uint8_t scene)
-{
-    scene &= 0x03;
-
-    if (!nanocore_midi_is_ready()) {
-        ESP_LOGW(TAG, "MIDI not ready; scene not applied");
+    // Do not leave an amp audition half-edited.
+    if (s_ui.amp_editing) {
+        ESP_LOGW(TAG, "Finish AMP EDIT with ENC1 before changing mode");
         return;
     }
 
-    const demo_scene_t *sc = &DEMO_SCENES[scene];
-
-    // A scene request is not the same thing as confirmed device state.
-    // Show ON?/OFF? until the NANOCORE sends matching MIDI feedback.
-    s_ui.scene = scene;
-    s_ui.fx2 = pending_state(sc->fx2);
-    s_ui.mod = pending_state(sc->mod);
-    s_ui.delay = pending_state(sc->delay);
-    s_ui.reverb = pending_state(sc->reverb);
-    render_ui();
-
-    typedef struct {
-        uint8_t cc;
-        bool on;
-        const char *label;
-    } scene_action_t;
-
-    const scene_action_t actions[] = {
-        {CC_FX2_ONOFF,    sc->fx2,    "FX2"},
-        {CC_MOD_ONOFF,    sc->mod,    "MOD"},
-        {CC_DELAY_ONOFF,  sc->delay,  "DELAY"},
-        {CC_REVERB_ONOFF, sc->reverb, "REVERB"},
-    };
-
-    ESP_LOGI(TAG, "SCENE %c / %s: phase 1 OFF commands",
-             (char)('A' + scene), sc->name);
-
-    // First turn blocks OFF. This avoids rapid simultaneous bypass/enable
-    // transitions inside the NANOCORE DSP graph.
-    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
-        if (!actions[i].on) {
-            if (send_scene_cc_reliable(actions[i].cc,
-                                       false,
-                                       actions[i].label) != ESP_OK) {
-                ESP_LOGE(TAG, "Scene aborted during OFF phase");
-                render_ui();
-                return;
-            }
-        }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(SCENE_PHASE_GAP_MS));
-
-    ESP_LOGI(TAG, "SCENE %c / %s: phase 2 ON commands",
-             (char)('A' + scene), sc->name);
-
-    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
-        if (actions[i].on) {
-            if (send_scene_cc_reliable(actions[i].cc,
-                                       true,
-                                       actions[i].label) != ESP_OK) {
-                ESP_LOGE(TAG, "Scene aborted during ON phase");
-                render_ui();
-                return;
-            }
-        }
-    }
-
-    // If the NANOCORE echoes/returns MIDI state, midi_evt_cb() converts
-    // matching pending states into confirmed ON/OFF during this window.
-    vTaskDelay(pdMS_TO_TICKS(SCENE_FEEDBACK_WAIT_MS));
-
-    ESP_LOGI(TAG,
-             "SCENE %c / %s commands sent. ON?/OFF? means unconfirmed.",
-             (char)('A' + scene), sc->name);
-
-    render_ui();
-}
-
-static void cycle_mode(void)
-{
     s_ui.mode = (ui_mode_t)((s_ui.mode + 1) % UI_MODE_COUNT);
 
     ESP_LOGI(TAG, "MODE -> %s",
              s_ui.mode == UI_MODE_PRESET ? "PRESET" :
              s_ui.mode == UI_MODE_STOMP  ? "STOMP" : "SCENE");
 
-    render_ui();
+    if (s_ui.mode == UI_MODE_SCENE) {
+        apply_snapshot_amp(s_ui.scene);
+    } else {
+        render_ui();
+    }
 }
 
 static void handle_program_click(void)
@@ -598,8 +543,11 @@ static void handle_program_click(void)
         break;
 
     case UI_MODE_SCENE:
-        s_ui.scene = (uint8_t)((s_ui.scene + 3) & 0x03);
-        apply_demo_scene(s_ui.scene);
+        if (s_ui.amp_editing) {
+            ESP_LOGW(TAG, "ENC1: save AMP EDIT before changing Scene");
+            break;
+        }
+        apply_snapshot_amp((uint8_t)((s_ui.scene + 3) & 0x03));
         break;
 
     case UI_MODE_PRESET:
@@ -622,8 +570,11 @@ static void handle_stop_click(void)
         break;
 
     case UI_MODE_SCENE:
-        s_ui.scene = (uint8_t)((s_ui.scene + 1) & 0x03);
-        apply_demo_scene(s_ui.scene);
+        if (s_ui.amp_editing) {
+            ESP_LOGW(TAG, "ENC1: save AMP EDIT before changing Scene");
+            break;
+        }
+        apply_snapshot_amp((uint8_t)((s_ui.scene + 1) & 0x03));
         break;
 
     case UI_MODE_PRESET:
@@ -699,6 +650,7 @@ static void ble_event_handler(void *handler_args,
             ESP_LOGI(TAG, " PRESET/STOMP/SCENE + LANDSCAPE UI");
             ESP_LOGI(TAG, " HOLD GPIO18 + GPIO21 = MODE");
             ESP_LOGI(TAG, " GPIO47 = MODE shortcut");
+            ESP_LOGI(TAG, " SCENE: ENC1 press=AMP EDIT, turn=CC43, press=SAVE");
             ESP_LOGI(TAG, "======================================");
         }
         break;
@@ -738,6 +690,127 @@ static void ble_event_handler(void *handler_args,
 
     default:
         break;
+    }
+}
+
+typedef struct {
+    gpio_num_t pin_a;
+    gpio_num_t pin_b;
+    gpio_num_t pin_sw;
+    int last_a;
+    bool last_sw_raw;
+    bool sw_stable;
+    TickType_t sw_last_change;
+} encoder_state_t;
+
+static int encoder_step(encoder_state_t *e)
+{
+    int a = gpio_get_level(e->pin_a);
+    int step = 0;
+
+    // Same proven direction rule used by the original programmer firmware:
+    // count one detent on the falling edge of A.
+    if (a != e->last_a && a == 0) {
+        int b = gpio_get_level(e->pin_b);
+        step = (b != a) ? 1 : -1;
+    }
+
+    e->last_a = a;
+    return step;
+}
+
+static bool encoder_click(encoder_state_t *e, TickType_t now)
+{
+    bool raw = gpio_get_level(e->pin_sw) == 0;
+
+    if (raw != e->last_sw_raw) {
+        e->last_sw_raw = raw;
+        e->sw_last_change = now;
+    }
+
+    if ((now - e->sw_last_change) < pdMS_TO_TICKS(35)) {
+        return false;
+    }
+
+    if (raw == e->sw_stable) {
+        return false;
+    }
+
+    e->sw_stable = raw;
+    return raw; // press edge
+}
+
+static void start_amp_edit(void)
+{
+    if (s_ui.mode != UI_MODE_SCENE) {
+        return;
+    }
+
+    refresh_scene_amp_ui();
+
+    s_ui.amp_editing = true;
+    s_ui.amp_edit_candidate = s_ui.scene_amp_configured
+                                ? s_ui.scene_amp_type : 0;
+
+    ESP_LOGI(TAG,
+             "AMP EDIT Scene %c started at ID %u%s",
+             (char)('A' + s_ui.scene),
+             s_ui.amp_edit_candidate,
+             s_ui.scene_amp_configured ? "" : " (default audition start)");
+
+    // Audition the starting point so what is shown is what is heard.
+    if (send_amp_type(s_ui.amp_edit_candidate) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
+    }
+
+    render_ui();
+}
+
+static void save_amp_edit(void)
+{
+    esp_err_t rc = snapshot_manager_set_amp(
+        s_ui.scene,
+        s_ui.amp_edit_candidate);
+
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Scene %c Amp ID %u: %s",
+                 (char)('A' + s_ui.scene),
+                 s_ui.amp_edit_candidate,
+                 esp_err_to_name(rc));
+        return;
+    }
+
+    ESP_LOGI(TAG, "AMP EDIT Scene %c saved -> ID %u",
+             (char)('A' + s_ui.scene),
+             s_ui.amp_edit_candidate);
+
+    s_ui.amp_editing = false;
+    refresh_scene_amp_ui();
+    render_ui();
+}
+
+static void handle_amp_encoder_step(int step)
+{
+    if (!s_ui.amp_editing || step == 0) {
+        return;
+    }
+
+    int value = (int)s_ui.amp_edit_candidate + step;
+
+    // Clamp rather than wrap; this makes exploring unknown valid ID ranges
+    // safer and preserves the user's perceived ordering.
+    if (value < 0) value = 0;
+    if (value > 127) value = 127;
+
+    if (value == s_ui.amp_edit_candidate) {
+        return;
+    }
+
+    s_ui.amp_edit_candidate = (uint8_t)value;
+    render_ui();
+
+    if (send_amp_type(s_ui.amp_edit_candidate) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
     }
 }
 
@@ -788,7 +861,10 @@ static void buttons_init(void)
         .pin_bit_mask =
             (1ULL << BTN_PROGRAM) |
             (1ULL << BTN_STOP) |
-            (1ULL << BTN_FUNCTION),
+            (1ULL << BTN_FUNCTION) |
+            (1ULL << ENC1_A) |
+            (1ULL << ENC1_B) |
+            (1ULL << ENC1_SW),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -819,6 +895,16 @@ static void button_task(void *arg)
         .last_raw_change = now,
     };
 
+    encoder_state_t enc1 = {
+        .pin_a = ENC1_A,
+        .pin_b = ENC1_B,
+        .pin_sw = ENC1_SW,
+        .last_a = gpio_get_level(ENC1_A),
+        .last_sw_raw = false,
+        .sw_stable = false,
+        .sw_last_change = now,
+    };
+
     bool chord_active = false;
     bool chord_fired = false;
     TickType_t chord_start = 0;
@@ -829,6 +915,19 @@ static void button_task(void *arg)
         button_poll(&program, now);
         button_poll(&stop, now);
         button_poll(&function, now);
+
+        int enc_step = encoder_step(&enc1);
+        if (enc_step != 0 && s_ui.mode == UI_MODE_SCENE) {
+            handle_amp_encoder_step(enc_step);
+        }
+
+        if (encoder_click(&enc1, now) && s_ui.mode == UI_MODE_SCENE) {
+            if (s_ui.amp_editing) {
+                save_amp_edit();
+            } else {
+                start_amp_edit();
+            }
+        }
 
         if (program.stable_pressed && stop.stable_pressed) {
             if (!chord_active) {
@@ -862,7 +961,11 @@ static void button_task(void *arg)
         }
 
         if (function.click) {
-            cycle_mode();
+            if (s_ui.amp_editing) {
+                ESP_LOGW(TAG, "AMP EDIT active; press ENC1 to save first");
+            } else {
+                cycle_mode();
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
@@ -890,7 +993,10 @@ void app_main(void)
     ESP_LOGI(TAG, "======================================");
 
     nvs_init_safe();
+    ESP_ERROR_CHECK(snapshot_manager_init());
     buttons_init();
+
+    refresh_scene_amp_ui();
 
     esp_err_t display_rc = display_ui_init();
     if (display_rc == ESP_OK) {
