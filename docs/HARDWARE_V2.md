@@ -21,7 +21,7 @@ All wiring is centralized in `components/board/include/board_pins.h`.
 | TFT CS | 10 |
 | TFT DC | 9 |
 | TFT RST | 8 |
-| TFT BL | 3.3V/VCC always-on for bring-up |
+| TFT BL | 3.3V always-on (validated) |
 | ENC1 A/B/SW | 4 / 5 / 6 |
 | ENC2 A/B/SW | 15 / 16 / 17 |
 | Bottom FS1 | 18 |
@@ -119,14 +119,24 @@ The physical header shown on the 3.5-inch module maps as follows:
 | TFT label | Meaning | ESP32-S3 Stage 05 |
 |---|---|---|
 | GND | Ground | GND |
-| VCC | Module supply | 3.3V recommended for first bring-up |
+| VCC | Module supply | 3.3V (validated on this exact module) |
 | SCL | SPI clock | GPIO12 |
 | SDA | SPI MOSI / display data input | GPIO11 |
 | RST | Reset | GPIO8 |
 | DC | Data/Command | GPIO9 |
 | CS | Chip Select | GPIO10 |
-| BL | Backlight | 3.3V/VCC initially; GPIO control optional later |
+| BL | Backlight | 3.3V (validated on this exact module) |
 | SDA-0 | extra data pin | NC for normal SPI display writes |
 
 Do not connect SDA-0 to GPIO13 merely because the previous display used MISO.
 The Stage 05 SPI bus now sets MISO to -1.
+
+
+### Validated power note
+
+Physical bring-up on the user's exact ST7796S module confirmed:
+- VCC = 3.3V
+- BL = 3.3V
+- Supplying the module from VBUS/5V caused the backlight/display to behave incorrectly.
+
+Use 3.3V for both VCC and BL on this hardware revision.
