@@ -1,7 +1,11 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include "controller_types.h"
+#include "name_editor.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -9,42 +13,34 @@ extern "C" {
 #endif
 
 typedef enum {
-    UI_MODE_PRESET = 0,
-    UI_MODE_STOMP,
-    UI_MODE_SCENE,
-    UI_MODE_COUNT
-} ui_mode_t;
-
-typedef enum {
-    UI_BLOCK_UNKNOWN = 0,
-    UI_BLOCK_OFF,
-    UI_BLOCK_ON,
-    UI_BLOCK_PENDING_OFF,
-    UI_BLOCK_PENDING_ON
-} ui_block_state_t;
+    UI_SCREEN_PERFORMANCE = 0,
+    UI_SCREEN_BLOCK_EDITOR,
+    UI_SCREEN_NAME_EDITOR,
+    UI_SCREEN_TUNER,
+} ui_screen_t;
 
 typedef struct {
     bool ble_connected;
     bool midi_ready;
+    bool dirty;
+    bool tap_capture;
 
-    ui_mode_t mode;
-    uint8_t preset;
-    uint8_t scene; // 0=A, 1=B, 2=C, 3=D
+    ui_screen_t screen;
+    controller_mode_t mode;
+    uint8_t preset_index;
+    uint8_t scene_index;
+    uint16_t bpm;
+    delay_subdivision_t subdivision;
 
-    // Stage 04.3 snapshot amp editor.
-    bool amp_editing;
-    bool scene_amp_configured;
-    uint8_t scene_amp_type;
-    uint8_t amp_edit_candidate;
+    const controller_preset_t *preset;
 
-    ui_block_state_t fx1;
-    ui_block_state_t fx2;
-    ui_block_state_t amp;
-    ui_block_state_t cab;
-    ui_block_state_t mod;
-    ui_block_state_t delay;
-    ui_block_state_t reverb;
-    ui_block_state_t eq;
+    controller_block_t selected_block;
+    size_t selected_parameter;
+    bool parameter_editing;
+    bool parameter_known;
+    uint16_t parameter_value;
+
+    const name_editor_t *name_editor;
 } display_ui_state_t;
 
 esp_err_t display_ui_init(void);
