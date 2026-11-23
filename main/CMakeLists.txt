@@ -5,8 +5,14 @@ idf_component_register(
         nvs_flash
         esp_event
         bt
-        esp_driver_gpio
         nanocore_midi
         display_ui
-        snapshots
+        board
+        input_manager
+        controller_core
+        controller_storage
+        tempo_engine
+        status_leds
+        nanocore_map
+        name_editor
 )
