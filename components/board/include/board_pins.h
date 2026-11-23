@@ -60,7 +60,7 @@
 // ST7796S panel tuning. Change here only if your specific module needs it.
 #define BOARD_LCD_H_RES          480
 #define BOARD_LCD_V_RES          320
-#define BOARD_LCD_PIXEL_CLOCK_HZ 40000000
+#define BOARD_LCD_PIXEL_CLOCK_HZ 20000000
 #define BOARD_LCD_INVERT_COLOR     0
 #define BOARD_LCD_BGR               0
 #define BOARD_LCD_MIRROR_X         1
