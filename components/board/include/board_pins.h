@@ -63,6 +63,6 @@
 #define BOARD_LCD_PIXEL_CLOCK_HZ 20000000
 #define BOARD_LCD_INVERT_COLOR     0
 #define BOARD_LCD_BGR               0
-#define BOARD_LCD_MIRROR_X         1
+#define BOARD_LCD_MIRROR_X         0
 #define BOARD_LCD_MIRROR_Y         0
 #define BOARD_LCD_SWAP_XY          1
