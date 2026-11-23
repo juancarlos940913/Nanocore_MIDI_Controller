@@ -5,6 +5,7 @@ on:
     branches:
       - stage-03-midi-program-change
       - stage-04-ui-modes-stomp
+      - stage-05-hardware-v2
   workflow_dispatch:
 
 jobs:
