@@ -13,11 +13,17 @@
 // ST7796S 3.5" SPI display, native 320x480, used as 480x320 landscape
 #define BOARD_LCD_SCK           12
 #define BOARD_LCD_MOSI          11
-#define BOARD_LCD_MISO          13
+// This 9-pin ST7796S module exposes SCL/SDA for SPI and does not
+// require an SPI MISO connection for normal display writes.
+// Pin 9 "SDA-0" is left unconnected in Stage 05.
+#define BOARD_LCD_MISO          -1
 #define BOARD_LCD_CS            10
 #define BOARD_LCD_DC             9
 #define BOARD_LCD_RST            8
-#define BOARD_LCD_BL             7
+// Set to -1 when BL is wired directly to 3.3V/VCC for always-on
+// backlight. Use a GPIO only if the module/backlight current is known
+// to be safe or driven through a transistor.
+#define BOARD_LCD_BL            -1
 
 // Encoders
 #define BOARD_ENC1_A             4
