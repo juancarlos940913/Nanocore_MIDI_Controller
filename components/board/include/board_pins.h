@@ -28,6 +28,9 @@
 #define BOARD_ENC2_B            16
 #define BOARD_ENC2_SW           17
 
+#define BOARD_ENC1_REVERSE       0
+#define BOARD_ENC2_REVERSE       0
+
 // Footswitch layout
 // Bottom row, left -> right
 #define BOARD_FS_BOTTOM_1       18   // preset down / delete in name editor
