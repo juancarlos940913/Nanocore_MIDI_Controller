@@ -160,6 +160,9 @@ static void input_task(void *arg)
 
         int s1 = encoder_step(&e1);
         int s2 = encoder_step(&e2);
+        if (BOARD_ENC1_REVERSE) s1 = -s1;
+        if (BOARD_ENC2_REVERSE) s2 = -s2;
+
         if (s1 < 0) emit(INPUT_ENC1_LEFT);
         if (s1 > 0) emit(INPUT_ENC1_RIGHT);
         if (s2 < 0) emit(INPUT_ENC2_LEFT);
