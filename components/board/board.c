@@ -31,10 +31,13 @@ esp_err_t board_init(void)
     esp_err_t rc = gpio_config(&in_cfg);
     if (rc != ESP_OK) return rc;
 
-    const uint64_t output_mask =
+    uint64_t output_mask =
         (1ULL << BOARD_LED_TAP_BLUE) |
-        (1ULL << BOARD_LED_MODE_GREEN) |
-        (1ULL << BOARD_LCD_BL);
+        (1ULL << BOARD_LED_MODE_GREEN);
+
+#if BOARD_LCD_BL >= 0
+    output_mask |= (1ULL << BOARD_LCD_BL);
+#endif
 
     gpio_config_t out_cfg = {
         .pin_bit_mask = output_mask,
@@ -70,7 +73,11 @@ void board_set_mode_led(bool on)
 
 void board_set_backlight(bool on)
 {
+#if BOARD_LCD_BL >= 0
     gpio_set_level(BOARD_LCD_BL,
                    on ? BOARD_LCD_BL_ACTIVE_LEVEL
                       : !BOARD_LCD_BL_ACTIVE_LEVEL);
+#else
+    (void)on;
+#endif
 }
