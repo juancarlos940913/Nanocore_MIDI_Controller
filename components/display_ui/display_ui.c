@@ -64,6 +64,11 @@ static const glyph_t FONT[] = {
  {'/',{1,2,4,8,16,0,0}}, {'?',{14,17,1,2,4,0,4}},
  {'!',{4,4,4,4,4,0,4}}, {'_',{0,0,0,0,0,0,31}},
  {'+',{0,4,4,31,4,4,0}}, {'=',{0,31,0,31,0,0,0}},
+ {'@',{14,17,23,21,23,16,14}}, {'#',{10,31,10,10,31,10,0}},
+ {'&',{12,18,20,8,21,18,13}}, {'(',{2,4,8,8,8,4,2}},
+ {')',{8,4,2,2,2,4,8}}, {'[',{14,8,8,8,8,8,14}},
+ {']',{14,2,2,2,2,2,14}}, {'*',{0,21,14,31,14,21,0}},
+ {',',{0,0,0,0,0,4,8}},
  {'0',{14,17,19,21,25,17,14}}, {'1',{4,12,4,4,4,4,14}},
  {'2',{14,17,1,2,4,8,31}}, {'3',{30,1,1,14,1,1,30}},
  {'4',{2,6,10,18,31,2,2}}, {'5',{31,16,16,30,1,1,30}},
@@ -246,12 +251,20 @@ static void block_editor(const display_ui_state_t *s)
     text(20,58,title,C_WHITE,2);
 
     size_t count=nanocore_parameter_count(s->selected_block);
+    const size_t visible=8;
+    size_t first=0;
+    if(s->selected_parameter>=visible)
+        first=s->selected_parameter-(visible-1);
+    if(first+visible>count && count>visible)
+        first=count-visible;
+
     const int start_y=98;
-    for(size_t i=0;i<count && i<8;++i){
+    for(size_t row=0;row<visible && first+row<count;++row){
+        size_t i=first+row;
         const nc_parameter_t *p=nanocore_parameter(s->selected_block,i);
-        int y=start_y+(int)i*22;
+        int y=start_y+(int)row*22;
         bool sel=i==s->selected_parameter;
-        if(sel) fill_rect(16,y-3,448,20,C_PANEL2);
+        if(sel) fill_rect(16,y-3,260,20,C_PANEL2);
         text(28,y,p?p->label:"?",sel?C_CYAN:C_MUTED,1);
     }
 
