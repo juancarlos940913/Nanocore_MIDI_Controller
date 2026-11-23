@@ -19,8 +19,8 @@ typedef struct {
     const char *label;
     nc_param_kind_t kind;
     uint8_t cc;
-    uint8_t min_value;
-    uint8_t max_value;
+    uint16_t min_value;
+    uint16_t max_value;
 } nc_parameter_t;
 
 const char *nanocore_block_name(controller_block_t block);
