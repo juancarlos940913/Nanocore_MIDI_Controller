@@ -9,7 +9,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#define POLL_MS             5
+#define POLL_MS            10
 #define DEBOUNCE_MS        30
 #define MODE_LONG_MS      650
 #define CHORD_HOLD_MS      70
@@ -217,7 +217,11 @@ static void input_task(void *arg)
         maybe_release_short(&tl, ch_tl);
         maybe_release_short(&tr, ch_tr);
 
-        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        TickType_t delay_ticks = pdMS_TO_TICKS(POLL_MS);
+        if (delay_ticks < 1) {
+            delay_ticks = 1;
+        }
+        vTaskDelay(delay_ticks);
     }
 }
 
@@ -226,7 +230,7 @@ esp_err_t input_manager_init(void)
     s_queue = xQueueCreate(32, sizeof(input_event_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
 
-    if (xTaskCreate(input_task, "nc_input", 4096, NULL, 8, NULL) != pdPASS) {
+    if (xTaskCreate(input_task, "nc_input", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
