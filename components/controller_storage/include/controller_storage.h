@@ -1,0 +1,38 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "controller_types.h"
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+esp_err_t controller_storage_init(void);
+
+esp_err_t controller_storage_load_runtime(controller_runtime_t *runtime);
+esp_err_t controller_storage_save_runtime(const controller_runtime_t *runtime);
+
+esp_err_t controller_storage_load_preset(uint8_t index,
+                                         controller_preset_t *preset);
+esp_err_t controller_storage_save_preset(uint8_t index,
+                                         const controller_preset_t *preset);
+
+void controller_storage_default_preset(uint8_t index,
+                                       controller_preset_t *preset);
+
+bool controller_assignment_get(const midi_assignment_t *items,
+                               size_t count,
+                               uint8_t cc,
+                               uint8_t *value);
+
+esp_err_t controller_assignment_set(midi_assignment_t *items,
+                                    size_t count,
+                                    uint8_t cc,
+                                    uint8_t value);
+
+#ifdef __cplusplus
+}
+#endif
