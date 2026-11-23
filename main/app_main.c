@@ -156,12 +156,21 @@ static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
         return rc;
     }
 
-    rc = send_cc(cc, value);
-    if (rc == ESP_OK) {
-        s_dirty = true;
+    // The working edit is valid even if BLE is temporarily disconnected.
+    // NVS SAVE must never depend on radio availability.
+    s_dirty = true;
+
+    if (s_midi_ready) {
+        esp_err_t tx = send_cc(cc, value);
+        if (tx != ESP_OK) {
+            ESP_LOGW(TAG, "CC%u stored locally; live MIDI TX failed", cc);
+        }
+    } else {
+        ESP_LOGI(TAG, "CC%u=%u stored locally (MIDI offline)", cc, value);
     }
+
     render_ui();
-    return rc;
+    return ESP_OK;
 }
 
 static void apply_assignments(const midi_assignment_t *items,
@@ -283,6 +292,9 @@ static void change_scene(int delta)
 
 static void cycle_mode(void)
 {
+    s_parameter_editing = false;
+    s_screen = UI_SCREEN_PERFORMANCE;
+
     s_runtime.mode =
         (controller_mode_t)((s_runtime.mode + 1) % CTRL_MODE_COUNT);
 
