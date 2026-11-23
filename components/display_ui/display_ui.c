@@ -398,7 +398,9 @@ esp_err_t display_ui_init(void)
 
     esp_lcd_panel_dev_config_t panel_cfg={
         .reset_gpio_num=BOARD_LCD_RST,
-        .rgb_ele_order=LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order=BOARD_LCD_BGR
+            ? LCD_RGB_ELEMENT_ORDER_BGR
+            : LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel=16,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7796(io,&panel_cfg,&s_panel));
