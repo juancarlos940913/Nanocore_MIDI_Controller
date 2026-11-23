@@ -26,6 +26,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #define LCD_HOST          SPI2_HOST
 #define LCD_W             BOARD_LCD_H_RES
@@ -415,8 +416,21 @@ esp_err_t display_ui_init(void)
         s_panel,BOARD_LCD_INVERT_COLOR));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel,true));
 
-    memset(s_fb,0,fb_bytes);
+    // Bring-up self-test: four vertical RGB/white bars. This makes it
+    // possible to distinguish a backlight/power problem from an SPI/data
+    // problem before the normal UI starts.
+    fill_rect(0, 0, LCD_W / 4, LCD_H, RGB565(255, 0, 0));
+    fill_rect(LCD_W / 4, 0, LCD_W / 4, LCD_H, RGB565(0, 255, 0));
+    fill_rect(LCD_W / 2, 0, LCD_W / 4, LCD_H, RGB565(0, 0, 255));
+    fill_rect((LCD_W * 3) / 4, 0, LCD_W - (LCD_W * 3) / 4, LCD_H, C_WHITE);
+
     board_set_backlight(true);
+
+    esp_err_t test_rc = flush_screen();
+    ESP_LOGI(TAG, "LCD self-test pattern TX: %s", esp_err_to_name(test_rc));
+    vTaskDelay(pdMS_TO_TICKS(700));
+
+    memset(s_fb,0,fb_bytes);
 
     s_ready=true;
     ESP_LOGI(TAG,"ST7796S ready 480x320 landscape, framebuffer in PSRAM");
