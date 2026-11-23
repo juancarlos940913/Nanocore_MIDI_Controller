@@ -56,15 +56,21 @@ esp_err_t board_init(void)
 
 void board_set_tap_led(bool on)
 {
-    gpio_set_level(BOARD_LED_TAP_BLUE, on ? 1 : 0);
+    gpio_set_level(BOARD_LED_TAP_BLUE,
+                   on ? BOARD_LED_TAP_ACTIVE_LEVEL
+                      : !BOARD_LED_TAP_ACTIVE_LEVEL);
 }
 
 void board_set_mode_led(bool on)
 {
-    gpio_set_level(BOARD_LED_MODE_GREEN, on ? 1 : 0);
+    gpio_set_level(BOARD_LED_MODE_GREEN,
+                   on ? BOARD_LED_MODE_ACTIVE_LEVEL
+                      : !BOARD_LED_MODE_ACTIVE_LEVEL);
 }
 
 void board_set_backlight(bool on)
 {
-    gpio_set_level(BOARD_LCD_BL, on ? 1 : 0);
+    gpio_set_level(BOARD_LCD_BL,
+                   on ? BOARD_LCD_BL_ACTIVE_LEVEL
+                      : !BOARD_LCD_BL_ACTIVE_LEVEL);
 }
