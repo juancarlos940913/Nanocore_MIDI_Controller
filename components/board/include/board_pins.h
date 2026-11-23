@@ -43,6 +43,9 @@
 #define BOARD_LED_MODE_GREEN    39
 
 #define BOARD_INPUT_ACTIVE_LEVEL 0
+#define BOARD_LED_TAP_ACTIVE_LEVEL 1
+#define BOARD_LED_MODE_ACTIVE_LEVEL 1
+#define BOARD_LCD_BL_ACTIVE_LEVEL 1
 
 
 // ST7796S panel tuning. Change here only if your specific module needs it.
@@ -50,6 +53,7 @@
 #define BOARD_LCD_V_RES          320
 #define BOARD_LCD_PIXEL_CLOCK_HZ 40000000
 #define BOARD_LCD_INVERT_COLOR     0
+#define BOARD_LCD_BGR               0
 #define BOARD_LCD_MIRROR_X         1
 #define BOARD_LCD_MIRROR_Y         0
 #define BOARD_LCD_SWAP_XY          1
