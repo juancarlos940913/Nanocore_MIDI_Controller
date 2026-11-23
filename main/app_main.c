@@ -1032,11 +1032,13 @@ void app_main(void)
 
     tempo_engine_init(s_preset.bpm);
 
-    ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
-    ESP_ERROR_CHECK(input_manager_init());
-
+    // Bring up the display before background input/LED tasks so a fault in
+    // those subsystems cannot hide boot diagnostics or leave the TFT dark.
     ESP_ERROR_CHECK(display_ui_init());
     render_ui();
+
+    ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
+    ESP_ERROR_CHECK(input_manager_init());
 
     ble_init();
 
