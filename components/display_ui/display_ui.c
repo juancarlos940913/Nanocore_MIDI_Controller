@@ -15,6 +15,7 @@
 #include "board.h"
 #include "board_pins.h"
 #include "nanocore_map.h"
+#include "tempo_engine.h"
 
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
