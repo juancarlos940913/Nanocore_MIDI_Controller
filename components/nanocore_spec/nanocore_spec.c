@@ -21,7 +21,7 @@
  */
 static const nanocore_param_info_t FX1_GATE_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -100.0f,   0.0f, 0),
-    PARAM_3PT  ("Release",   "ms",    5.0f,  50.0f, 100.0f, 1),
+    PARAM_3PT  ("Release",   "ms",    5.0f,  50.0f, 100.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_AUTO_GATE_PARAMS[] = {
@@ -32,7 +32,7 @@ static const nanocore_param_info_t FX1_AUTO_GATE_PARAMS[] = {
 static const nanocore_param_info_t FX1_GATE_COMP_PARAMS[] = {
     PARAM_LINEAR("Gate",      "dB", -100.0f,    0.0f, 0),
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 0),
     PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 0),
     PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 0),
     PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 0),
@@ -41,7 +41,7 @@ static const nanocore_param_info_t FX1_GATE_COMP_PARAMS[] = {
 
 static const nanocore_param_info_t FX1_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 0),
     PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 0),
     PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 0),
     PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 0),
@@ -55,7 +55,7 @@ static const nanocore_param_info_t FX1_COMP_PARAMS[] = {
  */
 static const nanocore_param_info_t FX1_PEAK_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -60.0f,   0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",   1.0f,  10.0f, 20.0f, 1),
+    PARAM_3PT  ("Ratio",      ":1",   1.0f,  10.0f, 20.0f, 0),
     PARAM_3PT  ("Attack",     "ms",   0.1f,   4.5f, 200.0f, 1),
     PARAM_3PT  ("Release",    "ms",   1.0f,  40.0f, 2000.0f, 0),
     PARAM_UNKNOWN,
@@ -107,4 +107,33 @@ float nanocore_spec_normalized_to_real(
 
     return param->min_value +
            normalized * (param->max_value - param->min_value);
+}
+
+
+float nanocore_spec_real_to_normalized(
+    const nanocore_param_info_t *param,
+    float real_value)
+{
+    if (!param) return real_value;
+
+    if (real_value <= param->min_value) return 0.0f;
+    if (real_value >= param->max_value) return 1.0f;
+
+    if (param->curve == NC_PARAM_THREE_POINT) {
+        if (real_value <= param->mid_value) {
+            const float span = param->mid_value - param->min_value;
+            if (span <= 0.0f) return 0.0f;
+            return 0.5f *
+                   (real_value - param->min_value) / span;
+        }
+
+        const float span = param->max_value - param->mid_value;
+        if (span <= 0.0f) return 1.0f;
+        return 0.5f +
+               0.5f * (real_value - param->mid_value) / span;
+    }
+
+    const float span = param->max_value - param->min_value;
+    if (span <= 0.0f) return 0.0f;
+    return (real_value - param->min_value) / span;
 }
