@@ -36,6 +36,7 @@
 
 #define BOARD_ENC1_REVERSE       0
 #define BOARD_ENC2_REVERSE       0
+#define BOARD_ENCODER_EDGES_PER_DETENT 4
 
 // Footswitch layout
 // Bottom row, left -> right
@@ -63,6 +64,6 @@
 #define BOARD_LCD_PIXEL_CLOCK_HZ 20000000
 #define BOARD_LCD_INVERT_COLOR     0
 #define BOARD_LCD_BGR               0
-#define BOARD_LCD_MIRROR_X         0
-#define BOARD_LCD_MIRROR_Y         0
+#define BOARD_LCD_MIRROR_X         1
+#define BOARD_LCD_MIRROR_Y         1
 #define BOARD_LCD_SWAP_XY          1
