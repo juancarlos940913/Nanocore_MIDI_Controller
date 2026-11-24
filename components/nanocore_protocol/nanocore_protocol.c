@@ -335,17 +335,25 @@ static esp_err_t send_save(uint8_t slot)
     return nanocore_midi_send_sysex(msg, sizeof(msg));
 }
 
-static esp_err_t send_read_name_window(uint8_t slot)
+static esp_err_t send_read_preset_window(uint8_t slot,
+                                             uint16_t offset,
+                                             uint8_t length)
 {
-    /* Raw command body documented by ToneCommand captures:
-     * [02, seqLo, seqHi, 41,00, len=4,00, slot, offsetLo,offsetHi, length]
-     * Then 7-bit pack everything after F0 7D 4E 43 70.
+    /*
+     * ToneCommand window read:
+     * [02, seqLo, seqHi, 41,00, len=4,00,
+     *  slot, offsetLo, offsetHi, length]
+     *
+     * BLE replies carry at most 59 preset-data bytes per request.
      */
     uint8_t raw[] = {
         0x02, next_seq(), 0x00,
         OP_READ_PRESET, 0x00,
         0x04, 0x00,
-        slot, 0x00, 0x00, 59
+        slot,
+        (uint8_t)(offset & 0xFF),
+        (uint8_t)((offset >> 8) & 0xFF),
+        length
     };
     uint8_t packed[20] = {0};
     size_t packed_len = pack7(raw, sizeof(raw), packed, sizeof(packed));
@@ -362,7 +370,14 @@ static esp_err_t send_read_name_window(uint8_t slot)
     p += packed_len;
     msg[p++] = 0xF7;
 
+    ESP_LOGI(TAG, "Read preset window slot=%u offset=%u len=%u",
+             slot, offset, length);
     return nanocore_midi_send_sysex(msg, p);
+}
+
+static esp_err_t send_read_name_window(uint8_t slot)
+{
+    return send_read_preset_window(slot, 0, 59);
 }
 
 static void parse_name_payload(const uint8_t *payload, size_t len)
@@ -425,6 +440,76 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
     queue_event(e);
 
     ESP_LOGI(TAG, "Preset %u name RX: %s", slot, name);
+}
+
+
+static bool parse_preset_window_header(const uint8_t *payload,
+                                       size_t len,
+                                       uint8_t *slot,
+                                       uint16_t *offset,
+                                       const uint8_t **data,
+                                       size_t *data_len)
+{
+    if (!payload || len < 5) return false;
+
+    if (slot) *slot = payload[0];
+    if (offset) {
+        *offset = (uint16_t)(payload[1] |
+                            ((uint16_t)payload[2] << 8));
+    }
+    if (data) *data = &payload[5];
+    if (data_len) *data_len = len - 5;
+    return true;
+}
+
+static void parse_models_payload(const uint8_t *payload, size_t len)
+{
+    uint8_t slot = 0;
+    uint16_t offset = 0;
+    const uint8_t *data = NULL;
+    size_t data_len = 0;
+
+    if (!parse_preset_window_header(payload, len,
+                                    &slot, &offset,
+                                    &data, &data_len)) {
+        return;
+    }
+
+    /*
+     * Saved-preset footer:
+     *   ... <AMP_INDEX> 21 01 <CAB_INDEX> 24 01 ...
+     *
+     * Both indices are plain 0..29 model ids.
+     */
+    for (size_t i = data_len; i-- > 1;) {
+        if (i + 4 >= data_len) continue;
+        if (data[i] == 0x21 &&
+            data[i + 1] == 0x01 &&
+            data[i + 3] == 0x24 &&
+            data[i + 4] == 0x01) {
+
+            const uint8_t amp = data[i - 1];
+            const uint8_t cab = data[i + 2];
+
+            nanocore_protocol_event_t *e =
+                scratch_event(NC_PROTO_EVENT_PRESET_MODELS);
+            e->slot = slot;
+            e->amp_model_known = amp < 30;
+            e->cab_model_known = cab < 30;
+            e->amp_model = amp;
+            e->cab_model = cab;
+            queue_event(e);
+
+            ESP_LOGI(TAG,
+                     "Preset models slot=%u offset=%u AMP=%u CAB=%u",
+                     slot, offset, amp, cab);
+            return;
+        }
+    }
+
+    ESP_LOGW(TAG,
+             "AMP/CAB footer not found slot=%u offset=%u data=%u",
+             slot, offset, (unsigned)data_len);
 }
 
 static void parse_live_payload(const uint8_t *p, size_t len)
@@ -568,7 +653,20 @@ static void dispatch_complete_reply(uint16_t opcode,
     if (opcode == OP_LIVE_STATE) {
         parse_live_payload(payload, len);
     } else if (opcode == OP_READ_PRESET) {
-        parse_name_payload(payload, len);
+        /*
+         * 0x41 replies echo slot + offset at payload[0..2].
+         * Offset 0 is our short name read; offset 200 is the saved-preset
+         * tail containing authoritative AMP/CAB model indices.
+         */
+        uint16_t offset = len >= 3
+            ? (uint16_t)(payload[1] | ((uint16_t)payload[2] << 8))
+            : 0xFFFF;
+
+        if (offset == 0) {
+            parse_name_payload(payload, len);
+        } else {
+            parse_models_payload(payload, len);
+        }
     } else if (opcode == OP_SAVE_PRESET &&
                s_wait_save_slot != 0xFF &&
                len > 0 &&
@@ -729,6 +827,20 @@ esp_err_t nanocore_protocol_request_preset_name(uint8_t slot)
         return ESP_ERR_INVALID_STATE;
     }
     return send_read_name_window(slot);
+}
+
+esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
+{
+    if (!s_connected || slot >= CTRL_PRESET_COUNT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Real saved presets are ~265 bytes and the AMP/CAB footer lives near the
+     * tail of page 2. One BLE-safe window starting at offset 200 contains the
+     * footer on current firmware without walking the whole preset.
+     */
+    return send_read_preset_window(slot, 200, 59);
 }
 
 esp_err_t nanocore_protocol_set_block_type(
