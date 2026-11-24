@@ -229,7 +229,13 @@ static void footer(const display_ui_state_t *s)
              tempo_engine_subdivision_name(s->subdivision),
              s->tap_capture?"  TAP":"");
     text(12,296,buf,s->tap_capture?C_BLUE:C_MUTED,1);
-    text(300,296,"ENC1 SELECT  ENC2 BACK",C_MUTED,1);
+
+    if (s->mode == CTRL_MODE_STOMP &&
+        s->screen == UI_SCREEN_PERFORMANCE) {
+        text(215,296,"TL FX2  TR DLY  B1 MOD  B2 REV",C_MUTED,1);
+    } else {
+        text(300,296,"ENC1 SELECT  ENC2 BACK",C_MUTED,1);
+    }
 }
 
 static void performance(const display_ui_state_t *s)
