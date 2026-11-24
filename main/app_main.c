@@ -1458,7 +1458,7 @@ static void handle_input(input_event_t e)
             esp_err_t rc = nanocore_protocol_request_preset_models(
                 s_runtime.current_preset);
             if (rc == ESP_OK) {
-                show_notice("READ AMP/CAB MODEL");
+                show_notice("READ SAVED AMP/CAB");
             } else {
                 ESP_LOGW(TAG, "Preset model read failed: %s",
                          esp_err_to_name(rc));
