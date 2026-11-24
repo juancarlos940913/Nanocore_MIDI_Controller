@@ -334,7 +334,7 @@ static const nanocore_candidate_type_t FX2_CANDIDATES[] = {
 static const nanocore_candidate_type_t DELAY_CANDIDATES[] = {
     {0, "BBD",       5, "Time,Feedback,Age,Mix,Ping Pong"},
     {1, "Digital",   4, "Time,Feedback,Mix,Ping Pong"},
-    {2, "Duck",      9, "Time,Feedback,Sensitivity,Depth,Attack,Release,Filter,Mix,Ping Pong"},
+    {2, "Duck",      9, "Time,Feedback,Sensitivity,Depth,Attack,Release,Filter,Ping Pong,Mix"},
     {3, "Ice",       5, "Time,Feedback,Interval,Mix,Ping Pong"},
     {4, "Reverse",   4, "Time,Feedback,Mix,Ping Pong"},
     {5, "LoFi",      6, "Time,Feedback,Bit Depth,LoFi Mix,Mix,Ping Pong"},
@@ -359,13 +359,14 @@ static const nanocore_candidate_type_t MOD_CANDIDATES[] = {
  * CC value/id 4). Room/Plate/Hall/Concert/Cloud/Spring remain unchanged.
  */
 static const nanocore_candidate_type_t REVERB_CANDIDATES[] = {
+    /* Physical selector order on firmware 1.2. */
     {0, "Room",    5, "Decay,Pre Delay,Tone,Mod,Mix"},
     {1, "Plate",   5, "Decay,Pre Delay,Tone,Mod,Mix"},
     {2, "Hall",    5, "Decay,Pre Delay,Tone,LF Damp,Mix"},
     {3, "Concert", 5, "Decay,Pre Delay,HF Damp,Mod,Mix"},
+    {6, "Spring",  5, "Decay,Pre Delay,Crossover,Tone,Mix"},
     {7, "Shimmer", 5, "Decay,Pre Delay,Tone,Pitch,Mix"},
     {5, "Cloud",   5, "Decay,Tone,Mod Depth,Mod Rate,Mix"},
-    {6, "Spring",  5, "Decay,Pre Delay,Crossover,Tone,Mix"},
 };
 
 static const nanocore_candidate_type_t EQ_CANDIDATES[] = {
