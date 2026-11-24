@@ -979,21 +979,97 @@ static void render_ui(void)
     memcpy(u.block_known, s_block_known, sizeof(u.block_known));
     memcpy(u.block_on, s_block_on, sizeof(u.block_on));
 
-    bool known = false;
-    u.parameter_value = current_parameter_value(&known);
-    u.parameter_known = known;
-    u.parameter_text = NULL;
+    char parameter_text[72] = {0};
 
-    const nc_parameter_t *selected = nanocore_parameter(
-        s_selected_block, s_selected_parameter);
-    if (known &&
-        s_selected_block == BLOCK_FX1 &&
-        selected &&
-        selected->kind == NC_PARAM_MIDI &&
-        selected->cc == nanocore_block_type_cc(BLOCK_FX1)) {
-        const nanocore_effect_type_info_t *info =
-            nanocore_spec_fx1_selector((size_t)u.parameter_value);
-        if (info) u.parameter_text = info->name;
+    if (s_selected_block == BLOCK_FX1) {
+        const nanocore_effect_type_info_t *info = current_fx1_info();
+
+        u.editor_override = true;
+        u.editor_parameter_count =
+            2 + (info ? info->expected_param_count : 0);
+        u.editor_parameter_labels[0] = "ON/OFF";
+        u.editor_parameter_labels[1] = "TYPE";
+
+        if (info && info->params) {
+            for (uint8_t i = 0;
+                 i < info->expected_param_count &&
+                 (size_t)(i + 2) < UI_MAX_EDITOR_PARAMETERS;
+                 ++i) {
+                u.editor_parameter_labels[i + 2] =
+                    info->params[i].name;
+            }
+        }
+
+        if (s_selected_parameter < u.editor_parameter_count) {
+            u.selected_parameter_label =
+                u.editor_parameter_labels[s_selected_parameter];
+        }
+
+        if (s_selected_parameter == 0) {
+            u.parameter_known = s_block_known[BLOCK_FX1];
+            u.parameter_value =
+                s_block_on[BLOCK_FX1] ? 127 : 0;
+
+            if (u.parameter_known) {
+                snprintf(parameter_text,sizeof(parameter_text),"%s",
+                         s_block_on[BLOCK_FX1] ? "ON" : "OFF");
+                u.parameter_text = parameter_text;
+            }
+        } else if (s_selected_parameter == 1) {
+            bool known = false;
+            u.parameter_value = current_parameter_value(&known);
+            u.parameter_known = known;
+
+            if (known) {
+                const nanocore_effect_type_info_t *selected_type =
+                    nanocore_spec_fx1_selector(
+                        (size_t)u.parameter_value);
+                if (selected_type) {
+                    u.parameter_text = selected_type->name;
+                }
+            }
+        } else if (info && info->params) {
+            uint8_t param_index =
+                (uint8_t)(s_selected_parameter - 2);
+
+            if (s_block_profile_known[BLOCK_FX1] &&
+                param_index < s_block_param_count[BLOCK_FX1] &&
+                param_index < info->expected_param_count) {
+
+                const nanocore_param_info_t *p =
+                    &info->params[param_index];
+                float normalized =
+                    s_block_params[BLOCK_FX1][param_index];
+                float real =
+                    nanocore_spec_normalized_to_real(
+                        p, normalized);
+
+                u.parameter_known = true;
+
+                if (p->unit && strcmp(p->unit, ":1") == 0) {
+                    snprintf(parameter_text,sizeof(parameter_text),
+                             "%.*f:1",
+                             p->decimals,(double)real);
+                } else if (p->unit && p->unit[0]) {
+                    snprintf(parameter_text,sizeof(parameter_text),
+                             "%.*f %s",
+                             p->decimals,(double)real,p->unit);
+                } else {
+                    snprintf(parameter_text,sizeof(parameter_text),
+                             "%.*f",
+                             p->decimals,(double)real);
+                }
+
+                u.parameter_text = parameter_text;
+            } else {
+                u.parameter_known = false;
+            }
+        }
+    } else {
+        bool known = false;
+        u.parameter_value = current_parameter_value(&known);
+        u.parameter_known = known;
+        u.parameter_text = NULL;
     }
 
     display_ui_render(&u);
