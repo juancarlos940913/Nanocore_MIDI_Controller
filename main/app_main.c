@@ -37,6 +37,7 @@
 #include "nanocore_mapper.h"
 #include "nanocore_midi.h"
 #include "nanocore_protocol.h"
+#include "nanocore_spec.h"
 #include "status_leds.h"
 #include "tempo_engine.h"
 
@@ -67,6 +68,8 @@ static bool s_tuner_on;
 
 static bool s_block_known[BLOCK_COUNT];
 static bool s_block_on[BLOCK_COUNT];
+static bool s_block_profile_known[BLOCK_COUNT];
+static uint8_t s_block_variant[BLOCK_COUNT];
 
 static char s_notice[64];
 static int64_t s_notice_until_us;
@@ -115,6 +118,8 @@ static void clear_block_state(void)
 {
     memset(s_block_known, 0, sizeof(s_block_known));
     memset(s_block_on, 0, sizeof(s_block_on));
+    memset(s_block_profile_known, 0, sizeof(s_block_profile_known));
+    memset(s_block_variant, 0, sizeof(s_block_variant));
 }
 
 static int block_from_onoff_cc(uint8_t cc)
@@ -256,6 +261,33 @@ static esp_err_t send_cc(uint8_t cc, uint8_t value)
     return rc;
 }
 
+static esp_err_t send_fx1_type_raw(uint8_t raw_type)
+{
+    const nanocore_effect_type_info_t *info =
+        nanocore_spec_fx1_type(raw_type);
+
+    if (!info || !info->default_normalized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t rc = nanocore_protocol_set_block_type(
+        BLOCK_FX1,
+        raw_type,
+        info->default_normalized,
+        info->expected_param_count);
+
+    if (rc == ESP_OK) {
+        s_block_profile_known[BLOCK_FX1] = true;
+        s_block_variant[BLOCK_FX1] = raw_type;
+
+        ESP_LOGI(TAG,
+                 "FX1 TYPE -> %s (raw=%u)",
+                 info->name, raw_type);
+    }
+
+    return rc;
+}
+
 static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
 {
     size_t count = 0;
@@ -276,9 +308,24 @@ static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
     }
 
     if (s_midi_ready) {
-        esp_err_t tx = send_cc(cc, value);
+        esp_err_t tx;
+
+        if (cc == nanocore_block_type_cc(BLOCK_FX1) &&
+            value < nanocore_spec_fx1_selector_count()) {
+            /*
+             * CC40 is retained only as the controller/NVS mirror of the raw
+             * type id. Current NanoCore extended FX1 types are selected by
+             * the captured ToneCommand 0x6D SysEx mechanism.
+             */
+            tx = send_fx1_type_raw(value);
+        } else {
+            tx = send_cc(cc, value);
+        }
+
         if (tx != ESP_OK) {
-            ESP_LOGW(TAG, "CC%u stored locally; live MIDI TX failed", cc);
+            ESP_LOGW(TAG,
+                     "CC%u/raw=%u stored locally; live TX failed",
+                     cc, value);
         }
     } else {
         ESP_LOGI(TAG, "CC%u=%u stored locally (MIDI offline)", cc, value);
@@ -296,7 +343,15 @@ static void apply_assignments(const midi_assignment_t *items,
     for (size_t i = 0; i < count; ++i) {
         if (!items[i].used) continue;
 
-        if (send_cc(items[i].cc, items[i].value) == ESP_OK) {
+        esp_err_t tx;
+        if (items[i].cc == nanocore_block_type_cc(BLOCK_FX1) &&
+            items[i].value < nanocore_spec_fx1_selector_count()) {
+            tx = send_fx1_type_raw(items[i].value);
+        } else {
+            tx = send_cc(items[i].cc, items[i].value);
+        }
+
+        if (tx == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
         }
     }
@@ -550,6 +605,32 @@ static uint16_t current_parameter_value(bool *known)
     }
 
     if (p->kind == NC_PARAM_MIDI &&
+        s_selected_block == BLOCK_FX1 &&
+        p->cc == nanocore_block_type_cc(BLOCK_FX1)) {
+        uint8_t raw_type = 0;
+        bool raw_known = false;
+
+        if (s_block_profile_known[BLOCK_FX1]) {
+            raw_type = s_block_variant[BLOCK_FX1];
+            raw_known = true;
+        } else {
+            raw_known = effective_cc(p->cc, &raw_type);
+        }
+
+        if (raw_known) {
+            int selector =
+                nanocore_spec_fx1_selector_index(raw_type);
+            if (selector >= 0) {
+                if (known) *known = true;
+                return (uint16_t)selector;
+            }
+        }
+
+        if (known) *known = false;
+        return 0;
+    }
+
+    if (p->kind == NC_PARAM_MIDI &&
         p->cc == nanocore_block_onoff_cc(s_selected_block) &&
         s_block_known[s_selected_block]) {
         if (known) *known = true;
@@ -603,6 +684,31 @@ static void adjust_parameter(int delta)
         s_preset.delay_subdivision = (delay_subdivision_t)sub;
         s_dirty = true;
         update_delay_from_tempo();
+        return;
+    }
+
+    if (p->kind == NC_PARAM_MIDI &&
+        s_selected_block == BLOCK_FX1 &&
+        p->cc == nanocore_block_type_cc(BLOCK_FX1)) {
+        bool known = false;
+        int current = (int)current_parameter_value(&known);
+        if (!known) current = 0;
+
+        const int count =
+            (int)nanocore_spec_fx1_selector_count();
+        int next = current + delta;
+        while (next < 0) next += count;
+        while (next >= count) next -= count;
+
+        const nanocore_effect_type_info_t *info =
+            nanocore_spec_fx1_selector((size_t)next);
+        if (!info) return;
+
+        /*
+         * Persist the raw wire type id in the same CC40 mirror slot used by
+         * older stages, but transmit through SysEx in set_working_cc().
+         */
+        (void)set_working_cc(p->cc, info->id);
         return;
     }
 
@@ -771,6 +877,19 @@ static void render_ui(void)
     bool known = false;
     u.parameter_value = current_parameter_value(&known);
     u.parameter_known = known;
+    u.parameter_text = NULL;
+
+    const nc_parameter_t *selected = nanocore_parameter(
+        s_selected_block, s_selected_parameter);
+    if (known &&
+        s_selected_block == BLOCK_FX1 &&
+        selected &&
+        selected->kind == NC_PARAM_MIDI &&
+        selected->cc == nanocore_block_type_cc(BLOCK_FX1)) {
+        const nanocore_effect_type_info_t *info =
+            nanocore_spec_fx1_selector((size_t)u.parameter_value);
+        if (info) u.parameter_text = info->name;
+    }
 
     display_ui_render(&u);
 }
@@ -1275,6 +1394,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         memcpy(s_block_known, e->block_known, sizeof(s_block_known));
         memcpy(s_block_on, e->block_on, sizeof(s_block_on));
+        memcpy(s_block_profile_known, e->block_profile_known,
+               sizeof(s_block_profile_known));
+        memcpy(s_block_variant, e->block_variant,
+               sizeof(s_block_variant));
 
         // Stage 06 mapper consumes the exact accepted LIVE snapshot.
         nanocore_mapper_on_live_state(e);
