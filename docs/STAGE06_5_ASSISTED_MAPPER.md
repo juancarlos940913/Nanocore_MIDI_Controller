@@ -1,0 +1,169 @@
+# Stage 06.5 — Assisted Mapper
+
+## Purpose
+
+Stage 06.5 changes the mapping workflow from manual reverse engineering to
+candidate validation.
+
+Candidate catalogs are preloaded from captured ToneCommand/NanoCore protocol
+work. The user's physical NanoCore remains the source of truth.
+
+For each capture, the controller compares:
+- target block;
+- raw type id from live opcode 0x63;
+- candidate type name;
+- expected parameter count;
+- actual parameter count;
+- raw normalized parameter values.
+
+The mapper reports:
+- `MATCH`: candidate raw id + parameter count agree with the device;
+- `MISMATCH`: candidate exists but live parameter count differs;
+- `UNKNOWN`: raw id is not in the candidate database;
+- `PROFILE_ONLY`: AMP/CAB live profile is visible, but the current 0x63
+  raw variant byte is not treated as an authoritative model id.
+
+## Controls
+
+From the normal PERFORMANCE screen:
+
+1. Rotate ENC1 until the block you want to map is selected.
+2. Hold TOP LEFT + TOP RIGHT to enable Assisted Mapper.
+3. The selected block becomes the mapper target and stays fixed for that
+   session.
+4. One baseline 0x63 capture is queued automatically.
+5. Change one TYPE on the physical NanoCore.
+6. Wait briefly for the NanoCore screen to settle.
+7. Press ENC2 once to capture the new live profile.
+8. Repeat steps 5–7 for every type.
+9. Hold TOP LEFT + TOP RIGHT again to stop the session and print the summary.
+
+Do not continuously press ENC2. One press per settled physical type is enough.
+
+## Example
+
+```
+NC_MAP: ASSIST|START|block=EQ|candidate_types=3|mode=manual_capture
+
+NC_MAP: ASSIST|CAPTURE|block=EQ|raw=0|candidate=3-band EQ|expected_count=4|got_count=4|status=MATCH
+NC_MAP: ASSIST|CANDIDATE_PARAMS|block=EQ|raw=0|Low,Mid,High,Level
+NC_MAP: ASSIST|RAW|block=EQ|variant=0|count=4|p0=...|p1=...|p2=...|p3=...
+
+NC_MAP: ASSIST|CAPTURE|block=EQ|raw=1|candidate=6-band EQ|expected_count=7|got_count=7|status=MATCH
+
+NC_MAP: ASSIST|SUMMARY|block=EQ|unique=3|match=3|mismatch=0|unknown=0|candidate_types=3
+```
+
+## Candidate type counts
+
+### EQ
+- 3-band EQ
+- 6-band EQ
+- 8-band EQ
+
+### Reverb
+- Room
+- Plate
+- Hall
+- Concert
+- Shimmer
+- Cloud
+- Spring
+
+### Delay
+- BBD
+- Digital
+- Duck
+- Ice
+- Reverse
+- LoFi
+- Smear
+- Mod Delay
+
+### MOD
+Candidate ids currently include:
+- Chorus
+- Phaser
+- Flanger
+- Tremolo
+- Vibrato
+- Velvet Vibrato
+- Chorus II
+- Phaser II
+- Jet Flanger
+
+Raw ids are intentionally validated rather than assumed sequential.
+
+### FX2
+Candidate ids include the original drives/boosts, Pitch/Wah family, and the
+newer Gate/Compressor/Wah types through raw id 20.
+
+Many FX2 types reuse effects already physically mapped in FX1. If raw id and
+parameter count match, their parameter model can later inherit the verified FX1
+metadata instead of being re-measured.
+
+## Recommended mapping order
+
+1. EQ
+2. REVERB
+3. DELAY
+4. MOD
+5. FX2
+6. AMP common profile
+7. CAB common profile
+
+This order starts with small catalogs and ends with the largest block.
+
+## What to do on MATCH
+
+Do not move every parameter.
+
+Record only the serial capture. A MATCH means the candidate type and live
+parameter count agree.
+
+For a few representative types per block, visually compare the candidate
+parameter names printed by the mapper with the physical NanoCore screen.
+
+If the names/order agree, no min/mid/max sweep is needed unless later editor
+testing reveals a bad scale.
+
+## What to do on MISMATCH
+
+For that type only:
+1. photograph or write the physical parameter names in order;
+2. record min / middle / max only for parameters whose range is uncertain;
+3. send the serial log plus the physical values.
+
+## What to do on UNKNOWN
+
+Record:
+- physical type name;
+- physical parameter names;
+- one ENC2 capture;
+- if practical, min/mid/max for any obviously new parameter.
+
+## AMP and CAB
+
+Do NOT manually sweep all ~30 models yet.
+
+Current live opcode 0x63 exposes their common parameter profiles, but its raw
+variant byte is not treated as an authoritative model id in Stage 06.5.
+
+For AMP:
+- make one Assisted Mapper capture;
+- note the physical model name;
+- optionally change to one second model and capture again.
+
+For CAB:
+- do the same.
+
+The model lists are already known from the official-app protocol work; a
+dedicated authoritative model-read/write path will be added after the effect
+blocks are validated.
+
+## Safety
+
+Assisted Mapper is read-only.
+It never saves or renames the preset.
+Use a preset you are comfortable changing temporarily and do not press SAVE
+during characterization unless persistence itself is being tested.
