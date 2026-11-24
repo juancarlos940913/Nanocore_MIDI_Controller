@@ -1275,9 +1275,9 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             (void)load_preset(e->slot, false);
             clear_block_state();
 
-            // For a physical/panel change, use the push only to select the
-            // candidate slot; 0x63 then confirms and supplies live state.
-            (void)nanocore_protocol_request_live_state();
+            // The push is a candidate; use the exact same 0x63 confirmation
+            // path before accepting live state/name.
+            schedule_recall_sync(e->slot);
 
             show_notice(had_dirty
                 ? "NANOCORE CHANGED - LOCAL EDIT LOST"
