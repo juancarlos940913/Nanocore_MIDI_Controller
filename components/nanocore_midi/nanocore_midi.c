@@ -13,6 +13,9 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "host/ble_gatt.h"
 
 static const char *TAG = "NC_MIDI";
@@ -140,4 +143,54 @@ esp_err_t nanocore_midi_send_cc(uint8_t channel_1based,
     };
 
     return send_ble_midi_message(midi, sizeof(midi));
+}
+
+
+esp_err_t nanocore_midi_send_sysex(const uint8_t *sysex, size_t len)
+{
+    if (!sysex || len < 2 || sysex[0] != 0xF0 || sysex[len - 1] != 0xF7) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Keep each ATT payload at 20 bytes even though we negotiate a larger MTU.
+     * 2 bytes are BLE-MIDI header/timestamp, leaving 18 raw MIDI bytes.
+     * A long SysEx continues in the next packet without a second F0.
+     */
+    const size_t max_midi = 18;
+    size_t off = 0;
+
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > max_midi) chunk = max_midi;
+
+        uint8_t packet[20] = {0};
+        const uint16_t ts = midi_timestamp_ms();
+        packet[0] = 0x80 | ((ts >> 7) & 0x3F);
+        packet[1] = 0x80 | (ts & 0x7F);
+        memcpy(&packet[2], &sysex[off], chunk);
+
+        int rc = ble_gattc_write_no_rsp_flat(
+            s_conn_handle,
+            s_midi_char_handle,
+            packet,
+            (uint16_t)(chunk + 2));
+
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE SysEx write failed rc=%d off=%u",
+                     rc, (unsigned)off);
+            return ESP_FAIL;
+        }
+
+        off += chunk;
+        if (off < len) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+
+    ESP_LOGD(TAG, "SysEx TX len=%u", (unsigned)len);
+    return ESP_OK;
 }
