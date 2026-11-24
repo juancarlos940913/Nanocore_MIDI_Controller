@@ -229,3 +229,30 @@ Current live counts:
 The final parameter is treated as Ping Pong. Duck's 9-parameter profile required
 raising the Stage 06 live parser from its old per-block limit of 8 to the full
 NC_PROTO_MAX_PARAMS=9.
+
+
+## Stage 06.7 selector-order confirmation
+
+Physical selector order on firmware 1.2:
+
+### REVERB
+```
+Room -> Plate -> Hall -> Concert -> Spring -> Shimmer -> Cloud
+raw: 0 -> 1 -> 2 -> 3 -> 6 -> 7 -> 5
+```
+
+### DELAY
+```
+BBD -> Digital -> Duck -> Ice -> Reverse -> LoFi -> Smear -> Mod Delay
+raw: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
+```
+
+The second DELAY sweep produced 8/8 MATCH.
+
+Duck's 9 live values also clarify the firmware-1.2 parameter order:
+```
+Time, Feedback, Sensitivity, Depth, Attack, Release, Filter, Ping Pong, Mix
+```
+The observed capture had p7=0.0 and p8=0.4, consistent with Ping Pong OFF and
+Mix=40%. Other delay types expose Ping Pong as the final parameter because
+their legacy Mix index does not need to move.
