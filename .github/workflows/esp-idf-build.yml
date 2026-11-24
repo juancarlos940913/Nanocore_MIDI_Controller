@@ -6,6 +6,7 @@ on:
       - stage-03-midi-program-change
       - stage-04-ui-modes-stomp
       - stage-05-hardware-v2
+      - stage-06-live-mapper
   workflow_dispatch:
 
 jobs:
