@@ -960,18 +960,6 @@ static void ble_init(void)
 static void handle_name_editor_event(input_event_t e)
 {
     switch (e) {
-    case INPUT_ENC1_LEFT:
-        name_editor_move_horizontal(&s_name_editor, -1);
-        break;
-    case INPUT_ENC1_RIGHT:
-        name_editor_move_horizontal(&s_name_editor, +1);
-        break;
-    case INPUT_ENC2_LEFT:
-        name_editor_move_vertical(&s_name_editor, -1);
-        break;
-    case INPUT_ENC2_RIGHT:
-        name_editor_move_vertical(&s_name_editor, +1);
-        break;
     case INPUT_ENC1_CLICK:
         name_editor_select(&s_name_editor);
         break;
@@ -1000,6 +988,41 @@ static void handle_name_editor_event(input_event_t e)
     render_ui();
 }
 
+static void handle_encoder_delta(uint8_t encoder, int delta)
+{
+    if (delta == 0) return;
+
+    if (s_screen == UI_SCREEN_NAME_EDITOR) {
+        if (encoder == 1) {
+            name_editor_move_horizontal(&s_name_editor, delta);
+        } else {
+            name_editor_move_vertical(&s_name_editor, delta);
+        }
+        render_ui();
+        return;
+    }
+
+    if (s_tuner_on) return;
+
+    if (encoder == 1) {
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            if (!s_parameter_editing) {
+                select_parameter(delta);
+            }
+        } else {
+            int block = (int)s_selected_block + delta;
+            while (block < 0) block += BLOCK_COUNT;
+            while (block >= BLOCK_COUNT) block -= BLOCK_COUNT;
+            s_selected_block = (controller_block_t)block;
+            render_ui();
+        }
+    } else if (encoder == 2) {
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR && s_parameter_editing) {
+            adjust_parameter(delta);
+        }
+    }
+}
+
 static void handle_input(input_event_t e)
 {
     if (s_screen == UI_SCREEN_NAME_EDITOR) {
@@ -1015,45 +1038,12 @@ static void handle_input(input_event_t e)
     }
 
     switch (e) {
-    case INPUT_ENC1_LEFT:
-        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
-            if (!s_parameter_editing) select_parameter(-1);
-        } else {
-            s_selected_block =
-                (controller_block_t)((s_selected_block + BLOCK_COUNT - 1)
-                                     % BLOCK_COUNT);
-            render_ui();
-        }
-        break;
-
-    case INPUT_ENC1_RIGHT:
-        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
-            if (!s_parameter_editing) select_parameter(+1);
-        } else {
-            s_selected_block =
-                (controller_block_t)((s_selected_block + 1) % BLOCK_COUNT);
-            render_ui();
-        }
-        break;
-
     case INPUT_ENC1_CLICK:
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
             s_parameter_editing = !s_parameter_editing;
             render_ui();
         } else {
             open_block_editor();
-        }
-        break;
-
-    case INPUT_ENC2_LEFT:
-        if (s_screen == UI_SCREEN_BLOCK_EDITOR && s_parameter_editing) {
-            adjust_parameter(-1);
-        }
-        break;
-
-    case INPUT_ENC2_RIGHT:
-        if (s_screen == UI_SCREEN_BLOCK_EDITOR && s_parameter_editing) {
-            adjust_parameter(+1);
         }
         break;
 
@@ -1112,6 +1102,75 @@ static void handle_input(input_event_t e)
     }
 }
 
+static void handle_protocol_event(const nanocore_protocol_event_t *e)
+{
+    if (!e) return;
+
+    switch (e->type) {
+    case NC_PROTO_EVENT_LIVE_STATE:
+        if (e->slot < CTRL_PRESET_COUNT &&
+            e->slot != s_runtime.current_preset) {
+            ESP_LOGI(TAG, "Live device slot %u differs from controller %u",
+                     e->slot, s_runtime.current_preset);
+            (void)load_preset(e->slot, false);
+        }
+
+        memcpy(s_block_known, e->block_known, sizeof(s_block_known));
+        memcpy(s_block_on, e->block_on, sizeof(s_block_on));
+        render_ui();
+        break;
+
+    case NC_PROTO_EVENT_BLOCK_STATE: {
+        if (e->block >= BLOCK_COUNT) break;
+
+        s_block_known[e->block] = true;
+        s_block_on[e->block] = e->on;
+
+        /*
+         * A physical NanoCore block toggle is a real unsaved live edit.
+         * Mirror it in the current controller context so SAVE preserves the
+         * same state in NVS as the pedal.
+         */
+        size_t count = 0;
+        midi_assignment_t *items = edit_assignments(&count);
+        (void)controller_assignment_set(
+            items, count,
+            nanocore_block_onoff_cc(e->block),
+            e->on ? 127 : 0);
+        s_dirty = true;
+        render_ui();
+        break;
+    }
+
+    case NC_PROTO_EVENT_ACTIVE_SLOT:
+        if (e->slot < CTRL_PRESET_COUNT &&
+            e->slot != s_runtime.current_preset) {
+            bool had_dirty = s_dirty;
+            (void)load_preset(e->slot, false);
+            clear_block_state();
+            (void)nanocore_protocol_request_live_state();
+            (void)nanocore_protocol_request_preset_name(e->slot);
+            show_notice(had_dirty
+                ? "NANOCORE CHANGED - LOCAL EDIT LOST"
+                : "NANOCORE PRESET CHANGED");
+        }
+        break;
+
+    case NC_PROTO_EVENT_PRESET_NAME:
+        if (e->slot == s_runtime.current_preset &&
+            s_screen != UI_SCREEN_NAME_EDITOR &&
+            e->name[0]) {
+            strncpy(s_preset.name, e->name, CTRL_NAME_LEN - 1);
+            s_preset.name[CTRL_NAME_LEN - 1] = '\0';
+            render_ui();
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
@@ -1141,15 +1200,31 @@ void app_main(void)
 
     ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
     ESP_ERROR_CHECK(input_manager_init());
+    ESP_ERROR_CHECK(nanocore_protocol_init());
 
     ble_init();
 
     bool last_tap_active = tempo_engine_tap_active();
 
     while (1) {
+        /*
+         * Rotation is coalesced: one fast physical turn may arrive as +20
+         * detents, which updates the model once and renders once instead of
+         * replaying 20 stale screen frames.
+         */
+        int enc1 = input_manager_take_encoder_delta(1);
+        int enc2 = input_manager_take_encoder_delta(2);
+        if (enc1) handle_encoder_delta(1, enc1);
+        if (enc2) handle_encoder_delta(2, enc2);
+
         input_event_t e = INPUT_NONE;
-        if (input_manager_get_event(&e, pdMS_TO_TICKS(20))) {
+        if (input_manager_get_event(&e, pdMS_TO_TICKS(5))) {
             handle_input(e);
+        }
+
+        nanocore_protocol_event_t pe = {0};
+        while (nanocore_protocol_get_event(&pe, 0)) {
+            handle_protocol_event(&pe);
         }
 
         tempo_engine_service();
@@ -1158,6 +1233,12 @@ void app_main(void)
         if (tap_active != last_tap_active) {
             status_leds_set_tap_capture(tap_active);
             last_tap_active = tap_active;
+            render_ui();
+        }
+
+        if (s_notice[0] &&
+            esp_timer_get_time() >= s_notice_until_us) {
+            s_notice[0] = '\0';
             render_ui();
         }
     }
