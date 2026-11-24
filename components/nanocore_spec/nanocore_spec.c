@@ -124,19 +124,62 @@ static const nanocore_param_info_t FX1_BASS_WAH_PARAMS[] = {
     PARAM_LINEAR("Level",       "dB",-60.0f, 6.0f, 0),
 };
 
+/*
+ * Default normalized values captured immediately after selecting each type on
+ * the physical NanoCore during Stage 06.  Bass Wah uses the independently
+ * confirmed factory defaults because the long sweep exhausted BLE before the
+ * second variant-11 snapshot.
+ */
+static const float FX1_DEF_GATE[]      = {0.20f, 0.473684f};
+static const float FX1_DEF_AUTO_GATE[] = {0.50f, 0.321429f};
+static const float FX1_DEF_GATE_COMP[] = {
+    0.20f, 0.666667f, 0.157895f, 0.00f, 0.05f, 0.10f, 0.50f
+};
+static const float FX1_DEF_COMP[] = {
+    0.666667f, 0.157895f, 0.00f, 0.05f, 0.10f, 0.50f
+};
+static const float FX1_DEF_ENV_WAH[] = {
+    0.514679f, 0.05f, 0.396985f, 0.80f
+};
+static const float FX1_DEF_WAH[] = {
+    0.50f, 0.50f, 0.1875f, 0.00f, 0.80f
+};
+static const float FX1_DEF_MOTION_WAH[] = {
+    0.14f, 0.50f, 0.55f, 1.00f
+};
+static const float FX1_DEF_PEAK_COMP[] = {
+    0.90f, 0.052632f, 0.715452f, 0.412516f, 0.50f
+};
+static const float FX1_DEF_PARALLEL_COMP[] = {
+    0.80f, 0.206456f, 0.417139f, 1.00f, 0.50f
+};
+static const float FX1_DEF_CLASSIC_WAH[] = {
+    0.00f, 0.90625f, 0.367778f, 1.00f, 0.909091f
+};
+static const float FX1_DEF_RETRO_WAH[] = {
+    0.00f, 0.864583f, 0.311333f, 1.00f, 0.909091f
+};
+static const float FX1_DEF_BASS_WAH[] = {
+    0.00f, 1.00f, 0.70f, 1.00f, 0.909091f
+};
+
 static const nanocore_effect_type_info_t FX1_TYPES[] = {
-    { 0,  "Gate",              2, FX1_GATE_PARAMS },
-    { 1,  "Auto Gate",         2, FX1_AUTO_GATE_PARAMS },
-    { 2,  "Gate + Compressor", 7, FX1_GATE_COMP_PARAMS },
-    { 3,  "Compressor",        6, FX1_COMP_PARAMS },
-    { 4,  "Env Wah",           4, FX1_ENV_WAH_PARAMS },
-    { 5,  "Wah",               5, FX1_WAH_PARAMS },
-    { 6,  "Motion Wah",        4, FX1_MOTION_WAH_PARAMS },
-    { 7,  "Peak Comp",         5, FX1_PEAK_COMP_PARAMS },
-    { 8,  "Parallel Comp",     5, FX1_PARALLEL_COMP_PARAMS },
-    { 9,  "Classic Wah",       5, FX1_CLASSIC_WAH_PARAMS },
-    { 10, "Retro Wah",         5, FX1_RETRO_WAH_PARAMS },
-    { 11, "Bass Wah",          5, FX1_BASS_WAH_PARAMS },
+    { 0,  "Gate",              2, FX1_GATE_PARAMS,          FX1_DEF_GATE },
+    { 1,  "Auto Gate",         2, FX1_AUTO_GATE_PARAMS,     FX1_DEF_AUTO_GATE },
+    { 2,  "Gate + Compressor", 7, FX1_GATE_COMP_PARAMS,     FX1_DEF_GATE_COMP },
+    { 3,  "Compressor",        6, FX1_COMP_PARAMS,          FX1_DEF_COMP },
+    { 4,  "Env Wah",           4, FX1_ENV_WAH_PARAMS,       FX1_DEF_ENV_WAH },
+    { 5,  "Wah",               5, FX1_WAH_PARAMS,           FX1_DEF_WAH },
+    { 6,  "Motion Wah",        4, FX1_MOTION_WAH_PARAMS,    FX1_DEF_MOTION_WAH },
+    { 7,  "Peak Comp",         5, FX1_PEAK_COMP_PARAMS,     FX1_DEF_PEAK_COMP },
+    { 8,  "Parallel Comp",     5, FX1_PARALLEL_COMP_PARAMS, FX1_DEF_PARALLEL_COMP },
+    { 9,  "Classic Wah",       5, FX1_CLASSIC_WAH_PARAMS,   FX1_DEF_CLASSIC_WAH },
+    { 10, "Retro Wah",         5, FX1_RETRO_WAH_PARAMS,     FX1_DEF_RETRO_WAH },
+    { 11, "Bass Wah",          5, FX1_BASS_WAH_PARAMS,      FX1_DEF_BASS_WAH },
+};
+
+static const uint8_t FX1_SELECTOR_ORDER[] = {
+    0, 1, 2, 3, 7, 8, 4, 5, 6, 9, 10, 11
 };
 
 const nanocore_effect_type_info_t *nanocore_spec_fx1_type(uint8_t type_id)
@@ -145,6 +188,25 @@ const nanocore_effect_type_info_t *nanocore_spec_fx1_type(uint8_t type_id)
         return 0;
     }
     return &FX1_TYPES[type_id];
+}
+
+size_t nanocore_spec_fx1_selector_count(void)
+{
+    return sizeof(FX1_SELECTOR_ORDER) / sizeof(FX1_SELECTOR_ORDER[0]);
+}
+
+const nanocore_effect_type_info_t *nanocore_spec_fx1_selector(size_t index)
+{
+    if (index >= nanocore_spec_fx1_selector_count()) return 0;
+    return nanocore_spec_fx1_type(FX1_SELECTOR_ORDER[index]);
+}
+
+int nanocore_spec_fx1_selector_index(uint8_t raw_type_id)
+{
+    for (size_t i = 0; i < nanocore_spec_fx1_selector_count(); ++i) {
+        if (FX1_SELECTOR_ORDER[i] == raw_type_id) return (int)i;
+    }
+    return -1;
 }
 
 float nanocore_spec_normalized_to_real(
