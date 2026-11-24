@@ -8,12 +8,19 @@ extern "C" {
 
 typedef enum {
     NC_PARAM_LINEAR = 0,
+    /*
+     * Piecewise linear calibration through n=0.0, 0.5 and 1.0.
+     * This preserves the exact min/mid/max values observed on hardware
+     * without prematurely assuming a logarithmic/exponential law.
+     */
+    NC_PARAM_THREE_POINT = 1,
 } nanocore_param_curve_t;
 
 typedef struct {
     const char *name;
     const char *unit;
     float min_value;
+    float mid_value;
     float max_value;
     uint8_t decimals;
     nanocore_param_curve_t curve;
