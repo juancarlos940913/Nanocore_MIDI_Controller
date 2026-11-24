@@ -31,6 +31,7 @@
 
 #define OP_ACTIVE_SLOT         0x01
 #define OP_BLOCK_STATE         0x02
+#define OP_PARAM_VALUE         0x06
 #define OP_READ_PRESET         0x41
 #define OP_SAVE_PRESET         0x46
 #define OP_LIVE_STATE          0x63
@@ -789,6 +790,31 @@ static void parse_push(const uint8_t *msg, size_t len)
             queue_event(e);
             ESP_LOGI(TAG, "Block push %u -> %s",
                      block_id, e->on ? "ON" : "OFF");
+        }
+    } else if (opcode == OP_PARAM_VALUE && len >= 19) {
+        /*
+         * Physical-panel parameter push:
+         * 06 00 <block> <paramIndex> <internalTag> <float32LE>
+         * The internalTag is intentionally ignored.
+         */
+        uint8_t block_id = msg[11];
+        uint8_t param_index = msg[12];
+
+        if (block_id < BLOCK_COUNT &&
+            param_index < NC_PROTO_MAX_PARAMS) {
+            float value = read_float32_le(&msg[14]);
+            if (value >= 0.0f && value <= 1.0f) {
+                nanocore_protocol_event_t *e =
+                    scratch_event(NC_PROTO_EVENT_PARAM_VALUE);
+                e->block = (controller_block_t)block_id;
+                e->param_index = param_index;
+                e->param_value = value;
+                queue_event(e);
+
+                ESP_LOGD(TAG,
+                         "Param push block=%u p%u=%.6f",
+                         block_id, param_index, (double)value);
+            }
         }
     }
 }
