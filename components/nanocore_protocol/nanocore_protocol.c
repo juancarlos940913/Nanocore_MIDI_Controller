@@ -382,8 +382,6 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         }
     }
 
-    const size_t after_blocks = pos;
-
     /* Optional chain footer: 0x08 + permutation of block ids 0..7. */
     if (pos + 9 <= len && p[pos] == 0x08) {
         bool seen[BLOCK_COUNT] = {0};
@@ -403,33 +401,12 @@ static void parse_live_payload(const uint8_t *p, size_t len)
     }
 
     /*
-     * Firmware 1.2 Synth (protocol block id 10) has been observed 15 bytes
-     * after the end of the normal 8-block stream:
-     * 9-byte chain footer + 6 reserved/unknown bytes, then
-     * [on][voice][count][float32 params...].
-     * Observe only; normal UI is not changed by Stage 06.
+     * Do not infer Synth Mode from the trailing bytes of the normal 0x63
+     * profile. The earlier Stage 06 heuristic produced a false SYNTH=ON in
+     * every normal preset. Dedicated Synth discovery will be implemented
+     * from a real Synth-mode capture later.
      */
-    size_t synth_pos = after_blocks + 15;
-    if (synth_pos + 3 <= len) {
-        uint8_t synth_on = p[synth_pos];
-        uint8_t synth_variant = p[synth_pos + 1];
-        uint8_t synth_count = p[synth_pos + 2];
 
-        if (synth_on <= 1 &&
-            synth_count <= NC_PROTO_SYNTH_MAX_PARAMS &&
-            synth_pos + 3 + (size_t)synth_count * 4 <= len) {
-
-            e->synth_known = true;
-            e->synth_on = synth_on != 0;
-            e->synth_variant = synth_variant;
-            e->synth_param_count = synth_count;
-
-            synth_pos += 3;
-            for (uint8_t i = 0; i < synth_count; ++i, synth_pos += 4) {
-                e->synth_params[i] = read_float32_le(&p[synth_pos]);
-            }
-        }
-    }
 
     queue_event(e);
 
