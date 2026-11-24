@@ -256,3 +256,36 @@ Time, Feedback, Sensitivity, Depth, Attack, Release, Filter, Ping Pong, Mix
 The observed capture had p7=0.0 and p8=0.4, consistent with Ping Pong OFF and
 Mix=40%. Other delay types expose Ping Pong as the final parameter because
 their legacy Mix index does not need to move.
+
+
+## Stage 06.8 — authoritative AMP/CAB model read
+
+Physical 0x63 captures confirmed the expected limitation:
+- AMP live variant stays 0 while changing models, but exposes 5 live params.
+- CAB live variant stays 0 while changing models, but exposes 3 live params.
+
+Therefore AMP/CAB model identity is no longer inferred from 0x63.
+
+The controller now reads the saved-preset 0x41 footer:
+
+```
+... <AMP_INDEX> 21 01 <CAB_INDEX> 24 01 ...
+```
+
+Both indices are direct 0..29 model ids.
+
+Assisted Mapper behavior for AMP/CAB:
+1. Select AMP or CAB in PERFORMANCE.
+2. Enable mapper with TOP LEFT + TOP RIGHT.
+3. Change the model on the physical NanoCore.
+4. Press ENC2 once.
+5. Serial prints:
+   `MODEL|slot=N|AMP=<name>(id)|CAB=<name>(id)`
+6. Repeat with one or two additional models only.
+
+There is no need to sweep all 30 AMP and 30 CAB models if the direct indices
+track the physical selections correctly.
+
+Common live profiles remain:
+- AMP: 5 params = Gain, Bass, Mid, Treble, Level
+- CAB: 3 params = Low Cut, High Cut, Level
