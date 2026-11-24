@@ -1,5 +1,5 @@
 /*
- * Nanocore MIDI Controller - Stage 06 / Live Mapper
+ * Nanocore MIDI Controller - Stage 06.5 / Assisted Mapper
  *
  * ESP32-S3 N16R8 + ST7796S 3.5" + 2 encoders + 5 footswitches + 2 LEDs.
  *
@@ -1514,10 +1514,27 @@ static void handle_input(input_event_t e)
 
     case INPUT_CHORD_MAPPER: {
         bool next = !nanocore_mapper_is_enabled();
+
+        if (next) {
+            /*
+             * Mapper target is frozen to the currently selected performance
+             * block for the whole assisted session.
+             */
+            nanocore_mapper_set_target(s_selected_block);
+        }
+
         nanocore_mapper_set_enabled(next);
-        show_notice(next
-            ? "MAPPER ON - ENC2 CAPTURE"
-            : "LIVE MAPPER OFF");
+
+        if (next) {
+            char notice[64];
+            snprintf(notice, sizeof(notice),
+                     "MAP %s - ENC2 CAPTURE",
+                     nanocore_block_name(
+                         nanocore_mapper_target()));
+            show_notice(notice);
+        } else {
+            show_notice("ASSISTED MAPPER OFF");
+        }
         break;
     }
 
@@ -1702,7 +1719,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06 / LIVE MAPPER");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06.5 / ASSISTED MAPPER");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
