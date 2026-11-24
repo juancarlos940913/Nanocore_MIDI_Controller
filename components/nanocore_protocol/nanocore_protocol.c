@@ -36,6 +36,8 @@
 #define OP_LIVE_STATE          0x63
 #define OP_PING                0x68
 #define OP_SET_FIELD           0x6D
+#define FIELD_AMP_MODEL        0x06
+#define FIELD_CAB_MODEL        0x07
 #define FIELD_PRESET_NAME      0x08
 
 #define SEG_MORE               0x10
@@ -165,6 +167,20 @@ static esp_err_t send_type_prime(void)
         OP_SET_FIELD, 0x00, 0x01, 0x00, 0x00,
         0x00, 0xF7
     };
+    return nanocore_midi_send_sysex(msg, sizeof(msg));
+}
+
+static esp_err_t send_scalar_field(uint8_t field_id, uint8_t value)
+{
+    uint8_t msg[] = {
+        0xF0, NC_MFR, NC_TAG_N, NC_TAG_C,
+        NC_DIR_HOST, 0x00, 0x02, next_seq(), 0x00,
+        OP_SET_FIELD, 0x00, 0x02, 0x00, 0x00,
+        (uint8_t)(field_id & 0x7F),
+        (uint8_t)(value & 0x7F),
+        0xF7
+    };
+
     return nanocore_midi_send_sysex(msg, sizeof(msg));
 }
 
@@ -880,6 +896,28 @@ esp_err_t nanocore_protocol_set_block_param(
     }
 
     return send_block_param(block, param_index, normalized_value);
+}
+
+esp_err_t nanocore_protocol_set_block_model(
+    controller_block_t block,
+    uint8_t model_id)
+{
+    if (!s_connected || !nanocore_midi_is_ready() || model_id >= 30) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t field;
+    if (block == BLOCK_AMP) {
+        field = FIELD_AMP_MODEL;
+    } else if (block == BLOCK_CAB) {
+        field = FIELD_CAB_MODEL;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Set %s model -> %u",
+             block == BLOCK_AMP ? "AMP" : "CAB", model_id);
+    return send_scalar_field(field, model_id);
 }
 
 esp_err_t nanocore_protocol_rename_and_save(uint8_t slot,
