@@ -14,6 +14,7 @@ typedef enum {
      * without prematurely assuming a logarithmic/exponential law.
      */
     NC_PARAM_THREE_POINT = 1,
+    NC_PARAM_EXPONENTIAL = 2,
 } nanocore_param_curve_t;
 
 typedef struct {
