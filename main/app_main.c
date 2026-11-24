@@ -54,7 +54,7 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define MIDI_ACTION_GAP_MS       28
 #define RECALL_FIRST_SYNC_MS    600
 #define RECALL_RETRY_MS         250
-#define RECALL_POLL_GUARD_MS    450
+#define RECALL_REPLY_TIMEOUT_MS 900
 #define RECALL_TIMEOUT_MS      3500
 #define NOTICE_MS              1800
 
@@ -76,10 +76,12 @@ static int64_t s_notice_until_us;
  * target authoritative until opcode 0x63 confirms that exact slot.
  */
 static bool s_recall_pending;
+static bool s_recall_poll_inflight;
 static uint8_t s_recall_target;
 static uint8_t s_recall_poll_count;
 static int64_t s_recall_started_us;
 static int64_t s_recall_next_poll_us;
+static int64_t s_recall_poll_sent_us;
 
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
 static uint16_t s_midi_char_handle;
@@ -124,6 +126,7 @@ static int block_from_onoff_cc(uint8_t cc)
 static void schedule_recall_sync(uint8_t target)
 {
     s_recall_pending = true;
+    s_recall_poll_inflight = false;
     s_recall_target = target;
     s_recall_poll_count = 0;
     s_recall_started_us = esp_timer_get_time();
@@ -149,22 +152,35 @@ static void service_recall_sync(void)
         return;
     }
 
+    if (s_recall_poll_inflight) {
+        if ((now - s_recall_poll_sent_us) <
+            (RECALL_REPLY_TIMEOUT_MS * 1000LL)) {
+            return;
+        }
+
+        ESP_LOGW(TAG,
+                 "Recall sync reply timeout; retrying target=%u",
+                 s_recall_target);
+        s_recall_poll_inflight = false;
+        s_recall_next_poll_us = now;
+    }
+
     if (now < s_recall_next_poll_us) return;
 
     esp_err_t rc = nanocore_protocol_request_live_state();
     if (rc == ESP_OK) {
         ++s_recall_poll_count;
+        s_recall_poll_inflight = true;
+        s_recall_poll_sent_us = now;
         ESP_LOGI(TAG,
                  "Recall sync poll #%u target=%u",
                  s_recall_poll_count, s_recall_target);
     } else {
         ESP_LOGW(TAG, "Recall sync poll failed: %s",
                  esp_err_to_name(rc));
+        s_recall_next_poll_us =
+            now + (RECALL_RETRY_MS * 1000LL);
     }
-
-    // Guard against overlapping segmented 0x63 replies.
-    s_recall_next_poll_us =
-        now + (RECALL_POLL_GUARD_MS * 1000LL);
 }
 
 static void nvs_init_safe(void)
@@ -331,6 +347,7 @@ static void restore_current_preset_to_nanocore(void)
         ESP_LOGE(TAG, "Program Change failed: %s",
                  esp_err_to_name(rc));
         s_recall_pending = false;
+        s_recall_poll_inflight = false;
         show_notice("PROGRAM CHANGE FAILED");
     }
 
@@ -1180,6 +1197,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
     switch (e->type) {
     case NC_PROTO_EVENT_LIVE_STATE:
+        s_recall_poll_inflight = false;
+
         if (e->slot >= CTRL_PRESET_COUNT) {
             ESP_LOGW(TAG, "Ignoring invalid LIVE slot=%u", e->slot);
             break;
