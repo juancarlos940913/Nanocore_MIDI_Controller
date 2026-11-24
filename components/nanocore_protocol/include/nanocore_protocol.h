@@ -97,6 +97,12 @@ esp_err_t nanocore_protocol_set_block_param(
     uint8_t param_index,
     float normalized_value);
 
+/* AMP/CAB model selection uses scalar 0x6D fields 0x06/0x07, not the
+ * generic effect-type payload used by FX1/FX2/DELAY/MOD/REV/EQ. */
+esp_err_t nanocore_protocol_set_block_model(
+    controller_block_t block,
+    uint8_t model_id);
+
 /*
  * Rename active preset (8-char device limit) and persist its live state
  * into the same active slot. Returns only after the device ACKs opcode 0x46.
