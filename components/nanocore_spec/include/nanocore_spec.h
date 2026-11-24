@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -33,6 +34,7 @@ typedef struct {
     const char *name;
     uint8_t expected_param_count;
     const nanocore_param_info_t *params;
+    const float *default_normalized;
 } nanocore_effect_type_info_t;
 
 float nanocore_spec_normalized_to_real(
@@ -53,6 +55,11 @@ float nanocore_spec_real_to_normalized(
  * the user's live 0x63 sweep: all 12 ids and parameter counts match.
  */
 const nanocore_effect_type_info_t *nanocore_spec_fx1_type(uint8_t type_id);
+
+/* Physical selector order shown by the current NanoCore firmware. */
+size_t nanocore_spec_fx1_selector_count(void);
+const nanocore_effect_type_info_t *nanocore_spec_fx1_selector(size_t index);
+int nanocore_spec_fx1_selector_index(uint8_t raw_type_id);
 
 #ifdef __cplusplus
 }
