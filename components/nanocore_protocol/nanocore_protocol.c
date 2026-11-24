@@ -236,20 +236,47 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
     if (anchor_pos == SIZE_MAX) return;
 
     /*
-     * This function receives the DATA portion of a 0x41 window after the
-     * outer NanoCore 7-bit wrapper has already been unpacked by
-     * handle_segmented_reply(). Therefore the preset name is contiguous
-     * ASCII here. Skipping offsets 2/10 (needed only when parsing the still-
-     * packed full frame) incorrectly turned "ClnArp" into "ClArp".
+     * Two name-field layouts have now been observed on real hardware:
+     *
+     *  A) already-unpacked/contiguous ASCII:
+     *       C l n A r p ...
+     *
+     *  B) the device's inner 7-bit-safe name field:
+     *       C l 00 n A r p ... [00 after the next 7 data bytes]
+     *
+     * The outer segmented BLE reply has already been unpacked, but a
+     * user-written name can still retain these *inner* packing-header bytes.
+     * Factory names such as "ClnArp" were observed in layout A, while
+     * readback after writing a 7-char name can use layout B.
+     *
+     * Auto-detect from byte +2: a NUL there cannot be a valid printable
+     * name character, so it unambiguously selects layout B.
      */
     char name[13] = {0};
     size_t out = 0;
-    for (size_t read = 0; out < 12 && anchor_pos + read < len; ++read) {
+    bool inner_packed =
+        (anchor_pos + 2 < len && payload[anchor_pos + 2] == 0x00);
+
+    for (size_t read = 0;
+         out < 12 && anchor_pos + read < len;
+         ++read) {
+
+        if (inner_packed && (read == 2 || read == 10)) {
+            continue;
+        }
+
         uint8_t ch = payload[anchor_pos + read];
         if (ch == 0) break;
-        if (ch < 0x20 || ch > 0x7E) return;
+        if (ch < 0x20 || ch > 0x7E) {
+            ESP_LOGW(TAG,
+                     "Preset name decode rejected byte 0x%02X at +%u",
+                     ch, (unsigned)read);
+            return;
+        }
+
         name[out++] = (char)ch;
     }
+
     if (!out) return;
 
     nanocore_protocol_event_t e = {
