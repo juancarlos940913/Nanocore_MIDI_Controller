@@ -444,3 +444,51 @@ size_t nanocore_spec_candidate_count(uint8_t block_id)
     default: return 0;
     }
 }
+
+
+/* -------------------------------------------------------------------------
+ * AMP/CAB factory model catalogs.
+ *
+ * Saved preset opcode 0x41 stores these as direct 0..29 indices. The model
+ * order is the same order used by ToneCommand's field 0x06/0x07 selectors.
+ * ------------------------------------------------------------------------- */
+
+static const char *AMP_MODEL_NAMES[] = {
+    "BogXTC1", "BogXTC2", "ENGP1", "ENGP2", "Fd59Bm",
+    "Fd65Dk", "Hiw103", "MarDSL1", "MarDSL2", "Mar8001",
+    "Mar8002", "MesR1", "MesR2", "MesR3", "OgG120",
+    "Pey51501", "Pey51502", "Pey6505", "RanT21", "RanT22",
+    "RoJC120", "SLO1001", "SLO1002", "SLO1003", "VXAC30",
+    "ApSVTVR", "ApSVTCL", "Adn900", "Hiw320", "MarSup"
+};
+
+static const char *CAB_MODEL_NAMES[] = {
+    "Bog412A", "Bog412B", "Eng412A", "Eng412B", "FdTR212",
+    "Fd59BM410", "Hiw412", "Mar412A", "Mar412B", "Mar96412A",
+    "Mar96412B", "Mes412A", "Mes412B", "Mes412C", "Og412",
+    "Pey412A", "Pey412B", "PeyVk412", "Ran112A", "Ran112B",
+    "Ran112C", "SLO412A", "SLO412B", "SLO412C", "AC30212",
+    "AP810", "Ap410", "Adn410", "HiwB410", "Mar412"
+};
+
+size_t nanocore_spec_amp_model_count(void)
+{
+    return sizeof(AMP_MODEL_NAMES) / sizeof(AMP_MODEL_NAMES[0]);
+}
+
+const char *nanocore_spec_amp_model_name(uint8_t model_id)
+{
+    return model_id < nanocore_spec_amp_model_count()
+        ? AMP_MODEL_NAMES[model_id] : 0;
+}
+
+size_t nanocore_spec_cab_model_count(void)
+{
+    return sizeof(CAB_MODEL_NAMES) / sizeof(CAB_MODEL_NAMES[0]);
+}
+
+const char *nanocore_spec_cab_model_name(uint8_t model_id)
+{
+    return model_id < nanocore_spec_cab_model_count()
+        ? CAB_MODEL_NAMES[model_id] : 0;
+}
