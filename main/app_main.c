@@ -1420,7 +1420,12 @@ void app_main(void)
             handle_input(e);
         }
 
-        nanocore_protocol_event_t pe = {0};
+        /*
+         * Stage 06 protocol events carry all live float parameters and are
+         * intentionally large. Keep the receive buffer out of app_main's
+         * task stack as well.
+         */
+        static nanocore_protocol_event_t pe;
         while (nanocore_protocol_get_event(&pe, 0)) {
             handle_protocol_event(&pe);
         }
