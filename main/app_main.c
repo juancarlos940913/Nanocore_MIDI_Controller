@@ -430,7 +430,14 @@ static void toggle_block(controller_block_t block)
 {
     uint8_t cc = nanocore_block_onoff_cc(block);
     uint8_t current = 0;
-    bool known = effective_cc(cc, &current);
+
+    bool known = false;
+    if (block < BLOCK_COUNT && s_block_known[block]) {
+        known = true;
+        current = s_block_on[block] ? 127 : 0;
+    } else {
+        known = effective_cc(cc, &current);
+    }
 
     uint8_t next = (!known || current < 64) ? 127 : 0;
     ESP_LOGI(TAG, "STOMP %s -> %s",
