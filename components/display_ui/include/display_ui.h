@@ -39,6 +39,7 @@ typedef struct {
     bool parameter_editing;
     bool parameter_known;
     uint16_t parameter_value;
+    const char *parameter_text;
 
     bool block_known[BLOCK_COUNT];
     bool block_on[BLOCK_COUNT];
