@@ -153,6 +153,78 @@ static esp_err_t send_short_command(uint8_t opcode)
     return nanocore_midi_send_sysex(msg, sizeof(msg));
 }
 
+static esp_err_t send_type_prime(void)
+{
+    /*
+     * ToneCommand sends this field-0 prime immediately before every
+     * set-block-type command.
+     */
+    uint8_t msg[] = {
+        0xF0, NC_MFR, NC_TAG_N, NC_TAG_C,
+        NC_DIR_HOST, 0x00, 0x02, next_seq(), 0x00,
+        OP_SET_FIELD, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0xF7
+    };
+    return nanocore_midi_send_sysex(msg, sizeof(msg));
+}
+
+static esp_err_t send_block_type(controller_block_t block,
+                                 uint8_t type_id,
+                                 const float *defaults,
+                                 uint8_t count)
+{
+    if (block >= BLOCK_COUNT ||
+        count > NC_PROTO_MAX_PARAMS ||
+        (count > 0 && !defaults)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t logical[4 + NC_PROTO_MAX_PARAMS * 4] = {0};
+    size_t logical_len = 0;
+
+    logical[logical_len++] = 0x02;
+    logical[logical_len++] = (uint8_t)block;
+    logical[logical_len++] = type_id & 0x7F;
+    logical[logical_len++] = count & 0x7F;
+
+    for (uint8_t i = 0; i < count; ++i) {
+        uint8_t raw[sizeof(float)] = {0};
+        memcpy(raw, &defaults[i], sizeof(raw));
+        memcpy(&logical[logical_len], raw, sizeof(raw));
+        logical_len += sizeof(raw);
+    }
+
+    uint8_t packed[64] = {0};
+    size_t packed_len = pack7(logical, logical_len,
+                              packed, sizeof(packed));
+    if (!packed_len) return ESP_FAIL;
+
+    uint8_t msg[96] = {0};
+    size_t pos = 0;
+    msg[pos++] = 0xF0;
+    msg[pos++] = NC_MFR;
+    msg[pos++] = NC_TAG_N;
+    msg[pos++] = NC_TAG_C;
+    msg[pos++] = NC_DIR_HOST;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x02;
+    msg[pos++] = next_seq();
+    msg[pos++] = 0x00;
+    msg[pos++] = OP_SET_FIELD;
+    msg[pos++] = 0x00;
+    msg[pos++] = (uint8_t)logical_len;
+    msg[pos++] = 0x00;
+    memcpy(&msg[pos], packed, packed_len);
+    pos += packed_len;
+    msg[pos++] = 0xF7;
+
+    ESP_LOGI(TAG,
+             "Set block type -> block=%u type=%u params=%u",
+             (unsigned)block, type_id, count);
+
+    return nanocore_midi_send_sysex(msg, pos);
+}
+
 static esp_err_t send_rename(const char *name)
 {
     if (!name) return ESP_ERR_INVALID_ARG;
@@ -603,6 +675,31 @@ esp_err_t nanocore_protocol_request_preset_name(uint8_t slot)
         return ESP_ERR_INVALID_STATE;
     }
     return send_read_name_window(slot);
+}
+
+esp_err_t nanocore_protocol_set_block_type(
+    controller_block_t block,
+    uint8_t type_id,
+    const float *default_normalized,
+    uint8_t param_count)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t rc = send_type_prime();
+    if (rc != ESP_OK) return rc;
+
+    /*
+     * Keep a small gap between the prime and the type payload. On a 100 Hz
+     * tick this becomes one scheduler tick, which is still negligible to UI.
+     */
+    TickType_t gap = pdMS_TO_TICKS(4);
+    if (gap < 1) gap = 1;
+    vTaskDelay(gap);
+
+    return send_block_type(block, type_id,
+                           default_normalized, param_count);
 }
 
 esp_err_t nanocore_protocol_rename_and_save(uint8_t slot,
