@@ -1,5 +1,7 @@
 #include "nanocore_spec.h"
 
+#include <math.h>
+
 #define PARAM_LINEAR(_name, _unit, _min, _max, _dec) \
     { .name = (_name), .unit = (_unit), \
       .min_value = (_min), .mid_value = ((_min) + (_max)) * 0.5f, \
@@ -10,55 +12,111 @@
       .min_value = (_min), .mid_value = (_mid), .max_value = (_max), \
       .decimals = (_dec), .curve = NC_PARAM_THREE_POINT }
 
-#define PARAM_UNKNOWN \
-    { .name = 0, .unit = 0, .min_value = 0.0f, .mid_value = 0.5f, \
-      .max_value = 1.0f, .decimals = 3, .curve = NC_PARAM_LINEAR }
+#define PARAM_EXP(_name, _unit, _min, _max, _dec) \
+    { .name = (_name), .unit = (_unit), \
+      .min_value = (_min), .mid_value = 0.0f, .max_value = (_max), \
+      .decimals = (_dec), .curve = NC_PARAM_EXPONENTIAL }
 
 /*
- * Physical calibration source: user's NanoCore firmware, Stage 06 mapper.
- * Values below intentionally follow the physical screen rather than older
- * third-party tables when they disagree.
+ * FX1 physical specification.
+ *
+ * Primary source: user's real NanoCore screen + Stage 06 opcode-0x63 sweeps.
+ * The handwritten "same as above" marks are expanded here to the most recent
+ * fully specified parameter with the same name.
+ *
+ * IDs are the raw 0x63 variant ids, NOT the physical selector order:
+ * selector 1..12 -> raw ids 0,1,2,3,7,8,4,5,6,9,10,11.
  */
+
 static const nanocore_param_info_t FX1_GATE_PARAMS[] = {
-    PARAM_LINEAR("Threshold", "dB", -100.0f,   0.0f, 0),
-    PARAM_3PT  ("Release",   "ms",    5.0f,  50.0f, 100.0f, 0),
+    PARAM_LINEAR("Threshold", "dB", -100.0f, 0.0f, 0),
+    PARAM_3PT("Release", "ms", 5.0f, 50.0f, 100.0f, 1),
 };
 
 static const nanocore_param_info_t FX1_AUTO_GATE_PARAMS[] = {
-    PARAM_LINEAR("Sensitivity", "dB",  -6.0f,   6.0f, 0),
-    PARAM_3PT  ("Release",     "ms",   20.0f, 158.0f, 300.0f, 0),
+    PARAM_LINEAR("Sensitivity", "dB", -6.0f, 6.0f, 0),
+    PARAM_3PT("Release", "ms", 20.0f, 157.2f, 300.0f, 1),
 };
 
 static const nanocore_param_info_t FX1_GATE_COMP_PARAMS[] = {
     PARAM_LINEAR("Gate",      "dB", -100.0f,    0.0f, 0),
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 0),
-    PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 0),
-    PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 0),
-    PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 0),
+    PARAM_3PT("Ratio",        ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 1),
+    PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 1),
+    PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 1),
     PARAM_LINEAR("Makeup",    "dB",  -24.0f,   24.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",    1.0f,   10.0f, 20.0f, 0),
-    PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 0),
-    PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 0),
-    PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 0),
+    PARAM_3PT("Ratio",        ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 1),
+    PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 1),
+    PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 1),
     PARAM_LINEAR("Makeup",    "dB",  -24.0f,   24.0f, 0),
 };
 
-/*
- * Peak Comp reports 5 live parameters. Four have been physically identified
- * so far. p4 remains deliberately unknown until the user identifies the
- * fifth physical control/meaning.
- */
+static const nanocore_param_info_t FX1_ENV_WAH_PARAMS[] = {
+    PARAM_EXP   ("Freq", "Hz", 10.0f, 20000.0f, 0),
+    PARAM_LINEAR("Env",  "Hz",  0.0f, 20000.0f, 0),
+    PARAM_3PT   ("Q",    "",    0.1f,    10.0f, 20.0f, 1),
+    PARAM_LINEAR("Mix",  "",    0.0f,   100.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_WAH_PARAMS[] = {
+    PARAM_EXP   ("Freq",  "Hz", 163.0f, 3500.0f, 0),
+    PARAM_LINEAR("Sweep", "",     0.0f,  100.0f, 0),
+    PARAM_LINEAR("Rate",  "Hz",   0.0f,    8.0f, 1),
+    PARAM_LINEAR("Shape", "",     0.0f,  100.0f, 0),
+    PARAM_LINEAR("Mix",   "",     0.0f,  100.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_MOTION_WAH_PARAMS[] = {
+    PARAM_LINEAR("Rate",  "Hz", 0.0f,  15.0f, 1),
+    PARAM_LINEAR("Voice", "",   0.0f, 100.0f, 0),
+    PARAM_LINEAR("Sweep", "",   0.0f, 100.0f, 0),
+    PARAM_LINEAR("Mix",   "",   0.0f, 100.0f, 0),
+};
+
 static const nanocore_param_info_t FX1_PEAK_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -60.0f,   0.0f, 0),
-    PARAM_3PT  ("Ratio",      ":1",   1.0f,  10.0f, 20.0f, 0),
-    PARAM_3PT  ("Attack",     "ms",   0.1f,   4.5f, 200.0f, 1),
-    PARAM_3PT  ("Release",    "ms",   1.0f,  40.0f, 2000.0f, 0),
-    PARAM_UNKNOWN,
+    PARAM_3PT   ("Ratio",     ":1",   1.0f,  10.0f, 20.0f, 1),
+    PARAM_EXP   ("Attack",    "ms",   0.1f, 200.0f, 1),
+    PARAM_3PT   ("Release",   "ms",   1.0f,  40.0f, 2000.0f, 1),
+    PARAM_LINEAR("Makeup",    "dB", -24.0f,  24.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_PARALLEL_COMP_PARAMS[] = {
+    PARAM_LINEAR("Threshold", "dB", -60.0f,    0.0f, 0),
+    PARAM_3PT   ("Attack",    "ms",   0.01f,  30.0f, 250.0f, 2),
+    PARAM_3PT   ("Release",   "ms",  10.0f,  300.0f, 2500.0f, 1),
+    PARAM_LINEAR("Mix",       "",     0.0f,  200.0f, 0),
+    PARAM_LINEAR("Level",     "dB", -24.0f,   24.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_CLASSIC_WAH_PARAMS[] = {
+    PARAM_LINEAR("Position", " ",   0.0f, 100.0f, 0),
+    PARAM_3PT   ("Low",      "Hz", 20.0f, 250.0f, 500.0f, 0),
+    PARAM_LINEAR("High",     "Hz", 500.0f, 5000.0f, 0),
+    PARAM_LINEAR("Mix",      "",    0.0f, 100.0f, 0),
+    PARAM_3PT   ("Level",    "dB",-60.0f, -30.0f, 6.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_RETRO_WAH_PARAMS[] = {
+    PARAM_LINEAR("Position", " ",   0.0f, 100.0f, 0),
+    PARAM_3PT   ("Low",      "Hz", 20.0f, 250.0f, 500.0f, 0),
+    PARAM_LINEAR("High",     "Hz", 500.0f, 5000.0f, 0),
+    PARAM_LINEAR("Mix",      "",    0.0f, 100.0f, 0),
+    PARAM_3PT   ("Level",    "dB",-60.0f, -30.0f, 6.0f, 0),
+};
+
+static const nanocore_param_info_t FX1_BASS_WAH_PARAMS[] = {
+    PARAM_LINEAR("Position",    "",   0.0f, 100.0f, 0),
+    PARAM_LINEAR("Q Trim",      "",   0.0f, 100.0f, 0),
+    PARAM_LINEAR("Volume Trim", "",   0.0f, 100.0f, 0),
+    PARAM_LINEAR("Mix",         "",   0.0f, 100.0f, 0),
+    PARAM_3PT   ("Level",       "dB",-60.0f, -30.0f, 6.0f, 0),
 };
 
 static const nanocore_effect_type_info_t FX1_TYPES[] = {
@@ -66,14 +124,14 @@ static const nanocore_effect_type_info_t FX1_TYPES[] = {
     { 1,  "Auto Gate",         2, FX1_AUTO_GATE_PARAMS },
     { 2,  "Gate + Compressor", 7, FX1_GATE_COMP_PARAMS },
     { 3,  "Compressor",        6, FX1_COMP_PARAMS },
-    { 4,  "Env Wah",           4, 0 },
-    { 5,  "Wah",               5, 0 },
-    { 6,  "Motion Wah",        4, 0 },
+    { 4,  "Env Wah",           4, FX1_ENV_WAH_PARAMS },
+    { 5,  "Wah",               5, FX1_WAH_PARAMS },
+    { 6,  "Motion Wah",        4, FX1_MOTION_WAH_PARAMS },
     { 7,  "Peak Comp",         5, FX1_PEAK_COMP_PARAMS },
-    { 8,  "Parallel Comp",     5, 0 },
-    { 9,  "Classic Wah",       5, 0 },
-    { 10, "Retro Wah",         5, 0 },
-    { 11, "Bass Wah",          5, 0 },
+    { 8,  "Parallel Comp",     5, FX1_PARALLEL_COMP_PARAMS },
+    { 9,  "Classic Wah",       5, FX1_CLASSIC_WAH_PARAMS },
+    { 10, "Retro Wah",         5, FX1_RETRO_WAH_PARAMS },
+    { 11, "Bass Wah",          5, FX1_BASS_WAH_PARAMS },
 };
 
 const nanocore_effect_type_info_t *nanocore_spec_fx1_type(uint8_t type_id)
@@ -93,6 +151,13 @@ float nanocore_spec_normalized_to_real(
     if (normalized < 0.0f) normalized = 0.0f;
     if (normalized > 1.0f) normalized = 1.0f;
 
+    if (param->curve == NC_PARAM_EXPONENTIAL &&
+        param->min_value > 0.0f &&
+        param->max_value > param->min_value) {
+        return param->min_value *
+               powf(param->max_value / param->min_value, normalized);
+    }
+
     if (param->curve == NC_PARAM_THREE_POINT) {
         if (normalized <= 0.5f) {
             const float t = normalized * 2.0f;
@@ -109,7 +174,6 @@ float nanocore_spec_normalized_to_real(
            normalized * (param->max_value - param->min_value);
 }
 
-
 float nanocore_spec_real_to_normalized(
     const nanocore_param_info_t *param,
     float real_value)
@@ -118,6 +182,13 @@ float nanocore_spec_real_to_normalized(
 
     if (real_value <= param->min_value) return 0.0f;
     if (real_value >= param->max_value) return 1.0f;
+
+    if (param->curve == NC_PARAM_EXPONENTIAL &&
+        param->min_value > 0.0f &&
+        param->max_value > param->min_value) {
+        return logf(real_value / param->min_value) /
+               logf(param->max_value / param->min_value);
+    }
 
     if (param->curve == NC_PARAM_THREE_POINT) {
         if (real_value <= param->mid_value) {
