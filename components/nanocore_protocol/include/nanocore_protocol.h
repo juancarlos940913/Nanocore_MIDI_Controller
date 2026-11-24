@@ -79,6 +79,12 @@ esp_err_t nanocore_protocol_set_block_type(
     const float *default_normalized,
     uint8_t param_count);
 
+/* Set one live block parameter by its type-local parameter index. */
+esp_err_t nanocore_protocol_set_block_param(
+    controller_block_t block,
+    uint8_t param_index,
+    float normalized_value);
+
 /*
  * Rename active preset (8-char device limit) and persist its live state
  * into the same active slot. Returns only after the device ACKs opcode 0x46.
