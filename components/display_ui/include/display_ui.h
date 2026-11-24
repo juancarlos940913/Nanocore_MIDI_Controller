@@ -12,6 +12,8 @@
 extern "C" {
 #endif
 
+#define UI_MAX_EDITOR_PARAMETERS 12
+
 typedef enum {
     UI_SCREEN_PERFORMANCE = 0,
     UI_SCREEN_BLOCK_EDITOR,
@@ -40,6 +42,16 @@ typedef struct {
     bool parameter_known;
     uint16_t parameter_value;
     const char *parameter_text;
+
+    /*
+     * Optional dynamic block-editor model. FX1 uses this so the visible
+     * parameter list follows the selected effect type instead of the old
+     * fixed CC table.
+     */
+    bool editor_override;
+    size_t editor_parameter_count;
+    const char *editor_parameter_labels[UI_MAX_EDITOR_PARAMETERS];
+    const char *selected_parameter_label;
 
     bool block_known[BLOCK_COUNT];
     bool block_on[BLOCK_COUNT];
