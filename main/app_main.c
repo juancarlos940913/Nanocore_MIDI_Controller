@@ -1452,8 +1452,22 @@ static void handle_input(input_event_t e)
      * intercepted before normal UI Back behavior while mapper mode is active.
      */
     if (nanocore_mapper_is_enabled() && e == INPUT_ENC2_CLICK) {
-        nanocore_mapper_request_capture();
-        show_notice("MAPPER CAPTURE");
+        controller_block_t target = nanocore_mapper_target();
+
+        if (target == BLOCK_AMP || target == BLOCK_CAB) {
+            esp_err_t rc = nanocore_protocol_request_preset_models(
+                s_runtime.current_preset);
+            if (rc == ESP_OK) {
+                show_notice("READ AMP/CAB MODEL");
+            } else {
+                ESP_LOGW(TAG, "Preset model read failed: %s",
+                         esp_err_to_name(rc));
+                show_notice("MODEL READ FAILED");
+            }
+        } else {
+            nanocore_mapper_request_capture();
+            show_notice("MAPPER CAPTURE");
+        }
         return;
     }
 
@@ -1710,6 +1724,37 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             render_ui();
         }
         break;
+
+    case NC_PROTO_EVENT_PRESET_MODELS: {
+        if (e->slot != s_runtime.current_preset) break;
+
+        const char *amp_name = e->amp_model_known
+            ? nanocore_spec_amp_model_name(e->amp_model) : NULL;
+        const char *cab_name = e->cab_model_known
+            ? nanocore_spec_cab_model_name(e->cab_model) : NULL;
+
+        ESP_LOGI(TAG,
+                 "MODEL|slot=%u|AMP=%s(%u)|CAB=%s(%u)",
+                 e->slot,
+                 amp_name ? amp_name : "UNKNOWN", e->amp_model,
+                 cab_name ? cab_name : "UNKNOWN", e->cab_model);
+
+        controller_block_t target = nanocore_mapper_target();
+        if (nanocore_mapper_is_enabled() &&
+            target == BLOCK_AMP && e->amp_model_known) {
+            char notice[64];
+            snprintf(notice, sizeof(notice), "AMP %u %s",
+                     e->amp_model, amp_name ? amp_name : "?");
+            show_notice(notice);
+        } else if (nanocore_mapper_is_enabled() &&
+                   target == BLOCK_CAB && e->cab_model_known) {
+            char notice[64];
+            snprintf(notice, sizeof(notice), "CAB %u %s",
+                     e->cab_model, cab_name ? cab_name : "?");
+            show_notice(notice);
+        }
+        break;
+    }
 
     default:
         break;
