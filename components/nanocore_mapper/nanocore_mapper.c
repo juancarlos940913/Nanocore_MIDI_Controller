@@ -107,7 +107,8 @@ static void log_block_snapshot(uint8_t slot,
          ++i) {
 
         if (fx1_info && fx1_info->params &&
-            i < fx1_info->expected_param_count) {
+            i < fx1_info->expected_param_count &&
+            fx1_info->params[i].name) {
             const nanocore_param_info_t *p = &fx1_info->params[i];
             float real = nanocore_spec_normalized_to_real(
                 p, e->block_params[block][i]);
@@ -203,7 +204,8 @@ static void log_block_diff(uint8_t slot,
             nanocore_spec_fx1_type(new_variant) : 0;
 
         if (fx1_info && fx1_info->params &&
-            i < fx1_info->expected_param_count) {
+            i < fx1_info->expected_param_count &&
+            fx1_info->params[i].name) {
             const nanocore_param_info_t *p = &fx1_info->params[i];
             float old_real = nanocore_spec_normalized_to_real(
                 p, prev->block_params[block][i]);
