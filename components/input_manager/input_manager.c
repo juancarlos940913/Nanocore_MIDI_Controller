@@ -1,11 +1,13 @@
 #include "input_manager.h"
 
 #include <stdbool.h>
-#include <string.h>
+#include <stdint.h>
 
 #include "board_pins.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -31,11 +33,39 @@ typedef struct {
     gpio_num_t a;
     gpio_num_t b;
     gpio_num_t sw;
-    int last_a;
+    volatile int16_t quarter_accum;
+    volatile int16_t detent_accum;
+    volatile uint8_t last_state;
     bool sw_raw;
     bool sw_stable;
     TickType_t sw_change;
 } encoder_t;
+
+static encoder_t s_enc1 = {
+    .a = BOARD_ENC1_A,
+    .b = BOARD_ENC1_B,
+    .sw = BOARD_ENC1_SW,
+};
+
+static encoder_t s_enc2 = {
+    .a = BOARD_ENC2_A,
+    .b = BOARD_ENC2_B,
+    .sw = BOARD_ENC2_SW,
+};
+
+static portMUX_TYPE s_encoder_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * Gray-code transition table. Invalid/bounce transitions contribute zero.
+ * This follows every A/B edge instead of periodically sampling one edge,
+ * so fast physical turns are not misread as backwards movement.
+ */
+static const int8_t QUAD_TABLE[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0,
+};
 
 static void emit(input_event_t e)
 {
@@ -48,6 +78,32 @@ static bool is_pressed(gpio_num_t gpio)
     return gpio_get_level(gpio) == BOARD_INPUT_ACTIVE_LEVEL;
 }
 
+static void IRAM_ATTR encoder_isr(void *arg)
+{
+    encoder_t *e = (encoder_t *)arg;
+    const uint8_t state =
+        (uint8_t)((gpio_get_level(e->a) ? 2 : 0) |
+                  (gpio_get_level(e->b) ? 1 : 0));
+
+    const uint8_t index = (uint8_t)((e->last_state << 2) | state);
+    const int8_t step = QUAD_TABLE[index & 0x0F];
+    e->last_state = state;
+
+    if (step == 0) return;
+
+    portENTER_CRITICAL_ISR(&s_encoder_mux);
+    e->quarter_accum += step;
+
+    if (e->quarter_accum >= BOARD_ENCODER_EDGES_PER_DETENT) {
+        e->detent_accum++;
+        e->quarter_accum = 0;
+    } else if (e->quarter_accum <= -BOARD_ENCODER_EDGES_PER_DETENT) {
+        e->detent_accum--;
+        e->quarter_accum = 0;
+    }
+    portEXIT_CRITICAL_ISR(&s_encoder_mux);
+}
+
 static bool button_poll(button_t *b, TickType_t now)
 {
     bool raw = is_pressed(b->gpio);
@@ -56,10 +112,7 @@ static bool button_poll(button_t *b, TickType_t now)
         b->raw_change = now;
     }
 
-    if ((now - b->raw_change) < pdMS_TO_TICKS(DEBOUNCE_MS)) {
-        return false;
-    }
-
+    if ((now - b->raw_change) < pdMS_TO_TICKS(DEBOUNCE_MS)) return false;
     if (raw == b->stable) return false;
 
     b->stable = raw;
@@ -71,21 +124,6 @@ static bool button_poll(button_t *b, TickType_t now)
     return true;
 }
 
-static int encoder_step(encoder_t *e)
-{
-    int a = gpio_get_level(e->a);
-    int step = 0;
-
-    // Same edge/direction rule as the user's proven programmer firmware.
-    if (a != e->last_a && a == 0) {
-        int b = gpio_get_level(e->b);
-        step = (b != a) ? 1 : -1;
-    }
-
-    e->last_a = a;
-    return step;
-}
-
 static bool encoder_click(encoder_t *e, TickType_t now)
 {
     bool raw = is_pressed(e->sw);
@@ -95,14 +133,11 @@ static bool encoder_click(encoder_t *e, TickType_t now)
         e->sw_change = now;
     }
 
-    if ((now - e->sw_change) < pdMS_TO_TICKS(DEBOUNCE_MS)) {
-        return false;
-    }
-
+    if ((now - e->sw_change) < pdMS_TO_TICKS(DEBOUNCE_MS)) return false;
     if (raw == e->sw_stable) return false;
 
     e->sw_stable = raw;
-    return raw; // click on debounced press edge
+    return raw;
 }
 
 static input_event_t short_event_for(gpio_num_t gpio)
@@ -118,10 +153,7 @@ static input_event_t short_event_for(gpio_num_t gpio)
 static void maybe_release_short(button_t *b, bool changed)
 {
     if (!changed || b->stable) return;
-
-    if (!b->consumed && !b->long_fired) {
-        emit(short_event_for(b->gpio));
-    }
+    if (!b->consumed && !b->long_fired) emit(short_event_for(b->gpio));
 }
 
 static void input_task(void *arg)
@@ -135,14 +167,8 @@ static void input_task(void *arg)
     button_t tl   = {.gpio = BOARD_FS_TOP_LEFT, .raw_change = now};
     button_t tr   = {.gpio = BOARD_FS_TOP_RIGHT, .raw_change = now};
 
-    encoder_t e1 = {
-        .a = BOARD_ENC1_A, .b = BOARD_ENC1_B, .sw = BOARD_ENC1_SW,
-        .last_a = gpio_get_level(BOARD_ENC1_A), .sw_change = now,
-    };
-    encoder_t e2 = {
-        .a = BOARD_ENC2_A, .b = BOARD_ENC2_B, .sw = BOARD_ENC2_SW,
-        .last_a = gpio_get_level(BOARD_ENC2_A), .sw_change = now,
-    };
+    s_enc1.sw_change = now;
+    s_enc2.sw_change = now;
 
     bool save_chord_active = false;
     bool tuner_chord_active = false;
@@ -158,20 +184,9 @@ static void input_task(void *arg)
         bool ch_tl   = button_poll(&tl, now);
         bool ch_tr   = button_poll(&tr, now);
 
-        int s1 = encoder_step(&e1);
-        int s2 = encoder_step(&e2);
-        if (BOARD_ENC1_REVERSE) s1 = -s1;
-        if (BOARD_ENC2_REVERSE) s2 = -s2;
+        if (encoder_click(&s_enc1, now)) emit(INPUT_ENC1_CLICK);
+        if (encoder_click(&s_enc2, now)) emit(INPUT_ENC2_CLICK);
 
-        if (s1 < 0) emit(INPUT_ENC1_LEFT);
-        if (s1 > 0) emit(INPUT_ENC1_RIGHT);
-        if (s2 < 0) emit(INPUT_ENC2_LEFT);
-        if (s2 > 0) emit(INPUT_ENC2_RIGHT);
-
-        if (encoder_click(&e1, now)) emit(INPUT_ENC1_CLICK);
-        if (encoder_click(&e2, now)) emit(INPUT_ENC2_CLICK);
-
-        // SAVE chord: bottom-left + top-left.
         if (down.stable && tl.stable) {
             if (!save_chord_active) {
                 save_chord_active = true;
@@ -187,7 +202,6 @@ static void input_task(void *arg)
             save_chord_active = false;
         }
 
-        // TUNER chord: mode/tap + top-right.
         if (mode.stable && tr.stable) {
             if (!tuner_chord_active) {
                 tuner_chord_active = true;
@@ -203,7 +217,6 @@ static void input_task(void *arg)
             tuner_chord_active = false;
         }
 
-        // Long bottom-center enters/exits tap-capture context.
         if (mode.stable && !mode.consumed && !mode.long_fired &&
             (now - mode.press_tick) >= pdMS_TO_TICKS(MODE_LONG_MS)) {
             mode.long_fired = true;
@@ -217,24 +230,39 @@ static void input_task(void *arg)
         maybe_release_short(&tl, ch_tl);
         maybe_release_short(&tr, ch_tr);
 
-        TickType_t delay_ticks = pdMS_TO_TICKS(POLL_MS);
-        if (delay_ticks < 1) {
-            delay_ticks = 1;
-        }
-        vTaskDelay(delay_ticks);
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS) > 0 ? pdMS_TO_TICKS(POLL_MS) : 1);
     }
+}
+
+static esp_err_t init_encoder_isr(encoder_t *e)
+{
+    e->last_state =
+        (uint8_t)((gpio_get_level(e->a) ? 2 : 0) |
+                  (gpio_get_level(e->b) ? 1 : 0));
+
+    ESP_ERROR_CHECK(gpio_set_intr_type(e->a, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_set_intr_type(e->b, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(e->a, encoder_isr, e));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(e->b, encoder_isr, e));
+    return ESP_OK;
 }
 
 esp_err_t input_manager_init(void)
 {
-    s_queue = xQueueCreate(32, sizeof(input_event_t));
+    s_queue = xQueueCreate(24, sizeof(input_event_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
+
+    esp_err_t rc = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) return rc;
+
+    ESP_ERROR_CHECK(init_encoder_isr(&s_enc1));
+    ESP_ERROR_CHECK(init_encoder_isr(&s_enc2));
 
     if (xTaskCreate(input_task, "nc_input", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Input manager ready");
+    ESP_LOGI(TAG, "Input manager ready (interrupt quadrature + accumulated detents)");
     return ESP_OK;
 }
 
@@ -242,4 +270,22 @@ bool input_manager_get_event(input_event_t *event, TickType_t timeout)
 {
     if (!event || !s_queue) return false;
     return xQueueReceive(s_queue, event, timeout) == pdTRUE;
+}
+
+int input_manager_take_encoder_delta(uint8_t encoder_index)
+{
+    encoder_t *e = encoder_index == 1 ? &s_enc1 :
+                   encoder_index == 2 ? &s_enc2 : NULL;
+    if (!e) return 0;
+
+    portENTER_CRITICAL(&s_encoder_mux);
+    int delta = e->detent_accum;
+    e->detent_accum = 0;
+    portEXIT_CRITICAL(&s_encoder_mux);
+
+    if ((encoder_index == 1 && BOARD_ENC1_REVERSE) ||
+        (encoder_index == 2 && BOARD_ENC2_REVERSE)) {
+        delta = -delta;
+    }
+    return delta;
 }
