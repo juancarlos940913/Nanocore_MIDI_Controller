@@ -22,6 +22,7 @@ typedef enum {
     NC_PROTO_EVENT_ACTIVE_SLOT,
     NC_PROTO_EVENT_PRESET_NAME,
     NC_PROTO_EVENT_PRESET_MODELS,
+    NC_PROTO_EVENT_PARAM_VALUE,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
@@ -64,6 +65,9 @@ typedef struct {
     bool cab_model_known;
     uint8_t amp_model;
     uint8_t cab_model;
+
+    uint8_t param_index;
+    float param_value;
 } nanocore_protocol_event_t;
 
 esp_err_t nanocore_protocol_init(void);
