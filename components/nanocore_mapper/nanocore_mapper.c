@@ -10,7 +10,6 @@
 #include "nanocore_spec.h"
 
 #define MAP_REPLY_TIMEOUT_MS 2500
-#define MAP_FLOAT_EPSILON 0.0005f
 
 static const char *TAG = "NC_MAP";
 
@@ -18,218 +17,120 @@ static bool s_enabled;
 static bool s_inflight;
 static bool s_capture_pending;
 static int64_t s_sent_us;
-static uint32_t s_last_hash;
+
+static controller_block_t s_target = BLOCK_FX1;
+
+static bool s_seen[128];
+static uint8_t s_unique;
+static uint8_t s_match;
+static uint8_t s_mismatch;
+static uint8_t s_unknown;
 
 static bool s_have_prev;
-static nanocore_protocol_event_t s_prev;
+static uint8_t s_prev_variant;
+static uint8_t s_prev_count;
+static float s_prev_params[NC_PROTO_MAX_PARAMS];
 
 static const char *BLOCK_NAMES[BLOCK_COUNT] = {
     "FX1", "FX2", "AMP", "CAB", "DELAY", "MOD", "REVERB", "EQ"
 };
 
-static uint32_t fnv1a_u8(uint32_t h, uint8_t v)
+static void reset_session(void)
 {
-    h ^= v;
-    return h * 16777619u;
+    memset(s_seen, 0, sizeof(s_seen));
+    s_unique = 0;
+    s_match = 0;
+    s_mismatch = 0;
+    s_unknown = 0;
+
+    s_have_prev = false;
+    s_prev_variant = 0;
+    s_prev_count = 0;
+    memset(s_prev_params, 0, sizeof(s_prev_params));
 }
 
-static uint32_t fnv1a_bytes(uint32_t h, const void *data, size_t len)
+static void log_summary(void)
 {
-    const uint8_t *p = (const uint8_t *)data;
-    for (size_t i = 0; i < len; ++i) h = fnv1a_u8(h, p[i]);
-    return h;
-}
+    const size_t expected =
+        nanocore_spec_candidate_count((uint8_t)s_target);
 
-static uint32_t snapshot_hash(const nanocore_protocol_event_t *e)
-{
-    uint32_t h = 2166136261u;
-    h = fnv1a_u8(h, e->slot);
+    ESP_LOGI(TAG,
+             "ASSIST|SUMMARY|block=%s|unique=%u|match=%u|mismatch=%u|unknown=%u|candidate_types=%u",
+             BLOCK_NAMES[s_target],
+             s_unique, s_match, s_mismatch, s_unknown,
+             (unsigned)expected);
 
-    for (int b = 0; b < BLOCK_COUNT; ++b) {
-        h = fnv1a_u8(h, e->block_profile_known[b] ? 1 : 0);
-        h = fnv1a_u8(h, e->block_on[b] ? 1 : 0);
-        h = fnv1a_u8(h, e->block_variant[b]);
-        h = fnv1a_u8(h, e->block_param_count[b]);
-
-        uint8_t count = e->block_param_count[b];
-        if (count > NC_PROTO_MAX_PARAMS) count = NC_PROTO_MAX_PARAMS;
-        h = fnv1a_bytes(h, e->block_params[b],
-                        (size_t)count * sizeof(float));
+    if (s_target == BLOCK_AMP || s_target == BLOCK_CAB) {
+        ESP_LOGI(TAG,
+                 "ASSIST|SUMMARY|block=%s|status=PROFILE_ONLY|note=0x63 raw variant is not authoritative model id",
+                 BLOCK_NAMES[s_target]);
     }
-
-    h = fnv1a_u8(h, e->chain_order_known ? 1 : 0);
-    if (e->chain_order_known) {
-        h = fnv1a_bytes(h, e->chain_order, BLOCK_COUNT);
-    }
-
-    return h;
 }
 
-static const char *type_name_for(int block, uint8_t variant)
+static void log_raw_params(const nanocore_protocol_event_t *e)
 {
-    if (block == BLOCK_FX1) {
-        const nanocore_effect_type_info_t *info =
-            nanocore_spec_fx1_type(variant);
-        return info ? info->name : "Unknown";
-    }
-    return "?";
-}
+    const int b = (int)s_target;
+    uint8_t count = e->block_param_count[b];
+    if (count > NC_PROTO_MAX_PARAMS) count = NC_PROTO_MAX_PARAMS;
 
-static bool float_changed(float a, float b)
-{
-    float d = a - b;
-    if (d < 0.0f) d = -d;
-    return d > MAP_FLOAT_EPSILON;
-}
-
-static void log_block_snapshot(uint8_t slot,
-                               int block,
-                               const nanocore_protocol_event_t *e)
-{
-    char line[420];
-    const uint8_t variant = e->block_variant[block];
-    const uint8_t count = e->block_param_count[block];
-    const char *type_name = type_name_for(block, variant);
-
+    char line[360];
     int n = snprintf(line, sizeof(line),
-                     "MAP|slot=%u|block=%s|on=%u|variant=%u|type=%s|count=%u",
-                     slot, BLOCK_NAMES[block],
-                     e->block_on[block] ? 1 : 0,
-                     variant, type_name, count);
-
-    const nanocore_effect_type_info_t *fx1_info =
-        block == BLOCK_FX1 ? nanocore_spec_fx1_type(variant) : 0;
+                     "ASSIST|RAW|block=%s|variant=%u|count=%u",
+                     BLOCK_NAMES[b],
+                     e->block_variant[b],
+                     count);
 
     for (uint8_t i = 0;
-         i < count && i < NC_PROTO_MAX_PARAMS &&
-         n > 0 && (size_t)n < sizeof(line);
+         i < count && n > 0 && (size_t)n < sizeof(line);
          ++i) {
-
-        if (fx1_info && fx1_info->params &&
-            i < fx1_info->expected_param_count &&
-            fx1_info->params[i].name) {
-            const nanocore_param_info_t *p = &fx1_info->params[i];
-            float real = nanocore_spec_normalized_to_real(
-                p, e->block_params[block][i]);
-
-            int w = snprintf(&line[n], sizeof(line) - (size_t)n,
-                             "|p%u=%s:%.6f=>%.*f%s",
-                             i, p->name,
-                             (double)e->block_params[block][i],
-                             p->decimals,
-                             (double)real,
-                             p->unit ? p->unit : "");
-            if (w < 0) break;
-            n += w;
-        } else {
-            int w = snprintf(&line[n], sizeof(line) - (size_t)n,
-                             "|p%u=%.6f", i,
-                             (double)e->block_params[block][i]);
-            if (w < 0) break;
-            n += w;
-        }
+        int w = snprintf(&line[n], sizeof(line) - (size_t)n,
+                         "|p%u=%.6f",
+                         i, (double)e->block_params[b][i]);
+        if (w < 0) break;
+        n += w;
     }
 
     ESP_LOGI(TAG, "%s", line);
 }
 
-static bool block_changed(const nanocore_protocol_event_t *a,
-                          const nanocore_protocol_event_t *b,
-                          int block)
+static void log_diffs(const nanocore_protocol_event_t *e)
 {
-    if (a->block_profile_known[block] != b->block_profile_known[block]) {
-        return true;
-    }
-    if (!a->block_profile_known[block]) return false;
+    if (!s_have_prev) return;
 
-    if (a->block_on[block] != b->block_on[block] ||
-        a->block_variant[block] != b->block_variant[block] ||
-        a->block_param_count[block] != b->block_param_count[block]) {
-        return true;
-    }
-
-    uint8_t count = a->block_param_count[block];
+    const int b = (int)s_target;
+    const uint8_t variant = e->block_variant[b];
+    uint8_t count = e->block_param_count[b];
     if (count > NC_PROTO_MAX_PARAMS) count = NC_PROTO_MAX_PARAMS;
 
+    if (variant != s_prev_variant || count != s_prev_count) return;
+
     for (uint8_t i = 0; i < count; ++i) {
-        if (float_changed(a->block_params[block][i],
-                          b->block_params[block][i])) {
-            return true;
-        }
+        float oldv = s_prev_params[i];
+        float newv = e->block_params[b][i];
+        float d = newv - oldv;
+        if (d < 0.0f) d = -d;
+        if (d <= 0.0005f) continue;
+
+        ESP_LOGI(TAG,
+                 "ASSIST|DIFF|block=%s|variant=%u|p%u=%.6f->%.6f",
+                 BLOCK_NAMES[b], variant, i,
+                 (double)oldv, (double)newv);
     }
-    return false;
 }
 
-static void log_block_diff(uint8_t slot,
-                           const nanocore_protocol_event_t *prev,
-                           const nanocore_protocol_event_t *now,
-                           int block)
+static void save_prev(const nanocore_protocol_event_t *e)
 {
-    const uint8_t old_variant = prev->block_variant[block];
-    const uint8_t new_variant = now->block_variant[block];
-
-    if (old_variant != new_variant ||
-        prev->block_param_count[block] != now->block_param_count[block]) {
-        ESP_LOGI(TAG,
-                 "DIFF|slot=%u|block=%s|type_change=%u->%u|type=%s|count=%u",
-                 slot, BLOCK_NAMES[block],
-                 old_variant, new_variant,
-                 type_name_for(block, new_variant),
-                 now->block_param_count[block]);
-
-        log_block_snapshot(slot, block, now);
-        return;
+    const int b = (int)s_target;
+    s_prev_variant = e->block_variant[b];
+    s_prev_count = e->block_param_count[b];
+    if (s_prev_count > NC_PROTO_MAX_PARAMS) {
+        s_prev_count = NC_PROTO_MAX_PARAMS;
     }
 
-    if (prev->block_on[block] != now->block_on[block]) {
-        ESP_LOGI(TAG,
-                 "DIFF|slot=%u|block=%s|on=%u->%u",
-                 slot, BLOCK_NAMES[block],
-                 prev->block_on[block] ? 1 : 0,
-                 now->block_on[block] ? 1 : 0);
-    }
-
-    uint8_t count = now->block_param_count[block];
-    if (count > NC_PROTO_MAX_PARAMS) count = NC_PROTO_MAX_PARAMS;
-
-    for (uint8_t i = 0; i < count; ++i) {
-        if (!float_changed(prev->block_params[block][i],
-                           now->block_params[block][i])) {
-            continue;
-        }
-
-        const nanocore_effect_type_info_t *fx1_info =
-            block == BLOCK_FX1 ?
-            nanocore_spec_fx1_type(new_variant) : 0;
-
-        if (fx1_info && fx1_info->params &&
-            i < fx1_info->expected_param_count &&
-            fx1_info->params[i].name) {
-            const nanocore_param_info_t *p = &fx1_info->params[i];
-            float old_real = nanocore_spec_normalized_to_real(
-                p, prev->block_params[block][i]);
-            float new_real = nanocore_spec_normalized_to_real(
-                p, now->block_params[block][i]);
-
-            ESP_LOGI(TAG,
-                     "DIFF|slot=%u|block=%s|type=%s|variant=%u|param=%s|norm=%.6f->%.6f|real=%.*f%s->%.*f%s",
-                     slot, BLOCK_NAMES[block],
-                     type_name_for(block, new_variant),
-                     new_variant, p->name,
-                     (double)prev->block_params[block][i],
-                     (double)now->block_params[block][i],
-                     p->decimals, (double)old_real, p->unit ? p->unit : "",
-                     p->decimals, (double)new_real, p->unit ? p->unit : "");
-        } else {
-            ESP_LOGI(TAG,
-                     "DIFF|slot=%u|block=%s|type=%s|variant=%u|param=p%u|%.6f->%.6f",
-                     slot, BLOCK_NAMES[block],
-                     type_name_for(block, new_variant),
-                     new_variant, i,
-                     (double)prev->block_params[block][i],
-                     (double)now->block_params[block][i]);
-        }
-    }
+    memset(s_prev_params, 0, sizeof(s_prev_params));
+    memcpy(s_prev_params, e->block_params[b],
+           (size_t)s_prev_count * sizeof(float));
+    s_have_prev = true;
 }
 
 esp_err_t nanocore_mapper_init(void)
@@ -238,27 +139,64 @@ esp_err_t nanocore_mapper_init(void)
     s_inflight = false;
     s_capture_pending = false;
     s_sent_us = 0;
-    s_last_hash = 0;
-    s_have_prev = false;
-    memset(&s_prev, 0, sizeof(s_prev));
+    s_target = BLOCK_FX1;
+    reset_session();
 
     ESP_LOGI(TAG,
-             "Live Mapper ready; TOP+TOP toggles, ENC2 captures");
+             "Assisted Mapper ready; select block, TOP+TOP toggles, ENC2 captures");
     return ESP_OK;
+}
+
+void nanocore_mapper_set_target(controller_block_t block)
+{
+    if (block >= BLOCK_COUNT) return;
+    if (s_enabled) {
+        ESP_LOGW(TAG, "Cannot change mapper target while active");
+        return;
+    }
+    s_target = block;
+}
+
+controller_block_t nanocore_mapper_target(void)
+{
+    return s_target;
 }
 
 void nanocore_mapper_set_enabled(bool enabled)
 {
-    s_enabled = enabled;
-    s_inflight = false;
-    s_capture_pending = enabled;  // one baseline snapshot on entry
-    s_last_hash = 0;
-    s_have_prev = false;
-    memset(&s_prev, 0, sizeof(s_prev));
+    if (enabled == s_enabled) return;
 
-    ESP_LOGI(TAG, "Live Mapper %s%s",
-             enabled ? "ON" : "OFF",
-             enabled ? " - ENC2 CAPTURE" : "");
+    if (!enabled) {
+        log_summary();
+        s_enabled = false;
+        s_inflight = false;
+        s_capture_pending = false;
+        ESP_LOGI(TAG, "Assisted Mapper OFF");
+        return;
+    }
+
+    s_enabled = true;
+    s_inflight = false;
+    s_capture_pending = true;   // baseline
+    reset_session();
+
+    ESP_LOGI(TAG,
+             "ASSIST|START|block=%s|candidate_types=%u|mode=manual_capture",
+             BLOCK_NAMES[s_target],
+             (unsigned)nanocore_spec_candidate_count((uint8_t)s_target));
+
+    if (s_target == BLOCK_AMP || s_target == BLOCK_CAB) {
+        ESP_LOGW(TAG,
+                 "ASSIST|block=%s|status=PROFILE_ONLY|reason=model_variant_not_authoritative",
+                 BLOCK_NAMES[s_target]);
+    }
+
+    ESP_LOGI(TAG, "Assisted Mapper ON - ENC2 CAPTURE");
+}
+
+bool nanocore_mapper_is_enabled(void)
+{
+    return s_enabled;
 }
 
 void nanocore_mapper_request_capture(void)
@@ -271,12 +209,8 @@ void nanocore_mapper_request_capture(void)
     }
 
     s_capture_pending = true;
-    ESP_LOGI(TAG, "Manual capture queued");
-}
-
-bool nanocore_mapper_is_enabled(void)
-{
-    return s_enabled;
+    ESP_LOGI(TAG, "Manual capture queued for %s",
+             BLOCK_NAMES[s_target]);
 }
 
 void nanocore_mapper_service(bool midi_ready, bool transport_busy)
@@ -291,10 +225,6 @@ void nanocore_mapper_service(bool midi_ready, bool transport_busy)
             return;
         }
 
-        /*
-         * Do not auto-retry. Repeated write-without-response retries were
-         * exactly what exhausted BLE memory during the 8-minute FX1 sweep.
-         */
         ESP_LOGW(TAG, "Manual mapper capture timed out");
         s_inflight = false;
         return;
@@ -308,7 +238,8 @@ void nanocore_mapper_service(bool midi_ready, bool transport_busy)
     if (rc == ESP_OK) {
         s_inflight = true;
         s_sent_us = now;
-        ESP_LOGI(TAG, "Manual 0x63 capture requested");
+        ESP_LOGI(TAG, "Manual 0x63 capture requested for %s",
+                 BLOCK_NAMES[s_target]);
     } else {
         ESP_LOGW(TAG, "Mapper capture request failed: %s",
                  esp_err_to_name(rc));
@@ -324,54 +255,71 @@ void nanocore_mapper_on_live_state(const nanocore_protocol_event_t *e)
         return;
     }
 
-    const uint32_t h = snapshot_hash(e);
-    if (h == s_last_hash) return;
-    s_last_hash = h;
+    const int b = (int)s_target;
+    if (!e->block_profile_known[b]) {
+        ESP_LOGW(TAG,
+                 "ASSIST|block=%s|status=NO_PROFILE",
+                 BLOCK_NAMES[b]);
+        return;
+    }
 
-    if (!s_have_prev) {
-        ESP_LOGI(TAG, "MAP|BEGIN|slot=%u|hash=%08lX",
-                 e->slot, (unsigned long)h);
+    const uint8_t variant = e->block_variant[b];
+    const uint8_t got_count = e->block_param_count[b];
 
-        for (int b = 0; b < BLOCK_COUNT; ++b) {
-            if (e->block_profile_known[b]) {
-                log_block_snapshot(e->slot, b, e);
-            }
-        }
+    if (s_target == BLOCK_AMP || s_target == BLOCK_CAB) {
+        ESP_LOGI(TAG,
+                 "ASSIST|CAPTURE|block=%s|raw_variant=%u|count=%u|status=PROFILE_ONLY",
+                 BLOCK_NAMES[b], variant, got_count);
+        log_raw_params(e);
+        log_diffs(e);
+        save_prev(e);
+        return;
+    }
 
-        if (e->chain_order_known) {
-            ESP_LOGI(TAG,
-                     "MAP|slot=%u|chain=%u,%u,%u,%u,%u,%u,%u,%u",
-                     e->slot,
-                     e->chain_order[0], e->chain_order[1],
-                     e->chain_order[2], e->chain_order[3],
-                     e->chain_order[4], e->chain_order[5],
-                     e->chain_order[6], e->chain_order[7]);
-        }
+    const nanocore_candidate_type_t *candidate =
+        nanocore_spec_candidate_type((uint8_t)s_target, variant);
 
-        ESP_LOGI(TAG, "MAP|END|slot=%u", e->slot);
+    const char *status;
+    if (!candidate) {
+        status = "UNKNOWN";
+    } else if (candidate->expected_param_count == got_count) {
+        status = "MATCH";
     } else {
-        for (int b = 0; b < BLOCK_COUNT; ++b) {
-            if (block_changed(&s_prev, e, b)) {
-                log_block_diff(e->slot, &s_prev, e, b);
-            }
-        }
+        status = "MISMATCH";
+    }
 
-        if (s_prev.chain_order_known != e->chain_order_known ||
-            (e->chain_order_known &&
-             memcmp(s_prev.chain_order, e->chain_order,
-                    sizeof(e->chain_order)) != 0)) {
-            if (e->chain_order_known) {
-                ESP_LOGI(TAG,
-                         "DIFF|slot=%u|chain=%u,%u,%u,%u,%u,%u,%u,%u",
-                         e->slot,
-                         e->chain_order[0], e->chain_order[1],
-                         e->chain_order[2], e->chain_order[3],
-                         e->chain_order[4], e->chain_order[5],
-                         e->chain_order[6], e->chain_order[7]);
-            }
+    ESP_LOGI(TAG,
+             "ASSIST|CAPTURE|block=%s|raw=%u|candidate=%s|expected_count=%d|got_count=%u|status=%s",
+             BLOCK_NAMES[b],
+             variant,
+             candidate ? candidate->name : "UNKNOWN",
+             candidate ? (int)candidate->expected_param_count : -1,
+             got_count,
+             status);
+
+    if (candidate && candidate->parameter_names) {
+        ESP_LOGI(TAG,
+                 "ASSIST|CANDIDATE_PARAMS|block=%s|raw=%u|%s",
+                 BLOCK_NAMES[b],
+                 variant,
+                 candidate->parameter_names);
+    }
+
+    log_raw_params(e);
+    log_diffs(e);
+
+    if (variant < 128 && !s_seen[variant]) {
+        s_seen[variant] = true;
+        ++s_unique;
+
+        if (!candidate) {
+            ++s_unknown;
+        } else if (candidate->expected_param_count == got_count) {
+            ++s_match;
+        } else {
+            ++s_mismatch;
         }
     }
 
-    memcpy(&s_prev, e, sizeof(s_prev));
-    s_have_prev = true;
+    save_prev(e);
 }
