@@ -98,15 +98,36 @@ static void log_block_snapshot(uint8_t slot,
                      e->block_on[block] ? 1 : 0,
                      variant, type_name, count);
 
+    const nanocore_effect_type_info_t *fx1_info =
+        block == BLOCK_FX1 ? nanocore_spec_fx1_type(variant) : 0;
+
     for (uint8_t i = 0;
          i < count && i < NC_PROTO_MAX_PARAMS &&
          n > 0 && (size_t)n < sizeof(line);
          ++i) {
-        int w = snprintf(&line[n], sizeof(line) - (size_t)n,
-                         "|p%u=%.6f", i,
-                         (double)e->block_params[block][i]);
-        if (w < 0) break;
-        n += w;
+
+        if (fx1_info && fx1_info->params &&
+            i < fx1_info->expected_param_count) {
+            const nanocore_param_info_t *p = &fx1_info->params[i];
+            float real = nanocore_spec_normalized_to_real(
+                p, e->block_params[block][i]);
+
+            int w = snprintf(&line[n], sizeof(line) - (size_t)n,
+                             "|p%u=%s:%.6f=>%.*f%s",
+                             i, p->name,
+                             (double)e->block_params[block][i],
+                             p->decimals,
+                             (double)real,
+                             p->unit ? p->unit : "");
+            if (w < 0) break;
+            n += w;
+        } else {
+            int w = snprintf(&line[n], sizeof(line) - (size_t)n,
+                             "|p%u=%.6f", i,
+                             (double)e->block_params[block][i]);
+            if (w < 0) break;
+            n += w;
+        }
     }
 
     ESP_LOGI(TAG, "%s", line);
@@ -177,13 +198,36 @@ static void log_block_diff(uint8_t slot,
             continue;
         }
 
-        ESP_LOGI(TAG,
-                 "DIFF|slot=%u|block=%s|type=%s|variant=%u|param=p%u|%.6f->%.6f",
-                 slot, BLOCK_NAMES[block],
-                 type_name_for(block, new_variant),
-                 new_variant, i,
-                 (double)prev->block_params[block][i],
-                 (double)now->block_params[block][i]);
+        const nanocore_effect_type_info_t *fx1_info =
+            block == BLOCK_FX1 ?
+            nanocore_spec_fx1_type(new_variant) : 0;
+
+        if (fx1_info && fx1_info->params &&
+            i < fx1_info->expected_param_count) {
+            const nanocore_param_info_t *p = &fx1_info->params[i];
+            float old_real = nanocore_spec_normalized_to_real(
+                p, prev->block_params[block][i]);
+            float new_real = nanocore_spec_normalized_to_real(
+                p, now->block_params[block][i]);
+
+            ESP_LOGI(TAG,
+                     "DIFF|slot=%u|block=%s|type=%s|variant=%u|param=%s|norm=%.6f->%.6f|real=%.*f%s->%.*f%s",
+                     slot, BLOCK_NAMES[block],
+                     type_name_for(block, new_variant),
+                     new_variant, p->name,
+                     (double)prev->block_params[block][i],
+                     (double)now->block_params[block][i],
+                     p->decimals, (double)old_real, p->unit ? p->unit : "",
+                     p->decimals, (double)new_real, p->unit ? p->unit : "");
+        } else {
+            ESP_LOGI(TAG,
+                     "DIFF|slot=%u|block=%s|type=%s|variant=%u|param=p%u|%.6f->%.6f",
+                     slot, BLOCK_NAMES[block],
+                     type_name_for(block, new_variant),
+                     new_variant, i,
+                     (double)prev->block_params[block][i],
+                     (double)now->block_params[block][i]);
+        }
     }
 }
 
