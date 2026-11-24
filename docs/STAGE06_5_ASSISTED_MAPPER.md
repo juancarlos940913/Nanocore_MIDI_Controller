@@ -297,3 +297,29 @@ with different models are enough to validate the direct 0..29 index mapping.
 Common live profiles remain:
 - AMP: 5 params = Gain, Bass, Mid, Treble, Level
 - CAB: 3 params = Low Cut, High Cut, Level
+
+
+## Stage 06.9 — AMP/CAB authoritative model read VERIFIED
+
+Physical validation on multiple saved presets confirms the opcode-0x41 footer
+decoder and the 0..29 factory model catalogs.
+
+Observed saved presets:
+- slot 4: AMP RoJC120 (20), CAB FdTR212 (4)
+- slot 5: AMP MesR3 (13), CAB Eng412A (2)
+- slot 6: AMP MesR2 (12), CAB Eng412A (2)
+- slot 7: AMP MesR3 (13), CAB Eng412B (3)
+
+All reported names matched the NanoCore's physical screen.
+
+This also confirms the intended split of authority:
+- 0x41 saved-preset footer = AMP/CAB model identity
+- 0x63 live profile = AMP/CAB common parameter values
+- 0x63 AMP/CAB variant byte remains 0 and must never be treated as model id
+
+Common live parameter counts remain:
+- AMP: 5 params = Gain, Bass, Mid, Treble, Level
+- CAB: 3 params = Low Cut, High Cut, Level
+
+Stage 06 normal-mode protocol mapping is therefore complete enough to proceed
+to the full dynamic editor stage.
