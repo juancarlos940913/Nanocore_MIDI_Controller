@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -38,6 +39,12 @@ esp_err_t nanocore_midi_send_program_change(uint8_t channel_1based,
 esp_err_t nanocore_midi_send_cc(uint8_t channel_1based,
                                 uint8_t cc,
                                 uint8_t value);
+
+/**
+ * Send a complete F0...F7 SysEx message over BLE-MIDI.
+ * Long messages are split into ordered BLE-MIDI continuation packets.
+ */
+esp_err_t nanocore_midi_send_sysex(const uint8_t *sysex, size_t len);
 
 #ifdef __cplusplus
 }

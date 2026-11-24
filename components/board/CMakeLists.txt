@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "snapshot_manager.c"
+    SRCS "board.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash
+    REQUIRES esp_driver_gpio
 )

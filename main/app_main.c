@@ -1,39 +1,23 @@
 /*
- * Nanocore MIDI Controller
- * Stage 04 - Landscape UI + PRESET/STOMP/SCENE modes
+ * Nanocore MIDI Controller - Stage 05 / Hardware V2
  *
- * Existing PCB test controls:
+ * ESP32-S3 N16R8 + ST7796S 3.5" + 2 encoders + 5 footswitches + 2 LEDs.
  *
- *   Hold BTN_PROGRAM + BTN_STOP ~700 ms:
- *       PRESET -> STOMP -> SCENE -> PRESET
- *
- *   BTN_FUNCTION short:
- *       same mode cycle (development shortcut)
- *
- *   PRESET:
- *       BTN_PROGRAM = previous preset
- *       BTN_STOP    = next preset
- *
- *   STOMP:
- *       BTN_PROGRAM = FX2 toggle (CC21)
- *       BTN_STOP    = Delay toggle (CC26)
- *
- *   SCENE:
- *       BTN_PROGRAM = previous demo scene
- *       BTN_STOP    = next demo scene
- *
- * Display:
- *   ST7789V native 240x320 rotated to 320x240 landscape.
+ * Responsibilities are deliberately split into components:
+ * board / input_manager / display_ui / controller_storage / tempo_engine /
+ * status_leds / nanocore_map / name_editor / nanocore_midi.
  */
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
-#include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
@@ -43,144 +27,753 @@
 #include "esp_ble_midi.h"
 #include "esp_ble_midi_svc.h"
 
-#include "board_pins.h"
+#include "board.h"
+#include "controller_storage.h"
+#include "controller_types.h"
 #include "display_ui.h"
+#include "input_manager.h"
+#include "name_editor.h"
+#include "nanocore_map.h"
 #include "nanocore_midi.h"
-#include "snapshot_manager.h"
+#include "nanocore_protocol.h"
+#include "status_leds.h"
+#include "tempo_engine.h"
 
-static const char *TAG = "NC_STAGE04";
+static const char *TAG = "NC_STAGE05";
 
 static const uint8_t MIDI_SERVICE_UUID[16] = BLE_MIDI_SERVICE_UUID128;
 static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 
-#define NANOCORE_MIDI_CHANNEL       1
-#define NANOCORE_PRESET_MIN         0
-#define NANOCORE_PRESET_MAX        63
+#define MIDI_CHANNEL              1
+#define NANOCORE_PRESET_MIN       0
+#define NANOCORE_PRESET_MAX      63
 
-#define CC_FX1_ONOFF               20
-#define CC_FX2_ONOFF               21
-#define CC_AMP_ONOFF               23
-#define CC_CAB_ONOFF               24
-#define CC_MOD_ONOFF               25
-#define CC_DELAY_ONOFF             26
-#define CC_REVERB_ONOFF            27
-#define CC_EQ_ONOFF                28
-#define CC_AMP_TYPE                43
+#define CC_DELAY_TIME            74
+#define CC_TUNER                 80
 
-#define BUTTON_POLL_MS             10
-#define BUTTON_DEBOUNCE_MS         35
-#define MODE_CHORD_HOLD_MS        700
+#define MIDI_ACTION_GAP_MS       28
+#define RECALL_FIRST_SYNC_MS    600
+#define RECALL_RETRY_MS         250
+#define RECALL_REPLY_TIMEOUT_MS 900
+#define RECALL_TIMEOUT_MS      3500
+#define NOTICE_MS              1800
 
-// Stage 04.1 scene transport tuning.
-// Previous 4 ms spacing was too aggressive for the real NANOCORE.
-// Absolute CC values are safe to repeat, so each scene action is sent
-// twice with a conservative gap.
-#define SCENE_RETRY_GAP_MS         25
-#define SCENE_ACTION_GAP_MS        45
-#define SCENE_PHASE_GAP_MS         80
-#define SCENE_FEEDBACK_WAIT_MS    140
-#define AMP_AUDITION_GAP_MS        45
+static bool s_target_found;
+static bool s_ble_connected;
+static bool s_midi_ready;
+static bool s_dirty;
+static bool s_tuner_on;
 
-static bool s_target_found = false;
+static bool s_block_known[BLOCK_COUNT];
+static bool s_block_on[BLOCK_COUNT];
+
+static char s_notice[64];
+static int64_t s_notice_until_us;
+
+/*
+ * Program Change is asynchronous inside NanoCore. A live-state read sent
+ * too early may legitimately return the previous slot. Keep the controller
+ * target authoritative until opcode 0x63 confirms that exact slot.
+ */
+static bool s_recall_pending;
+static bool s_recall_poll_inflight;
+static uint8_t s_recall_target;
+static uint8_t s_recall_poll_count;
+static int64_t s_recall_started_us;
+static int64_t s_recall_next_poll_us;
+static int64_t s_recall_poll_sent_us;
+
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
-static uint16_t s_midi_char_handle = 0;
+static uint16_t s_midi_char_handle;
 
-static display_ui_state_t s_ui = {
-    .ble_connected = false,
-    .midi_ready = false,
-    .mode = UI_MODE_PRESET,
-    .preset = 0,
-    .scene = 0,
-    .fx1 = UI_BLOCK_UNKNOWN,
-    .fx2 = UI_BLOCK_UNKNOWN,
-    .amp = UI_BLOCK_UNKNOWN,
-    .cab = UI_BLOCK_UNKNOWN,
-    .mod = UI_BLOCK_UNKNOWN,
-    .delay = UI_BLOCK_UNKNOWN,
-    .reverb = UI_BLOCK_UNKNOWN,
-    .eq = UI_BLOCK_UNKNOWN,
-};
+static controller_runtime_t s_runtime;
+static controller_preset_t s_preset;
 
-static void render_ui(void)
+static controller_block_t s_selected_block = BLOCK_FX1;
+static size_t s_selected_parameter;
+static bool s_parameter_editing;
+
+static ui_screen_t s_screen = UI_SCREEN_PERFORMANCE;
+
+static name_editor_t s_name_editor;
+static bool s_name_target_scene;
+
+static void render_ui(void);
+
+static void show_notice(const char *text)
 {
-    if (display_ui_is_ready()) {
-        display_ui_render(&s_ui);
-    }
-}
-
-static void set_blocks_unknown(void)
-{
-    s_ui.fx1 = UI_BLOCK_UNKNOWN;
-    s_ui.fx2 = UI_BLOCK_UNKNOWN;
-    s_ui.amp = UI_BLOCK_UNKNOWN;
-    s_ui.cab = UI_BLOCK_UNKNOWN;
-    s_ui.mod = UI_BLOCK_UNKNOWN;
-    s_ui.delay = UI_BLOCK_UNKNOWN;
-    s_ui.reverb = UI_BLOCK_UNKNOWN;
-    s_ui.eq = UI_BLOCK_UNKNOWN;
-}
-
-static void refresh_scene_amp_ui(void)
-{
-    const snapshot_t *snap = snapshot_manager_get(s_ui.scene);
-
-    s_ui.scene_amp_configured = snap && snap->amp_configured;
-    s_ui.scene_amp_type = (snap && snap->amp_configured)
-                            ? snap->amp_type_id : 0;
-
-    if (!s_ui.amp_editing) {
-        s_ui.amp_edit_candidate = s_ui.scene_amp_type;
-    }
-}
-
-static esp_err_t send_amp_type(uint8_t amp_type_id)
-{
-    if (!nanocore_midi_is_ready()) {
-        ESP_LOGW(TAG, "MIDI not ready; Amp Type %u not sent",
-                 amp_type_id);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    esp_err_t rc = nanocore_midi_send_cc(
-        NANOCORE_MIDI_CHANNEL,
-        CC_AMP_TYPE,
-        amp_type_id & 0x7F);
-
-    if (rc == ESP_OK) {
-        ESP_LOGI(TAG, "AMP TYPE audition -> CC43=%u",
-                 amp_type_id & 0x7F);
-    } else {
-        ESP_LOGE(TAG, "Amp Type CC43 failed: %s",
-                 esp_err_to_name(rc));
-    }
-
-    return rc;
-}
-
-static void apply_snapshot_amp(uint8_t scene)
-{
-    scene &= 0x03;
-    s_ui.scene = scene;
-    s_ui.amp_editing = false;
-    refresh_scene_amp_ui();
+    if (!text) return;
+    strncpy(s_notice, text, sizeof(s_notice) - 1);
+    s_notice[sizeof(s_notice) - 1] = '\0';
+    s_notice_until_us = esp_timer_get_time() + (NOTICE_MS * 1000LL);
     render_ui();
+}
 
-    const snapshot_t *snap = snapshot_manager_get(scene);
-    if (!snap || !snap->amp_configured) {
-        ESP_LOGW(TAG,
-                 "SCENE %c has no Amp configured; NANOCORE left unchanged",
-                 (char)('A' + scene));
+static void clear_block_state(void)
+{
+    memset(s_block_known, 0, sizeof(s_block_known));
+    memset(s_block_on, 0, sizeof(s_block_on));
+}
+
+static int block_from_onoff_cc(uint8_t cc)
+{
+    for (int i = 0; i < BLOCK_COUNT; ++i) {
+        if (nanocore_block_onoff_cc((controller_block_t)i) == cc) return i;
+    }
+    return -1;
+}
+
+static void schedule_recall_sync(uint8_t target)
+{
+    s_recall_pending = true;
+    s_recall_poll_inflight = false;
+    s_recall_target = target;
+    s_recall_poll_count = 0;
+    s_recall_started_us = esp_timer_get_time();
+    s_recall_next_poll_us =
+        s_recall_started_us + (RECALL_FIRST_SYNC_MS * 1000LL);
+
+    ESP_LOGI(TAG, "Recall sync armed: target slot=%u", target);
+}
+
+static void service_recall_sync(void)
+{
+    if (!s_recall_pending || !s_midi_ready) return;
+
+    int64_t now = esp_timer_get_time();
+
+    if ((now - s_recall_started_us) >=
+        (RECALL_TIMEOUT_MS * 1000LL)) {
+        ESP_LOGE(TAG,
+                 "Recall sync timeout: target=%u polls=%u",
+                 s_recall_target, s_recall_poll_count);
+        s_recall_pending = false;
+        show_notice("NANOCORE PRESET SYNC TIMEOUT");
         return;
     }
 
-    ESP_LOGI(TAG, "SCENE %c -> Amp Type ID %u only",
-             (char)('A' + scene),
-             snap->amp_type_id);
+    if (s_recall_poll_inflight) {
+        if ((now - s_recall_poll_sent_us) <
+            (RECALL_REPLY_TIMEOUT_MS * 1000LL)) {
+            return;
+        }
 
-    if (send_amp_type(snap->amp_type_id) == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
+        ESP_LOGW(TAG,
+                 "Recall sync reply timeout; retrying target=%u",
+                 s_recall_target);
+        s_recall_poll_inflight = false;
+        s_recall_next_poll_us = now;
+    }
+
+    if (now < s_recall_next_poll_us) return;
+
+    esp_err_t rc = nanocore_protocol_request_live_state();
+    if (rc == ESP_OK) {
+        ++s_recall_poll_count;
+        s_recall_poll_inflight = true;
+        s_recall_poll_sent_us = now;
+        ESP_LOGI(TAG,
+                 "Recall sync poll #%u target=%u",
+                 s_recall_poll_count, s_recall_target);
+    } else {
+        ESP_LOGW(TAG, "Recall sync poll failed: %s",
+                 esp_err_to_name(rc));
+        s_recall_next_poll_us =
+            now + (RECALL_RETRY_MS * 1000LL);
     }
 }
+
+static void nvs_init_safe(void)
+{
+    esp_err_t rc = nvs_flash_init();
+    if (rc == ESP_ERR_NVS_NO_FREE_PAGES ||
+        rc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        rc = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(rc);
+}
+
+static esp_err_t persist_runtime(void)
+{
+    esp_err_t rc = controller_storage_save_runtime(&s_runtime);
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "Runtime NVS save failed: %s", esp_err_to_name(rc));
+    }
+    return rc;
+}
+
+static midi_assignment_t *edit_assignments(size_t *count)
+{
+    if (s_runtime.mode == CTRL_MODE_SCENE) {
+        if (count) *count = CTRL_SCENE_ASSIGNMENTS;
+        return s_preset.scene[s_runtime.current_scene].assignments;
+    }
+
+    if (count) *count = CTRL_BASE_ASSIGNMENTS;
+    return s_preset.base;
+}
+
+static const midi_assignment_t *scene_assignments(uint8_t scene,
+                                                   size_t *count)
+{
+    if (scene >= CTRL_SCENE_COUNT) return NULL;
+    if (count) *count = CTRL_SCENE_ASSIGNMENTS;
+    return s_preset.scene[scene].assignments;
+}
+
+static bool effective_cc(uint8_t cc, uint8_t *value)
+{
+    if (s_runtime.mode == CTRL_MODE_SCENE) {
+        const midi_assignment_t *scene =
+            s_preset.scene[s_runtime.current_scene].assignments;
+
+        if (controller_assignment_get(scene,
+                                      CTRL_SCENE_ASSIGNMENTS,
+                                      cc,
+                                      value)) {
+            return true;
+        }
+    }
+
+    return controller_assignment_get(s_preset.base,
+                                     CTRL_BASE_ASSIGNMENTS,
+                                     cc,
+                                     value);
+}
+
+static esp_err_t send_cc(uint8_t cc, uint8_t value)
+{
+    if (!nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t rc = nanocore_midi_send_cc(MIDI_CHANNEL, cc, value);
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "CC%u=%u", cc, value);
+    }
+    return rc;
+}
+
+static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
+{
+    size_t count = 0;
+    midi_assignment_t *items = edit_assignments(&count);
+
+    esp_err_t rc = controller_assignment_set(items, count, cc, value);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "No room for CC%u in working context", cc);
+        return rc;
+    }
+
+    s_dirty = true;
+
+    int block = block_from_onoff_cc(cc);
+    if (block >= 0) {
+        s_block_known[block] = true;
+        s_block_on[block] = value >= 64;
+    }
+
+    if (s_midi_ready) {
+        esp_err_t tx = send_cc(cc, value);
+        if (tx != ESP_OK) {
+            ESP_LOGW(TAG, "CC%u stored locally; live MIDI TX failed", cc);
+        }
+    } else {
+        ESP_LOGI(TAG, "CC%u=%u stored locally (MIDI offline)", cc, value);
+    }
+
+    render_ui();
+    return ESP_OK;
+}
+
+static void apply_assignments(const midi_assignment_t *items,
+                              size_t count)
+{
+    if (!items || !s_midi_ready) return;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (!items[i].used) continue;
+
+        if (send_cc(items[i].cc, items[i].value) == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
+        }
+    }
+}
+
+static void apply_current_scene(void)
+{
+    if (s_runtime.current_scene >= CTRL_SCENE_COUNT) {
+        s_runtime.current_scene = 0;
+    }
+
+    s_preset.active_scene = s_runtime.current_scene;
+
+    if (s_midi_ready) {
+        size_t count = 0;
+        const midi_assignment_t *items =
+            scene_assignments(s_runtime.current_scene, &count);
+
+        ESP_LOGI(TAG, "Apply Scene %c / %s",
+                 (char)('A' + s_runtime.current_scene),
+                 s_preset.scene[s_runtime.current_scene].name);
+        apply_assignments(items, count);
+    }
+
+    (void)persist_runtime();
+    render_ui();
+}
+
+static void restore_current_preset_to_nanocore(void)
+{
+    if (!s_midi_ready) return;
+
+    const uint8_t target = s_runtime.current_preset;
+
+    ESP_LOGI(TAG, "Recall PC=%u mode=%u scene=%u",
+             target,
+             (unsigned)s_runtime.mode,
+             s_runtime.current_scene);
+
+    clear_block_state();
+    render_ui();
+
+    // Arm the expected slot BEFORE sending PC so any immediate/odd push
+    // generated by this recall cannot move the controller backwards.
+    schedule_recall_sync(target);
+
+    esp_err_t rc = nanocore_midi_send_program_change(
+        MIDI_CHANNEL, target);
+
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "Program Change failed: %s",
+                 esp_err_to_name(rc));
+        s_recall_pending = false;
+        s_recall_poll_inflight = false;
+        show_notice("PROGRAM CHANGE FAILED");
+    }
+
+    /*
+     * Do not apply Scene overrides or request 0x63 immediately here.
+     * NanoCore can need ~400-600 ms before its live profile changes slot.
+     * The asynchronous recall-sync state machine waits for LIVE slot=target.
+     */
+}
+
+static esp_err_t load_preset(uint8_t index, bool transmit)
+{
+    if (index >= CTRL_PRESET_COUNT) return ESP_ERR_INVALID_ARG;
+
+    controller_preset_t loaded;
+    esp_err_t rc = controller_storage_load_preset(index, &loaded);
+    if (rc != ESP_OK) return rc;
+
+    s_preset = loaded;
+    s_runtime.current_preset = index;
+    s_runtime.current_scene =
+        s_preset.active_scene < CTRL_SCENE_COUNT
+            ? s_preset.active_scene : 0;
+
+    tempo_engine_set_bpm(s_preset.bpm);
+    status_leds_set_bpm(s_preset.bpm);
+
+    s_dirty = false;
+    s_parameter_editing = false;
+    s_selected_parameter = 0;
+    s_screen = UI_SCREEN_PERFORMANCE;
+
+    (void)persist_runtime();
+
+    if (transmit) {
+        restore_current_preset_to_nanocore();
+    }
+
+    render_ui();
+    return ESP_OK;
+}
+
+static void change_preset(int delta)
+{
+    if (s_dirty) {
+        ESP_LOGW(TAG, "Preset change blocked: unsaved edits. Use SAVE chord.");
+        show_notice("SAVE CHANGES BEFORE PRESET +/-");
+        return;
+    }
+
+    int p = (int)s_runtime.current_preset + delta;
+    if (p < NANOCORE_PRESET_MIN) p = NANOCORE_PRESET_MAX;
+    if (p > NANOCORE_PRESET_MAX) p = NANOCORE_PRESET_MIN;
+
+    ESP_LOGI(TAG, "Preset -> %d", p);
+    (void)load_preset((uint8_t)p, true);
+}
+
+static void change_scene(int delta)
+{
+    int s = (int)s_runtime.current_scene + delta;
+    while (s < 0) s += CTRL_SCENE_COUNT;
+    while (s >= CTRL_SCENE_COUNT) s -= CTRL_SCENE_COUNT;
+
+    s_runtime.current_scene = (uint8_t)s;
+    apply_current_scene();
+}
+
+static void cycle_mode(void)
+{
+    s_parameter_editing = false;
+    s_screen = UI_SCREEN_PERFORMANCE;
+
+    controller_mode_t previous = s_runtime.mode;
+    s_runtime.mode =
+        (controller_mode_t)((s_runtime.mode + 1) % CTRL_MODE_COUNT);
+
+    status_leds_set_mode(s_runtime.mode);
+    (void)persist_runtime();
+
+    ESP_LOGI(TAG, "MODE -> %u", (unsigned)s_runtime.mode);
+
+    if (s_runtime.mode == CTRL_MODE_SCENE) {
+        apply_current_scene();
+    } else if (previous == CTRL_MODE_SCENE) {
+        // Leaving Scene must remove its temporary overrides and return to
+        // the saved physical NanoCore preset.
+        restore_current_preset_to_nanocore();
+    } else {
+        render_ui();
+    }
+}
+
+static void update_delay_from_tempo(void)
+{
+    uint32_t delay_ms = tempo_engine_delay_ms(
+        s_preset.bpm,
+        s_preset.delay_subdivision);
+
+    uint8_t cc74 = tempo_engine_delay_ms_to_cc74(delay_ms);
+
+    ESP_LOGI(TAG,
+             "Delay tempo: %u BPM %s -> %lu ms -> CC74=%u",
+             s_preset.bpm,
+             tempo_engine_subdivision_name(s_preset.delay_subdivision),
+             (unsigned long)delay_ms,
+             cc74);
+
+    (void)set_working_cc(CC_DELAY_TIME, cc74);
+}
+
+static void register_tap(void)
+{
+    status_leds_tap_feedback();
+
+    bool updated = tempo_engine_tap();
+    if (updated) {
+        s_preset.bpm = tempo_engine_get_bpm();
+        status_leds_set_bpm(s_preset.bpm);
+        s_dirty = true;
+        update_delay_from_tempo();
+    } else {
+        render_ui();
+    }
+}
+
+static void toggle_tap_capture(void)
+{
+    if (tempo_engine_tap_active()) {
+        tempo_engine_cancel_tap();
+        status_leds_set_tap_capture(false);
+        ESP_LOGI(TAG, "Tap capture OFF");
+    } else {
+        tempo_engine_begin_tap();
+        status_leds_set_tap_capture(true);
+        status_leds_tap_feedback();
+        ESP_LOGI(TAG, "Tap capture ON - short presses now tap tempo");
+    }
+    render_ui();
+}
+
+static void toggle_tuner(void)
+{
+    uint8_t value = s_tuner_on ? 0 : 127;
+
+    if (send_cc(CC_TUNER, value) != ESP_OK) {
+        ESP_LOGW(TAG, "Tuner command failed");
+        return;
+    }
+
+    s_tuner_on = !s_tuner_on;
+    s_screen = s_tuner_on ? UI_SCREEN_TUNER : UI_SCREEN_PERFORMANCE;
+    ESP_LOGI(TAG, "TUNER -> %s", s_tuner_on ? "ON" : "OFF");
+    render_ui();
+}
+
+static void toggle_block(controller_block_t block)
+{
+    uint8_t cc = nanocore_block_onoff_cc(block);
+    uint8_t current = 0;
+
+    bool known = false;
+    if (block < BLOCK_COUNT && s_block_known[block]) {
+        known = true;
+        current = s_block_on[block] ? 127 : 0;
+    } else {
+        known = effective_cc(cc, &current);
+    }
+
+    uint8_t next = (!known || current < 64) ? 127 : 0;
+    ESP_LOGI(TAG, "STOMP %s -> %s",
+             nanocore_block_name(block),
+             next >= 64 ? "ON" : "OFF");
+
+    (void)set_working_cc(cc, next);
+}
+
+static uint16_t current_parameter_value(bool *known)
+{
+    const nc_parameter_t *p = nanocore_parameter(
+        s_selected_block,
+        s_selected_parameter);
+
+    if (!p) {
+        if (known) *known = false;
+        return 0;
+    }
+
+    if (p->kind == NC_PARAM_TEMPO_BPM) {
+        if (known) *known = true;
+        return s_preset.bpm;
+    }
+
+    if (p->kind == NC_PARAM_TEMPO_SUBDIV) {
+        if (known) *known = true;
+        return s_preset.delay_subdivision;
+    }
+
+    if (p->kind == NC_PARAM_MIDI &&
+        p->cc == nanocore_block_onoff_cc(s_selected_block) &&
+        s_block_known[s_selected_block]) {
+        if (known) *known = true;
+        return s_block_on[s_selected_block] ? 127 : 0;
+    }
+
+    uint8_t value = 0;
+    bool k = effective_cc(p->cc, &value);
+    if (known) *known = k;
+    return value;
+}
+
+static void select_parameter(int delta)
+{
+    size_t count = nanocore_parameter_count(s_selected_block);
+    if (count == 0) return;
+
+    int p = (int)s_selected_parameter + delta;
+    while (p < 0) p += (int)count;
+    while (p >= (int)count) p -= (int)count;
+    s_selected_parameter = (size_t)p;
+    render_ui();
+}
+
+static void adjust_parameter(int delta)
+{
+    const nc_parameter_t *p = nanocore_parameter(
+        s_selected_block,
+        s_selected_parameter);
+
+    if (!p || delta == 0) return;
+
+    if (p->kind == NC_PARAM_TEMPO_BPM) {
+        int bpm = (int)s_preset.bpm + delta;
+        if (bpm < (int)p->min_value) bpm = p->min_value;
+        if (bpm > (int)p->max_value) bpm = p->max_value;
+
+        s_preset.bpm = (uint16_t)bpm;
+        tempo_engine_set_bpm(s_preset.bpm);
+        status_leds_set_bpm(s_preset.bpm);
+        s_dirty = true;
+        update_delay_from_tempo();
+        return;
+    }
+
+    if (p->kind == NC_PARAM_TEMPO_SUBDIV) {
+        int sub = (int)s_preset.delay_subdivision + delta;
+        while (sub < 0) sub += DELAY_SUBDIV_COUNT;
+        while (sub >= DELAY_SUBDIV_COUNT) sub -= DELAY_SUBDIV_COUNT;
+
+        s_preset.delay_subdivision = (delay_subdivision_t)sub;
+        s_dirty = true;
+        update_delay_from_tempo();
+        return;
+    }
+
+    bool known = false;
+    uint16_t value = current_parameter_value(&known);
+
+    if (p->cc >= 20 && p->cc <= 28) {
+        value = delta > 0 ? 127 : 0;
+    } else {
+        if (!known) value = p->min_value;
+        int next = (int)value + delta;
+        if (next < (int)p->min_value) next = p->min_value;
+        if (next > (int)p->max_value) next = p->max_value;
+        value = (uint16_t)next;
+    }
+
+    (void)set_working_cc(p->cc, (uint8_t)value);
+}
+
+static void open_block_editor(void)
+{
+    s_selected_parameter = 0;
+    s_parameter_editing = false;
+    s_screen = UI_SCREEN_BLOCK_EDITOR;
+    render_ui();
+}
+
+static void back_from_block_editor(void)
+{
+    if (s_parameter_editing) {
+        s_parameter_editing = false;
+    } else {
+        s_screen = UI_SCREEN_PERFORMANCE;
+    }
+    render_ui();
+}
+
+static void open_name_editor(void)
+{
+    const char *initial;
+
+    s_name_target_scene = s_runtime.mode == CTRL_MODE_SCENE;
+    if (s_name_target_scene) {
+        initial = s_preset.scene[s_runtime.current_scene].name;
+    } else {
+        initial = s_preset.name;
+    }
+
+    name_editor_open(&s_name_editor, initial);
+    s_screen = UI_SCREEN_NAME_EDITOR;
+    render_ui();
+}
+
+static void cancel_name_editor(void)
+{
+    name_editor_close(&s_name_editor);
+    s_screen = UI_SCREEN_PERFORMANCE;
+    render_ui();
+}
+
+static void commit_name_and_save(void)
+{
+    if (!s_name_editor.active) return;
+
+    if (s_name_target_scene) {
+        strncpy(s_preset.scene[s_runtime.current_scene].name,
+                s_name_editor.text,
+                CTRL_NAME_LEN - 1);
+        s_preset.scene[s_runtime.current_scene].name[CTRL_NAME_LEN - 1] = '\0';
+
+        s_preset.active_scene = s_runtime.current_scene;
+
+        esp_err_t rc = controller_storage_save_preset(
+            s_runtime.current_preset, &s_preset);
+        if (rc != ESP_OK) {
+            ESP_LOGE(TAG, "Scene/NVS save failed: %s", esp_err_to_name(rc));
+            show_notice("SCENE SAVE FAILED");
+            return;
+        }
+
+        s_dirty = false;
+        name_editor_close(&s_name_editor);
+        s_screen = UI_SCREEN_PERFORMANCE;
+        (void)persist_runtime();
+        show_notice("SCENE SAVED TO CONTROLLER");
+        return;
+    }
+
+    /*
+     * NanoCore's real preset-name write limit is 8 characters.
+     * Keep the controller's mirror identical to what the pedal stores.
+     */
+    char device_name[9] = {0};
+    strncpy(device_name, s_name_editor.text, 8);
+
+    if (!s_midi_ready) {
+        show_notice("NANOCORE OFFLINE - NOT SAVED");
+        return;
+    }
+
+    show_notice("SAVING TO NANOCORE...");
+
+    esp_err_t rc = nanocore_protocol_rename_and_save(
+        s_runtime.current_preset,
+        device_name,
+        pdMS_TO_TICKS(900));
+
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "NanoCore save failed: %s", esp_err_to_name(rc));
+        show_notice("NANOCORE SAVE FAILED");
+        return;
+    }
+
+    strncpy(s_preset.name, device_name, CTRL_NAME_LEN - 1);
+    s_preset.name[CTRL_NAME_LEN - 1] = '\0';
+    s_preset.active_scene = s_runtime.current_scene;
+
+    rc = controller_storage_save_preset(
+        s_runtime.current_preset, &s_preset);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "NanoCore saved but NVS mirror failed: %s",
+                 esp_err_to_name(rc));
+        show_notice("PEDAL SAVED / NVS ERROR");
+        return;
+    }
+
+    s_dirty = false;
+    name_editor_close(&s_name_editor);
+    s_screen = UI_SCREEN_PERFORMANCE;
+    (void)persist_runtime();
+
+    (void)nanocore_protocol_request_live_state();
+
+    ESP_LOGI(TAG, "NanoCore + NVS saved P%02u / %s",
+             s_runtime.current_preset + 1, s_preset.name);
+    show_notice("PRESET SAVED TO NANOCORE");
+}
+
+static void render_ui(void)
+{
+    if (!display_ui_is_ready()) return;
+
+    display_ui_state_t u = {
+        .ble_connected = s_ble_connected,
+        .midi_ready = s_midi_ready,
+        .dirty = s_dirty,
+        .tap_capture = tempo_engine_tap_active(),
+        .screen = s_screen,
+        .mode = s_runtime.mode,
+        .preset_index = s_runtime.current_preset,
+        .scene_index = s_runtime.current_scene,
+        .bpm = s_preset.bpm,
+        .subdivision = s_preset.delay_subdivision,
+        .preset = &s_preset,
+        .selected_block = s_selected_block,
+        .selected_parameter = s_selected_parameter,
+        .parameter_editing = s_parameter_editing,
+        .notice = s_notice,
+        .name_editor = &s_name_editor,
+    };
+
+    memcpy(u.block_known, s_block_known, sizeof(u.block_known));
+    memcpy(u.block_on, s_block_on, sizeof(u.block_on));
+
+    bool known = false;
+    u.parameter_value = current_parameter_value(&known);
+    u.parameter_known = known;
+
+    display_ui_render(&u);
+}
+
+/* -------------------------------------------------------------------------
+ * BLE-MIDI central transport discovery
+ * ------------------------------------------------------------------------- */
 
 static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
 {
@@ -191,9 +784,7 @@ static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
                                     ESP_BLE_CONN_ADV_TYPE_UUID128_COMPLETE,
                                     &p, &len) == ESP_OK) {
         for (uint8_t off = 0; off + 16 <= len; off += 16) {
-            if (memcmp(&p[off], MIDI_SERVICE_UUID, 16) == 0) {
-                return true;
-            }
+            if (memcmp(&p[off], MIDI_SERVICE_UUID, 16) == 0) return true;
         }
     }
 
@@ -201,9 +792,7 @@ static bool adv_has_midi_uuid(const uint8_t *adv, uint16_t adv_len)
                                     ESP_BLE_CONN_ADV_TYPE_UUID128_INCOMP,
                                     &p, &len) == ESP_OK) {
         for (uint8_t off = 0; off + 16 <= len; off += 16) {
-            if (memcmp(&p[off], MIDI_SERVICE_UUID, 16) == 0) {
-                return true;
-            }
+            if (memcmp(&p[off], MIDI_SERVICE_UUID, 16) == 0) return true;
         }
     }
 
@@ -214,27 +803,27 @@ static void adv_get_name(const uint8_t *adv, uint16_t adv_len,
                          char *out, size_t out_len)
 {
     if (!out || out_len == 0) return;
-
     out[0] = '\0';
 
     const uint8_t *name = NULL;
     uint8_t name_len = 0;
 
     esp_err_t rc = esp_ble_conn_parse_adv_data(
-        adv, adv_len, ESP_BLE_CONN_ADV_TYPE_NAME_COMPLETE,
+        adv, adv_len,
+        ESP_BLE_CONN_ADV_TYPE_NAME_COMPLETE,
         &name, &name_len);
 
     if (rc != ESP_OK) {
         rc = esp_ble_conn_parse_adv_data(
-            adv, adv_len, ESP_BLE_CONN_ADV_TYPE_NAME_SHORT,
+            adv, adv_len,
+            ESP_BLE_CONN_ADV_TYPE_NAME_SHORT,
             &name, &name_len);
     }
 
-    if (rc == ESP_OK && name && name_len > 0) {
-        size_t copy_len = name_len;
-        if (copy_len >= out_len) copy_len = out_len - 1;
-        memcpy(out, name, copy_len);
-        out[copy_len] = '\0';
+    if (rc == ESP_OK && name && name_len) {
+        size_t n = name_len < out_len - 1 ? name_len : out_len - 1;
+        memcpy(out, name, n);
+        out[n] = '\0';
     }
 }
 
@@ -246,9 +835,8 @@ static bool contains_nanocore(const char *name)
     size_t n = strlen(name);
     if (n >= sizeof(lower)) n = sizeof(lower) - 1;
 
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i)
         lower[i] = (char)tolower((unsigned char)name[i]);
-    }
 
     return strstr(lower, "nanocore") != NULL;
 }
@@ -256,27 +844,24 @@ static bool contains_nanocore(const char *name)
 static bool scan_cb(const esp_ble_conn_scan_result_t *result, void *arg)
 {
     (void)arg;
-
     if (!result || s_target_found) return false;
 
     char name[48];
-    adv_get_name(result->adv_data, result->adv_data_len, name, sizeof(name));
+    adv_get_name(result->adv_data, result->adv_data_len,
+                 name, sizeof(name));
 
-    bool midi_uuid = adv_has_midi_uuid(result->adv_data,
-                                       result->adv_data_len);
-    bool nanocore_name = contains_nanocore(name);
+    bool midi = adv_has_midi_uuid(result->adv_data,
+                                  result->adv_data_len);
 
-    if (midi_uuid || nanocore_name) {
+    if (midi || contains_nanocore(name)) {
         ESP_LOGI(TAG,
-                 "NANOCORE candidate: addr=" BLE_CONN_MGR_ADDR_STR
-                 " RSSI=%d name=\"%s\" MIDI_UUID=%s",
+                 "NANOCORE candidate: " BLE_CONN_MGR_ADDR_STR
+                 " RSSI=%d name=%s MIDI=%s",
                  BLE_CONN_MGR_ADDR_HEX(result->addr),
                  result->rssi,
                  name[0] ? name : "<no-name>",
-                 midi_uuid ? "YES" : "no");
-
+                 midi ? "YES" : "no");
         s_target_found = true;
-        ESP_LOGI(TAG, "Connecting...");
         return true;
     }
 
@@ -292,105 +877,41 @@ static bool conn_data_is_midi_io(const esp_ble_conn_data_t *d)
                   sizeof(d->uuid.uuid128)) == 0;
 }
 
-static ui_block_state_t block_state_from_midi_value(uint8_t value)
+static void midi_rx_cb(const uint8_t *data, uint16_t len, void *ctx)
 {
-    return value >= 64 ? UI_BLOCK_ON : UI_BLOCK_OFF;
-}
-
-static bool apply_received_block_cc(uint8_t cc, uint8_t value)
-{
-    ui_block_state_t state = block_state_from_midi_value(value);
-
-    switch (cc) {
-    case CC_FX1_ONOFF:
-        s_ui.fx1 = state;
-        return true;
-    case CC_FX2_ONOFF:
-        s_ui.fx2 = state;
-        return true;
-    case CC_AMP_ONOFF:
-        s_ui.amp = state;
-        return true;
-    case CC_CAB_ONOFF:
-        s_ui.cab = state;
-        return true;
-    case CC_MOD_ONOFF:
-        s_ui.mod = state;
-        return true;
-    case CC_DELAY_ONOFF:
-        s_ui.delay = state;
-        return true;
-    case CC_REVERB_ONOFF:
-        s_ui.reverb = state;
-        return true;
-    case CC_EQ_ONOFF:
-        s_ui.eq = state;
-        return true;
-    default:
-        return false;
-    }
-}
-
-static void midi_rx_cb(const uint8_t *data, uint16_t len, void *user_ctx)
-{
-    (void)user_ctx;
-    ESP_LOGD(TAG, "BLE-MIDI RX packet: %u bytes", len);
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, data, len, ESP_LOG_DEBUG);
+    (void)ctx;
+    ESP_LOGD(TAG, "BLE-MIDI packet %u bytes", len);
 }
 
 static void midi_evt_cb(uint16_t ts_ms,
-                        esp_ble_midi_event_type_t event_type,
+                        esp_ble_midi_event_type_t type,
                         const uint8_t *msg,
-                        uint16_t msg_len)
+                        uint16_t len)
 {
-    if (event_type == ESP_BLE_MIDI_EVENT_SYSEX_OVERFLOW) {
-        ESP_LOGW(TAG, "MIDI RX ts=%u: SysEx overflow", ts_ms);
+    if (type == ESP_BLE_MIDI_EVENT_SYSEX_OVERFLOW) {
+        ESP_LOGW(TAG, "MIDI RX SysEx overflow");
         return;
     }
 
-    if (!msg || msg_len == 0) {
-        return;
+    if (!msg || len == 0) return;
+
+    if ((msg[0] & 0xF0) == 0xB0 && len >= 3) {
+        ESP_LOGI(TAG, "MIDI RX CC%u=%u", msg[1] & 0x7F, msg[2] & 0x7F);
+    } else if (msg[0] == 0xF0) {
+        ESP_LOGD(TAG, "MIDI RX SysEx ts=%u len=%u", ts_ms, len);
+        nanocore_protocol_on_sysex(msg, len);
     }
-
-    const uint8_t status = msg[0] & 0xF0;
-
-    if (status == 0xB0 && msg_len >= 3) {
-        const uint8_t cc = msg[1] & 0x7F;
-        const uint8_t value = msg[2] & 0x7F;
-
-        ESP_LOGI(TAG,
-                 "MIDI FEEDBACK RX: CC%u=%u -> %s",
-                 cc,
-                 value,
-                 value >= 64 ? "ON/HIGH" : "OFF/LOW");
-
-        if (apply_received_block_cc(cc, value)) {
-            // Do not render from the BLE callback. Scene execution waits
-            // briefly for feedback and renders from the button task.
-        }
-        return;
-    }
-
-    if (status == 0xC0 && msg_len >= 2) {
-        ESP_LOGI(TAG, "MIDI FEEDBACK RX: Program Change %u",
-                 msg[1] & 0x7F);
-        return;
-    }
-
-    ESP_LOGI(TAG, "MIDI FEEDBACK RX: status=0x%02X len=%u",
-             msg[0], msg_len);
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, msg_len, ESP_LOG_INFO);
 }
 
-static void subscribe_midi_notifications(uint16_t conn_handle)
+static void subscribe_midi(uint16_t conn_handle)
 {
-    static uint8_t cccd_notify[2] = {0x01, 0x00};
+    static uint8_t cccd[2] = {0x01, 0x00};
 
     esp_ble_conn_data_t sub = {
         .type = BLE_CONN_UUID_TYPE_128,
         .write_conn_id = conn_handle,
-        .data = cccd_notify,
-        .data_len = sizeof(cccd_notify),
+        .data = cccd,
+        .data_len = sizeof(cccd),
     };
     memcpy(sub.uuid.uuid128, MIDI_CHAR_UUID, sizeof(sub.uuid.uuid128));
 
@@ -399,194 +920,31 @@ static void subscribe_midi_notifications(uint16_t conn_handle)
         ESP_BLE_CONN_DESC_CIENT_CONFIG,
         &sub);
 
-    if (rc == ESP_OK) {
-        ESP_LOGI(TAG, "Subscribed to BLE-MIDI notifications");
-    } else {
-        ESP_LOGW(TAG, "MIDI notification subscribe failed: %s",
-                 esp_err_to_name(rc));
-    }
+    ESP_LOGI(TAG, "MIDI notify subscribe: %s", esp_err_to_name(rc));
 }
 
-static bool resolve_peer_midi_handle(uint16_t conn_handle)
+static bool resolve_midi_handle(uint16_t conn_handle)
 {
-    esp_ble_conn_uuid_t svc_uuid = {0};
-    esp_ble_conn_uuid_t chr_uuid = {0};
-
-    memcpy(svc_uuid.uuid128, MIDI_SERVICE_UUID, sizeof(svc_uuid.uuid128));
-    memcpy(chr_uuid.uuid128, MIDI_CHAR_UUID, sizeof(chr_uuid.uuid128));
+    esp_ble_conn_uuid_t svc = {0};
+    esp_ble_conn_uuid_t chr = {0};
+    memcpy(svc.uuid128, MIDI_SERVICE_UUID, sizeof(svc.uuid128));
+    memcpy(chr.uuid128, MIDI_CHAR_UUID, sizeof(chr.uuid128));
 
     s_midi_char_handle = 0;
 
     esp_err_t rc = esp_ble_conn_get_peer_chr_handle(
         conn_handle,
-        BLE_CONN_UUID_TYPE_128,
-        svc_uuid,
-        BLE_CONN_UUID_TYPE_128,
-        chr_uuid,
+        BLE_CONN_UUID_TYPE_128, svc,
+        BLE_CONN_UUID_TYPE_128, chr,
         &s_midi_char_handle);
 
-    if (rc != ESP_OK || s_midi_char_handle == 0) {
-        ESP_LOGE(TAG, "BLE-MIDI characteristic NOT found: %s",
+    if (rc != ESP_OK || !s_midi_char_handle) {
+        ESP_LOGE(TAG, "MIDI characteristic not found: %s",
                  esp_err_to_name(rc));
         return false;
     }
 
-    ESP_LOGI(TAG, "BLE-MIDI characteristic found: handle=0x%04X",
-             s_midi_char_handle);
     return true;
-}
-
-static esp_err_t send_current_program(void)
-{
-    if (!nanocore_midi_is_ready()) {
-        ESP_LOGW(TAG, "MIDI not ready; PC %u not sent", s_ui.preset);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "Program Change -> %u", s_ui.preset);
-
-    esp_err_t rc = nanocore_midi_send_program_change(
-        NANOCORE_MIDI_CHANNEL, s_ui.preset);
-
-    if (rc == ESP_OK) {
-        // Preset recall can change any block, so our local block cache is
-        // deliberately invalidated until the controller sends a known state.
-        set_blocks_unknown();
-        render_ui();
-    } else {
-        ESP_LOGE(TAG, "Program Change failed: %s", esp_err_to_name(rc));
-    }
-
-    return rc;
-}
-
-static ui_block_state_t toggled_state(ui_block_state_t current)
-{
-    // First press from UNKNOWN intentionally sends ON.
-    return current == UI_BLOCK_ON ? UI_BLOCK_OFF : UI_BLOCK_ON;
-}
-
-static esp_err_t set_block_cc(uint8_t cc,
-                              ui_block_state_t *local_state,
-                              ui_block_state_t new_state,
-                              const char *label)
-{
-    if (!local_state) return ESP_ERR_INVALID_ARG;
-
-    if (!nanocore_midi_is_ready()) {
-        ESP_LOGW(TAG, "MIDI not ready; %s not changed", label);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint8_t value = (new_state == UI_BLOCK_ON) ? 127 : 0;
-
-    esp_err_t rc = nanocore_midi_send_cc(
-        NANOCORE_MIDI_CHANNEL, cc, value);
-
-    if (rc == ESP_OK) {
-        *local_state = new_state;
-        ESP_LOGI(TAG, "%s -> %s (CC%u=%u)",
-                 label,
-                 new_state == UI_BLOCK_ON ? "ON" : "OFF",
-                 cc, value);
-        render_ui();
-    } else {
-        ESP_LOGE(TAG, "%s CC failed: %s",
-                 label, esp_err_to_name(rc));
-    }
-
-    return rc;
-}
-
-static void toggle_fx2(void)
-{
-    set_block_cc(CC_FX2_ONOFF,
-                 &s_ui.fx2,
-                 toggled_state(s_ui.fx2),
-                 "FX2");
-}
-
-static void toggle_delay(void)
-{
-    set_block_cc(CC_DELAY_ONOFF,
-                 &s_ui.delay,
-                 toggled_state(s_ui.delay),
-                 "DELAY");
-}
-
-static void cycle_mode(void)
-{
-    // Do not leave an amp audition half-edited.
-    if (s_ui.amp_editing) {
-        ESP_LOGW(TAG, "Finish AMP EDIT with ENC1 before changing mode");
-        return;
-    }
-
-    s_ui.mode = (ui_mode_t)((s_ui.mode + 1) % UI_MODE_COUNT);
-
-    ESP_LOGI(TAG, "MODE -> %s",
-             s_ui.mode == UI_MODE_PRESET ? "PRESET" :
-             s_ui.mode == UI_MODE_STOMP  ? "STOMP" : "SCENE");
-
-    if (s_ui.mode == UI_MODE_SCENE) {
-        apply_snapshot_amp(s_ui.scene);
-    } else {
-        render_ui();
-    }
-}
-
-static void handle_program_click(void)
-{
-    switch (s_ui.mode) {
-    case UI_MODE_STOMP:
-        toggle_fx2();
-        break;
-
-    case UI_MODE_SCENE:
-        if (s_ui.amp_editing) {
-            ESP_LOGW(TAG, "ENC1: save AMP EDIT before changing Scene");
-            break;
-        }
-        apply_snapshot_amp((uint8_t)((s_ui.scene + 3) & 0x03));
-        break;
-
-    case UI_MODE_PRESET:
-    default:
-        if (s_ui.preset <= NANOCORE_PRESET_MIN) {
-            s_ui.preset = NANOCORE_PRESET_MAX;
-        } else {
-            --s_ui.preset;
-        }
-        send_current_program();
-        break;
-    }
-}
-
-static void handle_stop_click(void)
-{
-    switch (s_ui.mode) {
-    case UI_MODE_STOMP:
-        toggle_delay();
-        break;
-
-    case UI_MODE_SCENE:
-        if (s_ui.amp_editing) {
-            ESP_LOGW(TAG, "ENC1: save AMP EDIT before changing Scene");
-            break;
-        }
-        apply_snapshot_amp((uint8_t)((s_ui.scene + 1) & 0x03));
-        break;
-
-    case UI_MODE_PRESET:
-    default:
-        if (s_ui.preset >= NANOCORE_PRESET_MAX) {
-            s_ui.preset = NANOCORE_PRESET_MIN;
-        } else {
-            ++s_ui.preset;
-        }
-        send_current_program();
-        break;
-    }
 }
 
 static void ble_event_handler(void *handler_args,
@@ -600,92 +958,53 @@ static void ble_event_handler(void *handler_args,
 
     switch (id) {
     case ESP_BLE_CONN_EVENT_STARTED:
-        ESP_LOGI(TAG, "BLE manager started; scanning...");
-        render_ui();
+        ESP_LOGI(TAG, "BLE scanning...");
         break;
 
     case ESP_BLE_CONN_EVENT_CONNECTED:
-        if (esp_ble_conn_get_conn_handle(&s_conn_handle) != ESP_OK ||
-            s_conn_handle == BLE_CONN_HANDLE_INVALID) {
-            ESP_LOGE(TAG, "Connected event but no valid handle");
-            break;
-        }
-
-        s_ui.ble_connected = true;
-        ESP_LOGI(TAG, "CONNECTED: conn_handle=%u", s_conn_handle);
-        render_ui();
-
-        {
-            esp_err_t mtu_rc = esp_ble_conn_mtu_update(s_conn_handle, 185);
-            if (mtu_rc != ESP_OK) {
-                ESP_LOGW(TAG, "MTU request failed: %s",
-                         esp_err_to_name(mtu_rc));
-            }
+        if (esp_ble_conn_get_conn_handle(&s_conn_handle) == ESP_OK) {
+            s_ble_connected = true;
+            ESP_LOGI(TAG, "BLE connected handle=%u", s_conn_handle);
+            (void)esp_ble_conn_mtu_update(s_conn_handle, 185);
+            render_ui();
         }
         break;
-
-    case ESP_BLE_CONN_EVENT_MTU: {
-        esp_ble_conn_event_data_t *evt =
-            (esp_ble_conn_event_data_t *)event_data;
-        if (evt) {
-            ESP_LOGI(TAG, "MTU negotiated: %u", evt->mtu_update.mtu);
-        }
-        break;
-    }
 
     case ESP_BLE_CONN_EVENT_DISC_COMPLETE:
-        ESP_LOGI(TAG, "GATT discovery complete");
-
         if (s_conn_handle != BLE_CONN_HANDLE_INVALID &&
-            resolve_peer_midi_handle(s_conn_handle)) {
-
-            subscribe_midi_notifications(s_conn_handle);
+            resolve_midi_handle(s_conn_handle)) {
+            subscribe_midi(s_conn_handle);
             nanocore_midi_set_link(s_conn_handle, s_midi_char_handle);
 
-            s_ui.midi_ready = true;
+            s_midi_ready = true;
+            nanocore_protocol_set_connected(true);
             render_ui();
-
-            ESP_LOGI(TAG, "======================================");
-            ESP_LOGI(TAG, " STAGE 04 READY");
-            ESP_LOGI(TAG, " PRESET/STOMP/SCENE + LANDSCAPE UI");
-            ESP_LOGI(TAG, " HOLD GPIO18 + GPIO21 = MODE");
-            ESP_LOGI(TAG, " GPIO47 = MODE shortcut");
-            ESP_LOGI(TAG, " SCENE: ENC1 press=AMP EDIT, turn=CC43, press=SAVE");
-            ESP_LOGI(TAG, "======================================");
+            restore_current_preset_to_nanocore();
         }
         break;
 
     case ESP_BLE_CONN_EVENT_DATA_RECEIVE: {
-        esp_ble_conn_data_t *conn_data =
-            (esp_ble_conn_data_t *)event_data;
-
-        if (conn_data &&
-            conn_data->data &&
-            conn_data->data_len > 0 &&
-            conn_data_is_midi_io(conn_data)) {
-            esp_ble_midi_on_bep_received(
-                conn_data->data,
-                conn_data->data_len);
+        esp_ble_conn_data_t *d = (esp_ble_conn_data_t *)event_data;
+        if (d && d->data && d->data_len && conn_data_is_midi_io(d)) {
+            esp_ble_midi_on_bep_received(d->data, d->data_len);
         }
         break;
     }
 
     case ESP_BLE_CONN_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "DISCONNECTED; restarting scan");
-
+        ESP_LOGW(TAG, "BLE disconnected");
+        nanocore_protocol_set_connected(false);
         nanocore_midi_clear_link();
+        clear_block_state();
+        s_ble_connected = false;
+        s_midi_ready = false;
+        s_tuner_on = false;
         s_conn_handle = BLE_CONN_HANDLE_INVALID;
         s_midi_char_handle = 0;
         s_target_found = false;
-
-        s_ui.ble_connected = false;
-        s_ui.midi_ready = false;
-        set_blocks_unknown();
+        s_screen = UI_SCREEN_PERFORMANCE;
         render_ui();
-
-        if (esp_ble_conn_scan_start() != ESP_OK) {
-            ESP_LOGW(TAG, "Could not restart scan");
-        }
+        (void)esp_ble_conn_scan_start();
         break;
 
     default:
@@ -693,321 +1012,8 @@ static void ble_event_handler(void *handler_args,
     }
 }
 
-typedef struct {
-    gpio_num_t pin_a;
-    gpio_num_t pin_b;
-    gpio_num_t pin_sw;
-    int last_a;
-    bool last_sw_raw;
-    bool sw_stable;
-    TickType_t sw_last_change;
-} encoder_state_t;
-
-static int encoder_step(encoder_state_t *e)
+static void ble_init(void)
 {
-    int a = gpio_get_level(e->pin_a);
-    int step = 0;
-
-    // Same proven direction rule used by the original programmer firmware:
-    // count one detent on the falling edge of A.
-    if (a != e->last_a && a == 0) {
-        int b = gpio_get_level(e->pin_b);
-        step = (b != a) ? 1 : -1;
-    }
-
-    e->last_a = a;
-    return step;
-}
-
-static bool encoder_click(encoder_state_t *e, TickType_t now)
-{
-    bool raw = gpio_get_level(e->pin_sw) == 0;
-
-    if (raw != e->last_sw_raw) {
-        e->last_sw_raw = raw;
-        e->sw_last_change = now;
-    }
-
-    if ((now - e->sw_last_change) < pdMS_TO_TICKS(35)) {
-        return false;
-    }
-
-    if (raw == e->sw_stable) {
-        return false;
-    }
-
-    e->sw_stable = raw;
-    return raw; // press edge
-}
-
-static void start_amp_edit(void)
-{
-    if (s_ui.mode != UI_MODE_SCENE) {
-        return;
-    }
-
-    refresh_scene_amp_ui();
-
-    s_ui.amp_editing = true;
-    s_ui.amp_edit_candidate = s_ui.scene_amp_configured
-                                ? s_ui.scene_amp_type : 0;
-
-    ESP_LOGI(TAG,
-             "AMP EDIT Scene %c started at ID %u%s",
-             (char)('A' + s_ui.scene),
-             s_ui.amp_edit_candidate,
-             s_ui.scene_amp_configured ? "" : " (default audition start)");
-
-    // Audition the starting point so what is shown is what is heard.
-    if (send_amp_type(s_ui.amp_edit_candidate) == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
-    }
-
-    render_ui();
-}
-
-static void save_amp_edit(void)
-{
-    esp_err_t rc = snapshot_manager_set_amp(
-        s_ui.scene,
-        s_ui.amp_edit_candidate);
-
-    if (rc != ESP_OK) {
-        ESP_LOGE(TAG, "Could not save Scene %c Amp ID %u: %s",
-                 (char)('A' + s_ui.scene),
-                 s_ui.amp_edit_candidate,
-                 esp_err_to_name(rc));
-        return;
-    }
-
-    ESP_LOGI(TAG, "AMP EDIT Scene %c saved -> ID %u",
-             (char)('A' + s_ui.scene),
-             s_ui.amp_edit_candidate);
-
-    s_ui.amp_editing = false;
-    refresh_scene_amp_ui();
-    render_ui();
-}
-
-static void handle_amp_encoder_step(int step)
-{
-    if (!s_ui.amp_editing || step == 0) {
-        return;
-    }
-
-    int value = (int)s_ui.amp_edit_candidate + step;
-
-    // Clamp rather than wrap; this makes exploring unknown valid ID ranges
-    // safer and preserves the user's perceived ordering.
-    if (value < 0) value = 0;
-    if (value > 127) value = 127;
-
-    if (value == s_ui.amp_edit_candidate) {
-        return;
-    }
-
-    s_ui.amp_edit_candidate = (uint8_t)value;
-    render_ui();
-
-    if (send_amp_type(s_ui.amp_edit_candidate) == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(AMP_AUDITION_GAP_MS));
-    }
-}
-
-typedef struct {
-    gpio_num_t gpio;
-    bool stable_pressed;
-    bool raw_pressed;
-    bool consumed;
-    bool click;
-    TickType_t last_raw_change;
-    TickType_t press_tick;
-} button_state_t;
-
-static void button_poll(button_state_t *b, TickType_t now)
-{
-    b->click = false;
-
-    bool raw = gpio_get_level(b->gpio) == 0;
-
-    if (raw != b->raw_pressed) {
-        b->raw_pressed = raw;
-        b->last_raw_change = now;
-    }
-
-    if ((now - b->last_raw_change) < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
-        return;
-    }
-
-    if (raw == b->stable_pressed) {
-        return;
-    }
-
-    b->stable_pressed = raw;
-
-    if (raw) {
-        b->press_tick = now;
-        b->consumed = false;
-    } else {
-        if (!b->consumed) {
-            b->click = true;
-        }
-    }
-}
-
-static void buttons_init(void)
-{
-    gpio_config_t cfg = {
-        .pin_bit_mask =
-            (1ULL << BTN_PROGRAM) |
-            (1ULL << BTN_STOP) |
-            (1ULL << BTN_FUNCTION) |
-            (1ULL << ENC1_A) |
-            (1ULL << ENC1_B) |
-            (1ULL << ENC1_SW),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-}
-
-static void button_task(void *arg)
-{
-    (void)arg;
-
-    TickType_t now = xTaskGetTickCount();
-
-    button_state_t program = {
-        .gpio = BTN_PROGRAM,
-        .last_raw_change = now,
-    };
-
-    button_state_t stop = {
-        .gpio = BTN_STOP,
-        .last_raw_change = now,
-    };
-
-    button_state_t function = {
-        .gpio = BTN_FUNCTION,
-        .last_raw_change = now,
-    };
-
-    encoder_state_t enc1 = {
-        .pin_a = ENC1_A,
-        .pin_b = ENC1_B,
-        .pin_sw = ENC1_SW,
-        .last_a = gpio_get_level(ENC1_A),
-        .last_sw_raw = false,
-        .sw_stable = false,
-        .sw_last_change = now,
-    };
-
-    bool chord_active = false;
-    bool chord_fired = false;
-    TickType_t chord_start = 0;
-
-    while (1) {
-        now = xTaskGetTickCount();
-
-        button_poll(&program, now);
-        button_poll(&stop, now);
-        button_poll(&function, now);
-
-        int enc_step = encoder_step(&enc1);
-        if (enc_step != 0 && s_ui.mode == UI_MODE_SCENE) {
-            handle_amp_encoder_step(enc_step);
-        }
-
-        if (encoder_click(&enc1, now) && s_ui.mode == UI_MODE_SCENE) {
-            if (s_ui.amp_editing) {
-                save_amp_edit();
-            } else {
-                start_amp_edit();
-            }
-        }
-
-        if (program.stable_pressed && stop.stable_pressed) {
-            if (!chord_active) {
-                chord_active = true;
-                chord_fired = false;
-                chord_start = now;
-            }
-
-            if (!chord_fired &&
-                (now - chord_start) >= pdMS_TO_TICKS(MODE_CHORD_HOLD_MS)) {
-
-                program.consumed = true;
-                stop.consumed = true;
-                chord_fired = true;
-
-                cycle_mode();
-            }
-        } else if (!program.stable_pressed && !stop.stable_pressed) {
-            chord_active = false;
-            chord_fired = false;
-        }
-
-        // Individual commands execute on RELEASE so the two-button chord
-        // never accidentally changes a preset/effect before mode switching.
-        if (program.click) {
-            handle_program_click();
-        }
-
-        if (stop.click) {
-            handle_stop_click();
-        }
-
-        if (function.click) {
-            if (s_ui.amp_editing) {
-                ESP_LOGW(TAG, "AMP EDIT active; press ENC1 to save first");
-            } else {
-                cycle_mode();
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-    }
-}
-
-static void nvs_init_safe(void)
-{
-    esp_err_t rc = nvs_flash_init();
-
-    if (rc == ESP_ERR_NVS_NO_FREE_PAGES ||
-        rc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        rc = nvs_flash_init();
-    }
-
-    ESP_ERROR_CHECK(rc);
-}
-
-void app_main(void)
-{
-    ESP_LOGI(TAG, "======================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 04");
-    ESP_LOGI(TAG, " LANDSCAPE UI + PERFORMANCE MODES");
-    ESP_LOGI(TAG, "======================================");
-
-    nvs_init_safe();
-    ESP_ERROR_CHECK(snapshot_manager_init());
-    buttons_init();
-
-    refresh_scene_amp_ui();
-
-    esp_err_t display_rc = display_ui_init();
-    if (display_rc == ESP_OK) {
-        render_ui();
-    } else {
-        // BLE/MIDI remains testable over serial even if the TFT needs
-        // an orientation/color/driver adjustment on the physical unit.
-        ESP_LOGE(TAG, "Display init failed: %s",
-                 esp_err_to_name(display_rc));
-    }
-
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_event_handler_register(
         BLE_CONN_MGR_EVENTS,
@@ -1017,7 +1023,7 @@ void app_main(void)
 
     esp_ble_conn_config_t config = {0};
     strncpy((char *)config.device_name,
-            "Nanocore_Controller",
+            "Nanocore_Controller_V2",
             sizeof(config.device_name) - 1);
 
     ESP_ERROR_CHECK(esp_ble_conn_init(&config));
@@ -1033,16 +1039,376 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_ble_midi_profile_init());
     ESP_ERROR_CHECK(esp_ble_midi_register_rx_cb(midi_rx_cb, NULL));
     ESP_ERROR_CHECK(esp_ble_midi_register_event_cb(midi_evt_cb));
-
     ESP_ERROR_CHECK(esp_ble_conn_start());
+}
 
-    xTaskCreate(
-        button_task,
-        "nc_buttons",
-        4096,
-        NULL,
-        5,
-        NULL);
+/* -------------------------------------------------------------------------
+ * UI / physical input routing
+ * ------------------------------------------------------------------------- */
 
-    ESP_LOGI(TAG, "Waiting for NANOCORE BLE-MIDI...");
+static void handle_name_editor_event(input_event_t e)
+{
+    switch (e) {
+    case INPUT_ENC1_CLICK:
+        name_editor_select(&s_name_editor);
+        break;
+    case INPUT_ENC2_CLICK:
+        name_editor_toggle_case(&s_name_editor);
+        break;
+    case INPUT_FS_TOP_LEFT:
+        name_editor_cursor_move(&s_name_editor, -1);
+        break;
+    case INPUT_FS_TOP_RIGHT:
+        name_editor_cursor_move(&s_name_editor, +1);
+        break;
+    case INPUT_FS_PRESET_DOWN:
+        name_editor_backspace(&s_name_editor);
+        break;
+    case INPUT_FS_PRESET_UP:
+        cancel_name_editor();
+        return;
+    case INPUT_CHORD_SAVE:
+        commit_name_and_save();
+        return;
+    default:
+        return;
+    }
+
+    render_ui();
+}
+
+static void handle_encoder_delta(uint8_t encoder, int delta)
+{
+    if (delta == 0) return;
+
+    if (s_screen == UI_SCREEN_NAME_EDITOR) {
+        if (encoder == 1) {
+            name_editor_move_horizontal(&s_name_editor, delta);
+        } else {
+            name_editor_move_vertical(&s_name_editor, delta);
+        }
+        render_ui();
+        return;
+    }
+
+    if (s_tuner_on) return;
+
+    if (encoder == 1) {
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            if (!s_parameter_editing) {
+                select_parameter(delta);
+            }
+        } else {
+            int block = (int)s_selected_block + delta;
+            while (block < 0) block += BLOCK_COUNT;
+            while (block >= BLOCK_COUNT) block -= BLOCK_COUNT;
+            s_selected_block = (controller_block_t)block;
+            render_ui();
+        }
+    } else if (encoder == 2) {
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR && s_parameter_editing) {
+            adjust_parameter(delta);
+        }
+    }
+}
+
+static void handle_input(input_event_t e)
+{
+    if (s_screen == UI_SCREEN_NAME_EDITOR) {
+        handle_name_editor_event(e);
+        return;
+    }
+
+    if (s_tuner_on) {
+        if (e == INPUT_CHORD_TUNER || e == INPUT_ENC2_CLICK) {
+            toggle_tuner();
+        }
+        return;
+    }
+
+    switch (e) {
+    case INPUT_ENC1_CLICK:
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            s_parameter_editing = !s_parameter_editing;
+            render_ui();
+        } else {
+            open_block_editor();
+        }
+        break;
+
+    case INPUT_ENC2_CLICK:
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            back_from_block_editor();
+        }
+        break;
+
+    case INPUT_FS_PRESET_DOWN:
+        change_preset(-1);
+        break;
+
+    case INPUT_FS_PRESET_UP:
+        change_preset(+1);
+        break;
+
+    case INPUT_FS_MODE_SHORT:
+        if (tempo_engine_tap_active()) {
+            register_tap();
+        } else {
+            cycle_mode();
+        }
+        break;
+
+    case INPUT_FS_MODE_LONG:
+        toggle_tap_capture();
+        break;
+
+    case INPUT_CHORD_TUNER:
+        toggle_tuner();
+        break;
+
+    case INPUT_CHORD_SAVE:
+        open_name_editor();
+        break;
+
+    case INPUT_FS_TOP_LEFT:
+        if (s_runtime.mode == CTRL_MODE_SCENE) {
+            change_scene(-1);
+        } else if (s_runtime.mode == CTRL_MODE_STOMP) {
+            toggle_block(s_selected_block);
+        }
+        break;
+
+    case INPUT_FS_TOP_RIGHT:
+        if (s_runtime.mode == CTRL_MODE_SCENE) {
+            change_scene(+1);
+        } else if (s_runtime.mode == CTRL_MODE_STOMP) {
+            toggle_block(BLOCK_DELAY);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void handle_protocol_event(const nanocore_protocol_event_t *e)
+{
+    if (!e) return;
+
+    switch (e->type) {
+    case NC_PROTO_EVENT_LIVE_STATE:
+        s_recall_poll_inflight = false;
+
+        if (e->slot >= CTRL_PRESET_COUNT) {
+            ESP_LOGW(TAG, "Ignoring invalid LIVE slot=%u", e->slot);
+            break;
+        }
+
+        if (s_recall_pending) {
+            if (e->slot != s_recall_target) {
+                /*
+                 * Expected during Program Change: a 0x63 request issued
+                 * while NanoCore is still switching can return the OLD slot.
+                 * Never let that stale reply roll controller state backwards.
+                 */
+                ESP_LOGW(TAG,
+                         "Stale LIVE slot=%u ignored; waiting for target=%u",
+                         e->slot, s_recall_target);
+
+                s_recall_next_poll_us =
+                    esp_timer_get_time() +
+                    (RECALL_RETRY_MS * 1000LL);
+                break;
+            }
+
+            ESP_LOGI(TAG,
+                     "Recall confirmed: LIVE slot=%u after %u poll(s)",
+                     e->slot, s_recall_poll_count);
+            s_recall_pending = false;
+        } else if (e->slot != s_runtime.current_preset) {
+            /*
+             * A stray/delayed 0x63 must never select a preset by itself.
+             * Physical preset changes are handled by a valid slot push,
+             * which first updates current_preset and then requests 0x63.
+             */
+            ESP_LOGW(TAG,
+                     "Unexpected LIVE slot=%u while controller=%u; ignored",
+                     e->slot, s_runtime.current_preset);
+            break;
+        }
+
+        memcpy(s_block_known, e->block_known, sizeof(s_block_known));
+        memcpy(s_block_on, e->block_on, sizeof(s_block_on));
+        render_ui();
+
+        if (s_runtime.mode == CTRL_MODE_SCENE) {
+            // Only overlay a Scene after the requested physical preset
+            // has definitely finished recalling.
+            apply_current_scene();
+        }
+
+        // Serialize BLE reads: name only after confirmed live-state slot.
+        (void)nanocore_protocol_request_preset_name(
+            s_runtime.current_preset);
+        break;
+
+    case NC_PROTO_EVENT_BLOCK_STATE: {
+        if (e->block >= BLOCK_COUNT) break;
+
+        s_block_known[e->block] = true;
+        s_block_on[e->block] = e->on;
+
+        /*
+         * A physical NanoCore block toggle is a real unsaved live edit.
+         * Mirror it in the current controller context so SAVE preserves the
+         * same state in NVS as the pedal.
+         */
+        size_t count = 0;
+        midi_assignment_t *items = edit_assignments(&count);
+        (void)controller_assignment_set(
+            items, count,
+            nanocore_block_onoff_cc(e->block),
+            e->on ? 127 : 0);
+        s_dirty = true;
+        render_ui();
+        break;
+    }
+
+    case NC_PROTO_EVENT_ACTIVE_SLOT:
+        /*
+         * Current NanoCore firmware is known to emit unreliable 0x01 values
+         * around Program Change (including values outside 0..63). During a
+         * controller-originated recall, 0x63 is the only slot authority.
+         */
+        if (s_recall_pending) {
+            ESP_LOGI(TAG,
+                     "Slot push %u ignored during recall target=%u",
+                     e->slot, s_recall_target);
+            break;
+        }
+
+        if (e->slot < CTRL_PRESET_COUNT &&
+            e->slot != s_runtime.current_preset) {
+            bool had_dirty = s_dirty;
+            ESP_LOGI(TAG, "Physical NanoCore preset -> %u", e->slot);
+            (void)load_preset(e->slot, false);
+            clear_block_state();
+
+            // The push is a candidate; use the exact same 0x63 confirmation
+            // path before accepting live state/name.
+            schedule_recall_sync(e->slot);
+
+            show_notice(had_dirty
+                ? "NANOCORE CHANGED - LOCAL EDIT LOST"
+                : "NANOCORE PRESET CHANGED");
+        }
+        break;
+
+    case NC_PROTO_EVENT_PRESET_NAME:
+        if (e->slot == s_runtime.current_preset &&
+            s_screen != UI_SCREEN_NAME_EDITOR &&
+            e->name[0]) {
+            strncpy(s_preset.name, e->name, CTRL_NAME_LEN - 1);
+            s_preset.name[CTRL_NAME_LEN - 1] = '\0';
+
+            // Keep the local mirror's display name from becoming stale
+            // (e.g. an old test name such as "Prueba").
+            if (!s_dirty) {
+                esp_err_t rc = controller_storage_save_preset(
+                    s_runtime.current_preset, &s_preset);
+                if (rc != ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "Could not refresh NVS preset name: %s",
+                             esp_err_to_name(rc));
+                }
+            }
+
+            render_ui();
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "==============================================");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 05 / HW V2");
+    ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
+    ESP_LOGI(TAG, "==============================================");
+
+    nvs_init_safe();
+    ESP_ERROR_CHECK(board_init());
+    ESP_ERROR_CHECK(controller_storage_init());
+
+    ESP_ERROR_CHECK(controller_storage_load_runtime(&s_runtime));
+    ESP_ERROR_CHECK(controller_storage_load_preset(
+        s_runtime.current_preset,
+        &s_preset));
+
+    if (s_runtime.current_scene >= CTRL_SCENE_COUNT) {
+        s_runtime.current_scene = 0;
+    }
+
+    tempo_engine_init(s_preset.bpm);
+
+    // Bring up the display before background input/LED tasks so a fault in
+    // those subsystems cannot hide boot diagnostics or leave the TFT dark.
+    ESP_ERROR_CHECK(display_ui_init());
+    render_ui();
+
+    ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
+    ESP_ERROR_CHECK(input_manager_init());
+    ESP_ERROR_CHECK(nanocore_protocol_init());
+
+    ble_init();
+
+    bool last_tap_active = tempo_engine_tap_active();
+
+    while (1) {
+        /*
+         * Rotation is coalesced: one fast physical turn may arrive as +20
+         * detents, which updates the model once and renders once instead of
+         * replaying 20 stale screen frames.
+         */
+        int enc1 = input_manager_take_encoder_delta(1);
+        int enc2 = input_manager_take_encoder_delta(2);
+        if (enc1) handle_encoder_delta(1, enc1);
+        if (enc2) handle_encoder_delta(2, enc2);
+
+        input_event_t e = INPUT_NONE;
+        TickType_t input_wait = pdMS_TO_TICKS(10);
+        if (input_wait < 1) input_wait = 1;
+        if (input_manager_get_event(&e, input_wait)) {
+            handle_input(e);
+        }
+
+        nanocore_protocol_event_t pe = {0};
+        while (nanocore_protocol_get_event(&pe, 0)) {
+            handle_protocol_event(&pe);
+        }
+
+        service_recall_sync();
+        tempo_engine_service();
+
+        bool tap_active = tempo_engine_tap_active();
+        if (tap_active != last_tap_active) {
+            status_leds_set_tap_capture(tap_active);
+            last_tap_active = tap_active;
+            render_ui();
+        }
+
+        if (s_notice[0] &&
+            esp_timer_get_time() >= s_notice_until_us) {
+            s_notice[0] = '\0';
+            render_ui();
+        }
+
+        // Always give IDLE0 CPU time. On a 100 Hz FreeRTOS tick,
+        // pdMS_TO_TICKS(5) was zero and the previous loop could spin forever,
+        // tripping the task watchdog even while the controller appeared alive.
+        vTaskDelay(1);
+    }
 }
