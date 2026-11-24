@@ -40,6 +40,10 @@ typedef struct {
     bool parameter_known;
     uint16_t parameter_value;
 
+    bool block_known[BLOCK_COUNT];
+    bool block_on[BLOCK_COUNT];
+
+    const char *notice;
     const name_editor_t *name_editor;
 } display_ui_state_t;
 
