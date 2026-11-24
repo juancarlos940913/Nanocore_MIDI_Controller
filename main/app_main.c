@@ -276,8 +276,9 @@ static void restore_current_preset_to_nanocore(void)
         vTaskDelay(pdMS_TO_TICKS(LIVE_SYNC_SETTLE_MS));
     }
 
+    // Name request is intentionally issued after the live-state response
+    // is fully reassembled (see handle_protocol_event).
     (void)nanocore_protocol_request_live_state();
-    (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
 }
 
 static esp_err_t load_preset(uint8_t index, bool transmit)
@@ -1130,6 +1131,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         memcpy(s_block_known, e->block_known, sizeof(s_block_known));
         memcpy(s_block_on, e->block_on, sizeof(s_block_on));
         render_ui();
+
+        // Serialize BLE SysEx reads: request the short name window only
+        // after the segmented live-state reply has completed.
+        (void)nanocore_protocol_request_preset_name(e->slot);
         break;
 
     case NC_PROTO_EVENT_BLOCK_STATE: {
@@ -1161,7 +1166,6 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             (void)load_preset(e->slot, false);
             clear_block_state();
             (void)nanocore_protocol_request_live_state();
-            (void)nanocore_protocol_request_preset_name(e->slot);
             show_notice(had_dirty
                 ? "NANOCORE CHANGED - LOCAL EDIT LOST"
                 : "NANOCORE PRESET CHANGED");
