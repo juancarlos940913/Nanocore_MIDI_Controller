@@ -252,7 +252,7 @@ esp_err_t input_manager_init(void)
     s_queue = xQueueCreate(24, sizeof(input_event_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
 
-    esp_err_t rc = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    esp_err_t rc = gpio_install_isr_service(0);
     if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) return rc;
 
     ESP_ERROR_CHECK(init_encoder_isr(&s_enc1));
