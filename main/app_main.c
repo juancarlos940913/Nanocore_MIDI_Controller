@@ -343,6 +343,7 @@ static void cycle_mode(void)
     s_parameter_editing = false;
     s_screen = UI_SCREEN_PERFORMANCE;
 
+    controller_mode_t previous = s_runtime.mode;
     s_runtime.mode =
         (controller_mode_t)((s_runtime.mode + 1) % CTRL_MODE_COUNT);
 
@@ -353,6 +354,10 @@ static void cycle_mode(void)
 
     if (s_runtime.mode == CTRL_MODE_SCENE) {
         apply_current_scene();
+    } else if (previous == CTRL_MODE_SCENE) {
+        // Leaving Scene must remove its temporary overrides and return to
+        // the saved physical NanoCore preset.
+        restore_current_preset_to_nanocore();
     } else {
         render_ui();
     }
