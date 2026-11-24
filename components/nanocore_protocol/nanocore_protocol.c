@@ -245,70 +245,52 @@ static esp_err_t send_read_name_window(uint8_t slot)
 
 static void parse_name_payload(const uint8_t *payload, size_t len)
 {
-    static const uint8_t anchor[] = {0x02,0x07,0x00,0x02,0x10};
+    if (!payload || len < 8) return;
 
-    if (!payload || len < sizeof(anchor) + 3) return;
-
-    uint8_t slot = payload[0];
+    const uint8_t slot = payload[0];
     size_t anchor_pos = SIZE_MAX;
-    for (size_t i = 0; i + sizeof(anchor) <= len; ++i) {
-        if (memcmp(&payload[i], anchor, sizeof(anchor)) == 0) {
-            anchor_pos = i + sizeof(anchor);
+
+    /*
+     * Real 0x41 captures show the name tag as:
+     *
+     *   02 <record-length> 00 02 10 <ASCII name...>
+     *
+     * The second byte is NOT fixed:
+     *   factory/shorter names were observed with 0x07,
+     *   the user-written 8-char "ColdCln1" uses 0x08.
+     *
+     * Therefore match the structural bytes and deliberately ignore the
+     * variable length byte instead of hard-coding 0x07.
+     */
+    for (size_t i = 0; i + 5 <= len; ++i) {
+        if (payload[i]     == 0x02 &&
+            payload[i + 2] == 0x00 &&
+            payload[i + 3] == 0x02 &&
+            payload[i + 4] == 0x10) {
+            anchor_pos = i + 5;
             break;
         }
     }
+
     if (anchor_pos == SIZE_MAX) {
-        ESP_LOGW(TAG, "Preset name anchor not found in 0x41 payload len=%u",
+        ESP_LOGW(TAG,
+                 "Preset name tag not found in 0x41 payload len=%u",
                  (unsigned)len);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, len, ESP_LOG_INFO);
         return;
     }
 
-    /*
-     * Two name-field layouts have now been observed on real hardware:
-     *
-     *  A) already-unpacked/contiguous ASCII:
-     *       C l n A r p ...
-     *
-     *  B) the device's inner 7-bit-safe name field:
-     *       C l 00 n A r p ... [00 after the next 7 data bytes]
-     *
-     * The outer segmented BLE reply has already been unpacked, but a
-     * user-written name can still retain these *inner* packing-header bytes.
-     * Factory names such as "ClnArp" were observed in layout A, while
-     * readback after writing a 7-char name can use layout B.
-     *
-     * Auto-detect from byte +2: a NUL there cannot be a valid printable
-     * name character, so it unambiguously selects layout B.
-     */
     char name[13] = {0};
     size_t out = 0;
-    bool inner_packed =
-        (anchor_pos + 2 < len && payload[anchor_pos + 2] == 0x00);
 
-    for (size_t read = 0;
-         out < 12 && anchor_pos + read < len;
-         ++read) {
-
-        if (inner_packed && (read == 2 || read == 10)) {
-            continue;
-        }
-
-        uint8_t ch = payload[anchor_pos + read];
+    while (out < 12 && anchor_pos + out < len) {
+        const uint8_t ch = payload[anchor_pos + out];
         if (ch == 0) break;
         if (ch < 0x20 || ch > 0x7E) {
             ESP_LOGW(TAG,
-                     "Preset name decode rejected byte 0x%02X at +%u (anchor=%u packed=%u)",
-                     ch, (unsigned)read, (unsigned)anchor_pos,
-                     inner_packed ? 1 : 0);
-            size_t dump_start = anchor_pos > 8 ? anchor_pos - 8 : 0;
-            size_t dump_len = len - dump_start;
-            if (dump_len > 32) dump_len = 32;
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, &payload[dump_start],
-                                     dump_len, ESP_LOG_INFO);
+                     "Preset name invalid byte 0x%02X at index=%u",
+                     ch, (unsigned)out);
             return;
         }
-
         name[out++] = (char)ch;
     }
 
