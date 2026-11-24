@@ -101,26 +101,26 @@ static const nc_parameter_t EQ[] = {
 const char *nanocore_block_name(controller_block_t b)
 {
     static const char *N[] = {
-        "FX1", "FX2", "AMP", "CAB", "MOD", "DELAY", "REVERB", "EQ"
+        "FX1", "FX2", "AMP", "CAB", "DELAY", "MOD", "REVERB", "EQ"
     };
     return b < BLOCK_COUNT ? N[b] : "?";
 }
 
 uint8_t nanocore_block_onoff_cc(controller_block_t b)
 {
-    static const uint8_t C[] = {20,21,23,24,25,26,27,28};
+    static const uint8_t C[] = {20,21,23,24,26,25,27,28};
     return b < BLOCK_COUNT ? C[b] : 0;
 }
 
 uint8_t nanocore_block_type_cc(controller_block_t b)
 {
-    static const uint8_t C[] = {40,41,43,44,45,46,47,48};
+    static const uint8_t C[] = {40,41,43,44,46,45,47,48};
     return b < BLOCK_COUNT ? C[b] : 0;
 }
 
 uint8_t nanocore_block_type_max(controller_block_t b)
 {
-    static const uint8_t M[] = {3,10,127,127,4,7,6,2};
+    static const uint8_t M[] = {3,10,127,127,7,4,6,2};
     return b < BLOCK_COUNT ? M[b] : 127;
 }
 
