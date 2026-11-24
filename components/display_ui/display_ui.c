@@ -312,7 +312,9 @@ static void block_editor(const display_ui_state_t *s)
             snprintf(val,sizeof(val),"%s",
                      tempo_engine_subdivision_name(s->subdivision));
         }else if(s->parameter_known){
-            if(p->cc>=20 && p->cc<=28)
+            if(s->parameter_text && s->parameter_text[0])
+                snprintf(val,sizeof(val),"%s",s->parameter_text);
+            else if(p->cc>=20 && p->cc<=28)
                 snprintf(val,sizeof(val),"%s",s->parameter_value>=64?"ON":"OFF");
             else
                 snprintf(val,sizeof(val),"%u",(unsigned)s->parameter_value);
@@ -322,7 +324,9 @@ static void block_editor(const display_ui_state_t *s)
         fill_rect(300,92,150,70,C_PANEL);
         rect(300,92,150,70,s->parameter_editing?C_YELLOW:C_PURPLE,2);
         text_center(375,105,p->label,C_WHITE,1);
-        text_center(375,130,val,s->parameter_editing?C_YELLOW:C_WHITE,2);
+        text_center(375,130,val,
+                    s->parameter_editing?C_YELLOW:C_WHITE,
+                    (s->parameter_text && s->parameter_text[0]) ? 1 : 2);
     }
     text(300,180,s->parameter_editing?"ENC2 CHANGE":"ENC1 PARAM",C_MUTED,1);
     text(300,200,"ENC1 CLICK EDIT",C_MUTED,1);
