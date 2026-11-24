@@ -233,7 +233,12 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
             break;
         }
     }
-    if (anchor_pos == SIZE_MAX) return;
+    if (anchor_pos == SIZE_MAX) {
+        ESP_LOGW(TAG, "Preset name anchor not found in 0x41 payload len=%u",
+                 (unsigned)len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, len, ESP_LOG_INFO);
+        return;
+    }
 
     /*
      * Two name-field layouts have now been observed on real hardware:
@@ -269,8 +274,14 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
         if (ch == 0) break;
         if (ch < 0x20 || ch > 0x7E) {
             ESP_LOGW(TAG,
-                     "Preset name decode rejected byte 0x%02X at +%u",
-                     ch, (unsigned)read);
+                     "Preset name decode rejected byte 0x%02X at +%u (anchor=%u packed=%u)",
+                     ch, (unsigned)read, (unsigned)anchor_pos,
+                     inner_packed ? 1 : 0);
+            size_t dump_start = anchor_pos > 8 ? anchor_pos - 8 : 0;
+            size_t dump_len = len - dump_start;
+            if (dump_len > 32) dump_len = 32;
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, &payload[dump_start],
+                                     dump_len, ESP_LOG_INFO);
             return;
         }
 
