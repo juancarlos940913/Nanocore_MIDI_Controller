@@ -68,6 +68,18 @@ esp_err_t nanocore_protocol_request_live_state(void);
 esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
 
 /*
+ * Set one block's effect type using the same 0x6D live-edit command family
+ * used by ToneCommand. The type change includes the target type's normalized
+ * default parameter vector; extended FX1 types are not reliably selectable
+ * through the legacy TYPE CC.
+ */
+esp_err_t nanocore_protocol_set_block_type(
+    controller_block_t block,
+    uint8_t type_id,
+    const float *default_normalized,
+    uint8_t param_count);
+
+/*
  * Rename active preset (8-char device limit) and persist its live state
  * into the same active slot. Returns only after the device ACKs opcode 0x46.
  */
