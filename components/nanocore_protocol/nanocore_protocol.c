@@ -225,6 +225,56 @@ static esp_err_t send_block_type(controller_block_t block,
     return nanocore_midi_send_sysex(msg, pos);
 }
 
+static esp_err_t send_block_param(controller_block_t block,
+                                  uint8_t param_index,
+                                  float normalized)
+{
+    if (block >= BLOCK_COUNT || param_index >= NC_PROTO_MAX_PARAMS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    uint8_t logical[7] = {
+        0x01,
+        (uint8_t)block,
+        param_index,
+        0, 0, 0, 0
+    };
+    memcpy(&logical[3], &normalized, sizeof(normalized));
+
+    uint8_t packed[8] = {0};
+    size_t packed_len = pack7(logical, sizeof(logical),
+                              packed, sizeof(packed));
+    if (!packed_len) return ESP_FAIL;
+
+    uint8_t msg[32] = {0};
+    size_t pos = 0;
+    msg[pos++] = 0xF0;
+    msg[pos++] = NC_MFR;
+    msg[pos++] = NC_TAG_N;
+    msg[pos++] = NC_TAG_C;
+    msg[pos++] = NC_DIR_HOST;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x02;
+    msg[pos++] = next_seq();
+    msg[pos++] = 0x00;
+    msg[pos++] = OP_SET_FIELD;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x07;
+    msg[pos++] = 0x00;
+    memcpy(&msg[pos], packed, packed_len);
+    pos += packed_len;
+    msg[pos++] = 0xF7;
+
+    ESP_LOGI(TAG,
+             "Set block param -> block=%u param=%u norm=%.6f",
+             (unsigned)block, param_index, (double)normalized);
+
+    return nanocore_midi_send_sysex(msg, pos);
+}
+
 static esp_err_t send_rename(const char *name)
 {
     if (!name) return ESP_ERR_INVALID_ARG;
@@ -700,6 +750,18 @@ esp_err_t nanocore_protocol_set_block_type(
 
     return send_block_type(block, type_id,
                            default_normalized, param_count);
+}
+
+esp_err_t nanocore_protocol_set_block_param(
+    controller_block_t block,
+    uint8_t param_index,
+    float normalized_value)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return send_block_param(block, param_index, normalized_value);
 }
 
 esp_err_t nanocore_protocol_rename_and_save(uint8_t slot,
