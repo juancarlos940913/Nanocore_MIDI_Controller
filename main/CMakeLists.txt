@@ -6,6 +6,7 @@ idf_component_register(
         esp_event
         bt
         nanocore_midi
+        nanocore_protocol
         display_ui
         board
         input_manager
