@@ -837,10 +837,12 @@ esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
 
     /*
      * Real saved presets are ~265 bytes and the AMP/CAB footer lives near the
-     * tail of page 2. One BLE-safe window starting at offset 200 contains the
-     * footer on current firmware without walking the whole preset.
+     * tail of page 2. A real captured preset places AMP at absolute byte 258
+     * and the 0x21 footer marker at byte 259. Starting at 220 keeps the whole
+     * footer inside one BLE-capped 59-byte response (220..278) instead of
+     * splitting it exactly at the 59-byte boundary.
      */
-    return send_read_preset_window(slot, 200, 59);
+    return send_read_preset_window(slot, 220, 59);
 }
 
 esp_err_t nanocore_protocol_set_block_type(
