@@ -1692,6 +1692,18 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         memcpy(s_block_params, e->block_params,
                sizeof(s_block_params));
 
+        /*
+         * A physical type change may shrink the editor parameter list.
+         * Never leave the cursor pointing beyond the newly selected type.
+         */
+        if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            size_t count = editor_parameter_count();
+            if (count > 0 && s_selected_parameter >= count) {
+                s_selected_parameter = count - 1;
+                s_parameter_editing = false;
+            }
+        }
+
         // Assisted Mapper can still consume the accepted LIVE snapshot.
         nanocore_mapper_on_live_state(e);
 
