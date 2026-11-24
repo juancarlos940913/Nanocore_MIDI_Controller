@@ -21,7 +21,7 @@ static const nc_parameter_t FX1[] = {
 
 static const nc_parameter_t FX2[] = {
     P_MIDI("ON/OFF", 21, 0, 127),
-    P_MIDI("TYPE", 41, 0, 10),
+    P_MIDI("TYPE", 41, 0, 20),
     P_MIDI("GAIN/BOOST", 57, 0, 127),
     P_MIDI("TONE", 58, 0, 127),
     P_MIDI("LEVEL", 59, 0, 127),
@@ -35,7 +35,7 @@ static const nc_parameter_t FX2[] = {
 
 static const nc_parameter_t AMP[] = {
     P_MIDI("ON/OFF", 23, 0, 127),
-    P_MIDI("AMP ID", 43, 0, 127),
+    P_MIDI("AMP ID", 43, 0, 29),
     P_MIDI("GAIN", 60, 0, 127),
     P_MIDI("BASS", 61, 0, 127),
     P_MIDI("MID", 62, 0, 127),
@@ -45,7 +45,7 @@ static const nc_parameter_t AMP[] = {
 
 static const nc_parameter_t CAB[] = {
     P_MIDI("ON/OFF", 24, 0, 127),
-    P_MIDI("CAB ID", 44, 0, 127),
+    P_MIDI("CAB ID", 44, 0, 29),
     P_MIDI("LOW CUT", 65, 0, 127),
     P_MIDI("HIGH CUT", 66, 0, 127),
     P_MIDI("LEVEL", 67, 0, 127),
@@ -53,7 +53,7 @@ static const nc_parameter_t CAB[] = {
 
 static const nc_parameter_t MOD[] = {
     P_MIDI("ON/OFF", 25, 0, 127),
-    P_MIDI("TYPE", 45, 0, 4),
+    P_MIDI("TYPE", 45, 0, 17),
     P_MIDI("P1", 68, 0, 127),
     P_MIDI("P2", 69, 0, 127),
     P_MIDI("P3", 70, 0, 127),
@@ -76,7 +76,7 @@ static const nc_parameter_t DELAY[] = {
 
 static const nc_parameter_t REVERB[] = {
     P_MIDI("ON/OFF", 27, 0, 127),
-    P_MIDI("TYPE", 47, 0, 6),
+    P_MIDI("TYPE", 47, 0, 7),
     P_MIDI("DECAY", 85, 0, 127),
     P_MIDI("P2", 86, 0, 127),
     P_MIDI("P3", 87, 0, 127),
@@ -120,7 +120,7 @@ uint8_t nanocore_block_type_cc(controller_block_t b)
 
 uint8_t nanocore_block_type_max(controller_block_t b)
 {
-    static const uint8_t M[] = {11,10,127,127,7,4,6,2};
+    static const uint8_t M[] = {11,20,29,29,7,17,7,2};
     return b < BLOCK_COUNT ? M[b] : 127;
 }
 

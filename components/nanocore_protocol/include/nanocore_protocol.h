@@ -22,6 +22,7 @@ typedef enum {
     NC_PROTO_EVENT_ACTIVE_SLOT,
     NC_PROTO_EVENT_PRESET_NAME,
     NC_PROTO_EVENT_PRESET_MODELS,
+    NC_PROTO_EVENT_PARAM_VALUE,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
@@ -64,6 +65,9 @@ typedef struct {
     bool cab_model_known;
     uint8_t amp_model;
     uint8_t cab_model;
+
+    uint8_t param_index;
+    float param_value;
 } nanocore_protocol_event_t;
 
 esp_err_t nanocore_protocol_init(void);
@@ -96,6 +100,12 @@ esp_err_t nanocore_protocol_set_block_param(
     controller_block_t block,
     uint8_t param_index,
     float normalized_value);
+
+/* AMP/CAB model selection uses scalar 0x6D fields 0x06/0x07, not the
+ * generic effect-type payload used by FX1/FX2/DELAY/MOD/REV/EQ. */
+esp_err_t nanocore_protocol_set_block_model(
+    controller_block_t block,
+    uint8_t model_id);
 
 /*
  * Rename active preset (8-char device limit) and persist its live state

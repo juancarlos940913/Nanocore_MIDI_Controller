@@ -1,7 +1,10 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "controller_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,6 +22,12 @@ typedef enum {
     NC_PARAM_CUBIC = 3,
 } nanocore_param_curve_t;
 
+typedef enum {
+    NC_PARAM_VALUE_NUMERIC = 0,
+    NC_PARAM_VALUE_ENUM = 1,
+    NC_PARAM_VALUE_BOOLEAN = 2,
+} nanocore_param_value_kind_t;
+
 typedef struct {
     const char *name;
     const char *unit;
@@ -27,6 +36,13 @@ typedef struct {
     float max_value;
     uint8_t decimals;
     nanocore_param_curve_t curve;
+
+    /* Stage 07 dynamic-editor metadata. Existing Stage 06 entries that omit
+     * these fields remain plain numeric parameters with zero default. */
+    float default_value;
+    nanocore_param_value_kind_t value_kind;
+    const char * const *options;
+    uint8_t option_count;
 } nanocore_param_info_t;
 
 typedef struct {
@@ -84,6 +100,46 @@ size_t nanocore_spec_amp_model_count(void);
 const char *nanocore_spec_amp_model_name(uint8_t model_id);
 size_t nanocore_spec_cab_model_count(void);
 const char *nanocore_spec_cab_model_name(uint8_t model_id);
+
+/* -------------------------------------------------------------------------
+ * Stage 07 generic editor specification
+ * ------------------------------------------------------------------------- */
+
+/* Raw type/model lookup and physical selector order. */
+size_t nanocore_spec_editor_type_count(controller_block_t block);
+const nanocore_effect_type_info_t *nanocore_spec_editor_type_by_raw(
+    controller_block_t block,
+    uint8_t raw_type_id);
+const nanocore_effect_type_info_t *nanocore_spec_editor_type_by_selector(
+    controller_block_t block,
+    size_t selector_index);
+int nanocore_spec_editor_selector_index(
+    controller_block_t block,
+    uint8_t raw_type_id);
+
+/* AMP/CAB use the same type-info shape, but their params are common to every
+ * model and the model id comes from 0x41/local live state instead of 0x63. */
+bool nanocore_spec_editor_is_model_block(controller_block_t block);
+
+/* Build the normalized parameter vector used when selecting a new effect
+ * type. FX1/duplicated FX1 effects preserve captured hardware defaults;
+ * other types derive the vector from each param's declared real default. */
+bool nanocore_spec_editor_defaults(
+    const nanocore_effect_type_info_t *type,
+    float *out,
+    size_t out_count);
+
+/* UI helpers. */
+void nanocore_spec_format_normalized(
+    const nanocore_param_info_t *param,
+    float normalized,
+    char *out,
+    size_t out_len);
+
+float nanocore_spec_adjust_normalized(
+    const nanocore_param_info_t *param,
+    float current,
+    int delta);
 
 #ifdef __cplusplus
 }
