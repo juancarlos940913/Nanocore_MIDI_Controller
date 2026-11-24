@@ -15,6 +15,7 @@ typedef enum {
      */
     NC_PARAM_THREE_POINT = 1,
     NC_PARAM_EXPONENTIAL = 2,
+    NC_PARAM_CUBIC = 3,
 } nanocore_param_curve_t;
 
 typedef struct {
