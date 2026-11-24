@@ -731,28 +731,6 @@ static void toggle_block(controller_block_t block)
     (void)set_working_cc(cc, next);
 }
 
-static uint16_t current_parameter_value(bool *known)
-{
-    if (known) *known = false;
-
-    if (s_selected_block >= BLOCK_COUNT) return 0;
-
-    if (s_selected_parameter == 0) {
-        if (!s_block_known[s_selected_block]) return 0;
-        if (known) *known = true;
-        return s_block_on[s_selected_block] ? 127 : 0;
-    }
-
-    if (s_selected_parameter == 1) {
-        int selector = current_type_selector(s_selected_block);
-        if (selector < 0) return 0;
-        if (known) *known = true;
-        return (uint16_t)selector;
-    }
-
-    return 0;
-}
-
 static void select_parameter(int delta)
 {
     size_t count = editor_parameter_count();
