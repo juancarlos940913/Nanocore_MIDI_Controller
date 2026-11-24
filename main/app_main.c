@@ -17,6 +17,7 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
@@ -34,6 +35,7 @@
 #include "name_editor.h"
 #include "nanocore_map.h"
 #include "nanocore_midi.h"
+#include "nanocore_protocol.h"
 #include "status_leds.h"
 #include "tempo_engine.h"
 
@@ -50,13 +52,21 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CC_TUNER                 80
 
 #define MIDI_ACTION_GAP_MS       28
-#define PRESET_SETTLE_MS         90
+#define PRESET_SETTLE_MS        150
+#define LIVE_SYNC_SETTLE_MS      80
+#define NOTICE_MS              1800
 
 static bool s_target_found;
 static bool s_ble_connected;
 static bool s_midi_ready;
 static bool s_dirty;
 static bool s_tuner_on;
+
+static bool s_block_known[BLOCK_COUNT];
+static bool s_block_on[BLOCK_COUNT];
+
+static char s_notice[64];
+static int64_t s_notice_until_us;
 
 static uint16_t s_conn_handle = BLE_CONN_HANDLE_INVALID;
 static uint16_t s_midi_char_handle;
@@ -74,6 +84,29 @@ static name_editor_t s_name_editor;
 static bool s_name_target_scene;
 
 static void render_ui(void);
+
+static void show_notice(const char *text)
+{
+    if (!text) return;
+    strncpy(s_notice, text, sizeof(s_notice) - 1);
+    s_notice[sizeof(s_notice) - 1] = '\0';
+    s_notice_until_us = esp_timer_get_time() + (NOTICE_MS * 1000LL);
+    render_ui();
+}
+
+static void clear_block_state(void)
+{
+    memset(s_block_known, 0, sizeof(s_block_known));
+    memset(s_block_on, 0, sizeof(s_block_on));
+}
+
+static int block_from_onoff_cc(uint8_t cc)
+{
+    for (int i = 0; i < BLOCK_COUNT; ++i) {
+        if (nanocore_block_onoff_cc((controller_block_t)i) == cc) return i;
+    }
+    return -1;
+}
 
 static void nvs_init_safe(void)
 {
@@ -156,9 +189,13 @@ static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
         return rc;
     }
 
-    // The working edit is valid even if BLE is temporarily disconnected.
-    // NVS SAVE must never depend on radio availability.
     s_dirty = true;
+
+    int block = block_from_onoff_cc(cc);
+    if (block >= 0) {
+        s_block_known[block] = true;
+        s_block_on[block] = value >= 64;
+    }
 
     if (s_midi_ready) {
         esp_err_t tx = send_cc(cc, value);
@@ -214,10 +251,13 @@ static void restore_current_preset_to_nanocore(void)
 {
     if (!s_midi_ready) return;
 
-    ESP_LOGI(TAG, "Restore PC=%u mode=%u scene=%u",
+    ESP_LOGI(TAG, "Recall PC=%u mode=%u scene=%u",
              s_runtime.current_preset,
              (unsigned)s_runtime.mode,
              s_runtime.current_scene);
+
+    clear_block_state();
+    render_ui();
 
     if (nanocore_midi_send_program_change(
             MIDI_CHANNEL,
@@ -225,11 +265,19 @@ static void restore_current_preset_to_nanocore(void)
         vTaskDelay(pdMS_TO_TICKS(PRESET_SETTLE_MS));
     }
 
-    apply_assignments(s_preset.base, CTRL_BASE_ASSIGNMENTS);
-
+    /*
+     * A saved NanoCore preset is now authoritative. Do NOT automatically
+     * replay the controller's base CC mirror after Program Change; doing so
+     * caused the audible OFF/ON pop observed when recalling a preset.
+     * Scene overrides remain controller-side and are intentionally applied.
+     */
     if (s_runtime.mode == CTRL_MODE_SCENE) {
         apply_current_scene();
+        vTaskDelay(pdMS_TO_TICKS(LIVE_SYNC_SETTLE_MS));
     }
+
+    (void)nanocore_protocol_request_live_state();
+    (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
 }
 
 static esp_err_t load_preset(uint8_t index, bool transmit)
@@ -268,7 +316,7 @@ static void change_preset(int delta)
 {
     if (s_dirty) {
         ESP_LOGW(TAG, "Preset change blocked: unsaved edits. Use SAVE chord.");
-        render_ui();
+        show_notice("SAVE CHANGES BEFORE PRESET +/-");
         return;
     }
 
@@ -319,7 +367,7 @@ static void update_delay_from_tempo(void)
     uint8_t cc74 = tempo_engine_delay_ms_to_cc74(delay_ms);
 
     ESP_LOGI(TAG,
-             "Delay tempo: %u BPM %s -> %lu ms -> provisional CC74=%u",
+             "Delay tempo: %u BPM %s -> %lu ms -> CC74=%u",
              s_preset.bpm,
              tempo_engine_subdivision_name(s_preset.delay_subdivision),
              (unsigned long)delay_ms,
@@ -406,6 +454,13 @@ static uint16_t current_parameter_value(bool *known)
     if (p->kind == NC_PARAM_TEMPO_SUBDIV) {
         if (known) *known = true;
         return s_preset.delay_subdivision;
+    }
+
+    if (p->kind == NC_PARAM_MIDI &&
+        p->cc == nanocore_block_onoff_cc(s_selected_block) &&
+        s_block_known[s_selected_block]) {
+        if (known) *known = true;
+        return s_block_on[s_selected_block] ? 127 : 0;
     }
 
     uint8_t value = 0;
@@ -524,21 +579,60 @@ static void commit_name_and_save(void)
                 s_name_editor.text,
                 CTRL_NAME_LEN - 1);
         s_preset.scene[s_runtime.current_scene].name[CTRL_NAME_LEN - 1] = '\0';
-    } else {
-        strncpy(s_preset.name,
-                s_name_editor.text,
-                CTRL_NAME_LEN - 1);
-        s_preset.name[CTRL_NAME_LEN - 1] = '\0';
+
+        s_preset.active_scene = s_runtime.current_scene;
+
+        esp_err_t rc = controller_storage_save_preset(
+            s_runtime.current_preset, &s_preset);
+        if (rc != ESP_OK) {
+            ESP_LOGE(TAG, "Scene/NVS save failed: %s", esp_err_to_name(rc));
+            show_notice("SCENE SAVE FAILED");
+            return;
+        }
+
+        s_dirty = false;
+        name_editor_close(&s_name_editor);
+        s_screen = UI_SCREEN_PERFORMANCE;
+        (void)persist_runtime();
+        show_notice("SCENE SAVED TO CONTROLLER");
+        return;
     }
 
-    s_preset.active_scene = s_runtime.current_scene;
+    /*
+     * NanoCore's real preset-name write limit is 8 characters.
+     * Keep the controller's mirror identical to what the pedal stores.
+     */
+    char device_name[9] = {0};
+    strncpy(device_name, s_name_editor.text, 8);
 
-    esp_err_t rc = controller_storage_save_preset(
+    if (!s_midi_ready) {
+        show_notice("NANOCORE OFFLINE - NOT SAVED");
+        return;
+    }
+
+    show_notice("SAVING TO NANOCORE...");
+
+    esp_err_t rc = nanocore_protocol_rename_and_save(
         s_runtime.current_preset,
-        &s_preset);
+        device_name,
+        pdMS_TO_TICKS(900));
 
     if (rc != ESP_OK) {
-        ESP_LOGE(TAG, "Preset save failed: %s", esp_err_to_name(rc));
+        ESP_LOGE(TAG, "NanoCore save failed: %s", esp_err_to_name(rc));
+        show_notice("NANOCORE SAVE FAILED");
+        return;
+    }
+
+    strncpy(s_preset.name, device_name, CTRL_NAME_LEN - 1);
+    s_preset.name[CTRL_NAME_LEN - 1] = '\0';
+    s_preset.active_scene = s_runtime.current_scene;
+
+    rc = controller_storage_save_preset(
+        s_runtime.current_preset, &s_preset);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "NanoCore saved but NVS mirror failed: %s",
+                 esp_err_to_name(rc));
+        show_notice("PEDAL SAVED / NVS ERROR");
         return;
     }
 
@@ -547,12 +641,12 @@ static void commit_name_and_save(void)
     s_screen = UI_SCREEN_PERFORMANCE;
     (void)persist_runtime();
 
-    ESP_LOGI(TAG, "Saved P%02u / %s",
-             s_runtime.current_preset + 1,
-             s_name_target_scene
-                ? s_preset.scene[s_runtime.current_scene].name
-                : s_preset.name);
-    render_ui();
+    (void)nanocore_protocol_request_live_state();
+    (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
+
+    ESP_LOGI(TAG, "NanoCore + NVS saved P%02u / %s",
+             s_runtime.current_preset + 1, s_preset.name);
+    show_notice("PRESET SAVED TO NANOCORE");
 }
 
 static void render_ui(void)
@@ -574,8 +668,12 @@ static void render_ui(void)
         .selected_block = s_selected_block,
         .selected_parameter = s_selected_parameter,
         .parameter_editing = s_parameter_editing,
+        .notice = s_notice,
         .name_editor = &s_name_editor,
     };
+
+    memcpy(u.block_known, s_block_known, sizeof(u.block_known));
+    memcpy(u.block_on, s_block_on, sizeof(u.block_on));
 
     bool known = false;
     u.parameter_value = current_parameter_value(&known);
@@ -712,6 +810,7 @@ static void midi_evt_cb(uint16_t ts_ms,
         ESP_LOGI(TAG, "MIDI RX CC%u=%u", msg[1] & 0x7F, msg[2] & 0x7F);
     } else if (msg[0] == 0xF0) {
         ESP_LOGD(TAG, "MIDI RX SysEx ts=%u len=%u", ts_ms, len);
+        nanocore_protocol_on_sysex(msg, len);
     }
 }
 
@@ -789,6 +888,7 @@ static void ble_event_handler(void *handler_args,
             nanocore_midi_set_link(s_conn_handle, s_midi_char_handle);
 
             s_midi_ready = true;
+            nanocore_protocol_set_connected(true);
             render_ui();
             restore_current_preset_to_nanocore();
         }
@@ -804,7 +904,9 @@ static void ble_event_handler(void *handler_args,
 
     case ESP_BLE_CONN_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "BLE disconnected");
+        nanocore_protocol_set_connected(false);
         nanocore_midi_clear_link();
+        clear_block_state();
         s_ble_connected = false;
         s_midi_ready = false;
         s_tuner_on = false;
