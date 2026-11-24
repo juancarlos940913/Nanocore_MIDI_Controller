@@ -9,15 +9,14 @@
 #include "esp_timer.h"
 #include "nanocore_spec.h"
 
-#define MAP_POLL_INTERVAL_MS  800
-#define MAP_REPLY_TIMEOUT_MS 1400
+#define MAP_REPLY_TIMEOUT_MS 2500
 #define MAP_FLOAT_EPSILON 0.0005f
 
 static const char *TAG = "NC_MAP";
 
 static bool s_enabled;
 static bool s_inflight;
-static int64_t s_next_poll_us;
+static bool s_capture_pending;
 static int64_t s_sent_us;
 static uint32_t s_last_hash;
 
@@ -237,14 +236,14 @@ esp_err_t nanocore_mapper_init(void)
 {
     s_enabled = false;
     s_inflight = false;
-    s_next_poll_us = 0;
+    s_capture_pending = false;
     s_sent_us = 0;
     s_last_hash = 0;
     s_have_prev = false;
     memset(&s_prev, 0, sizeof(s_prev));
 
     ESP_LOGI(TAG,
-             "Live Mapper ready; hold both TOP footswitches to toggle");
+             "Live Mapper ready; TOP+TOP toggles, ENC2 captures");
     return ESP_OK;
 }
 
@@ -252,12 +251,27 @@ void nanocore_mapper_set_enabled(bool enabled)
 {
     s_enabled = enabled;
     s_inflight = false;
+    s_capture_pending = enabled;  // one baseline snapshot on entry
     s_last_hash = 0;
     s_have_prev = false;
     memset(&s_prev, 0, sizeof(s_prev));
-    s_next_poll_us = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "Live Mapper %s", enabled ? "ON" : "OFF");
+    ESP_LOGI(TAG, "Live Mapper %s%s",
+             enabled ? "ON" : "OFF",
+             enabled ? " - ENC2 CAPTURE" : "");
+}
+
+void nanocore_mapper_request_capture(void)
+{
+    if (!s_enabled) return;
+
+    if (s_inflight) {
+        ESP_LOGW(TAG, "Mapper capture already in flight");
+        return;
+    }
+
+    s_capture_pending = true;
+    ESP_LOGI(TAG, "Manual capture queued");
 }
 
 bool nanocore_mapper_is_enabled(void)
@@ -277,23 +291,27 @@ void nanocore_mapper_service(bool midi_ready, bool transport_busy)
             return;
         }
 
-        ESP_LOGW(TAG, "Live mapper 0x63 timeout; retrying");
+        /*
+         * Do not auto-retry. Repeated write-without-response retries were
+         * exactly what exhausted BLE memory during the 8-minute FX1 sweep.
+         */
+        ESP_LOGW(TAG, "Manual mapper capture timed out");
         s_inflight = false;
+        return;
     }
 
-    if (now < s_next_poll_us) return;
+    if (!s_capture_pending) return;
+
+    s_capture_pending = false;
 
     esp_err_t rc = nanocore_protocol_request_live_state();
     if (rc == ESP_OK) {
         s_inflight = true;
         s_sent_us = now;
-        s_next_poll_us =
-            now + (MAP_POLL_INTERVAL_MS * 1000LL);
+        ESP_LOGI(TAG, "Manual 0x63 capture requested");
     } else {
-        ESP_LOGW(TAG, "Mapper live-state request failed: %s",
+        ESP_LOGW(TAG, "Mapper capture request failed: %s",
                  esp_err_to_name(rc));
-        s_next_poll_us =
-            now + (MAP_POLL_INTERVAL_MS * 1000LL);
     }
 }
 
@@ -328,12 +346,6 @@ void nanocore_mapper_on_live_state(const nanocore_protocol_event_t *e)
                      e->chain_order[2], e->chain_order[3],
                      e->chain_order[4], e->chain_order[5],
                      e->chain_order[6], e->chain_order[7]);
-        }
-
-        if (e->synth_known) {
-            ESP_LOGI(TAG,
-                     "MAP|slot=%u|synth_profile=stored|variant=%u|count=%u",
-                     e->slot, e->synth_variant, e->synth_param_count);
         }
 
         ESP_LOGI(TAG, "MAP|END|slot=%u", e->slot);
