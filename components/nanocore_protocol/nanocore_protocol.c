@@ -398,9 +398,24 @@ static void parse_push(const uint8_t *msg, size_t len)
     const uint8_t opcode = msg[9];
 
     if (opcode == OP_ACTIVE_SLOT && len > 11) {
+        uint8_t raw_slot = msg[11] & 0x7F;
+
+        /*
+         * Firmware revisions observed in the field can emit opcode 0x01
+         * around Program Change with values such as 0x53/0x54/0x64 that
+         * are NOT preset slots. Never surface values outside the real
+         * 0..63 preset range as slot-change events.
+         */
+        if (raw_slot >= CTRL_PRESET_COUNT) {
+            ESP_LOGW(TAG,
+                     "Untrusted slot push raw=0x%02X (%u) ignored",
+                     raw_slot, raw_slot);
+            return;
+        }
+
         nanocore_protocol_event_t e = {
             .type = NC_PROTO_EVENT_ACTIVE_SLOT,
-            .slot = msg[11] & 0x7F,
+            .slot = raw_slot,
         };
         queue_event(&e);
         ESP_LOGI(TAG, "Active slot push -> %u", e.slot);
