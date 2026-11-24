@@ -7,6 +7,7 @@ on:
       - stage-04-ui-modes-stomp
       - stage-05-hardware-v2
       - stage-06-live-mapper
+      - stage-07-full-dynamic-editor
   workflow_dispatch:
 
 jobs:
