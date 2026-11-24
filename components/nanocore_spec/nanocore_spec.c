@@ -17,6 +17,11 @@
       .min_value = (_min), .mid_value = 0.0f, .max_value = (_max), \
       .decimals = (_dec), .curve = NC_PARAM_EXPONENTIAL }
 
+#define PARAM_CUBIC(_name, _unit, _min, _max, _dec) \
+    { .name = (_name), .unit = (_unit), \
+      .min_value = (_min), .mid_value = 0.0f, .max_value = (_max), \
+      .decimals = (_dec), .curve = NC_PARAM_CUBIC }
+
 /*
  * FX1 physical specification.
  *
@@ -30,18 +35,18 @@
 
 static const nanocore_param_info_t FX1_GATE_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -100.0f, 0.0f, 0),
-    PARAM_3PT("Release", "ms", 5.0f, 50.0f, 100.0f, 1),
+    PARAM_LINEAR("Release", "ms", 5.0f, 100.0f, 1),
 };
 
 static const nanocore_param_info_t FX1_AUTO_GATE_PARAMS[] = {
     PARAM_LINEAR("Sensitivity", "dB", -6.0f, 6.0f, 0),
-    PARAM_3PT("Release", "ms", 20.0f, 157.2f, 300.0f, 1),
+    PARAM_LINEAR("Release", "ms", 20.0f, 300.0f, 1),
 };
 
 static const nanocore_param_info_t FX1_GATE_COMP_PARAMS[] = {
     PARAM_LINEAR("Gate",      "dB", -100.0f,    0.0f, 0),
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT("Ratio",        ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_LINEAR("Ratio",     ":1",    1.0f,   20.0f, 1),
     PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 1),
     PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 1),
     PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 1),
@@ -50,7 +55,7 @@ static const nanocore_param_info_t FX1_GATE_COMP_PARAMS[] = {
 
 static const nanocore_param_info_t FX1_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB",  -60.0f,    0.0f, 0),
-    PARAM_3PT("Ratio",        ":1",    1.0f,   10.0f, 20.0f, 1),
+    PARAM_LINEAR("Ratio",     ":1",    1.0f,   20.0f, 1),
     PARAM_LINEAR("Knee",      "dB",    0.0f,   24.0f, 1),
     PARAM_LINEAR("Attack",    "ms",    0.0f,  200.0f, 1),
     PARAM_LINEAR("Release",   "ms",    0.0f, 1000.0f, 1),
@@ -60,7 +65,7 @@ static const nanocore_param_info_t FX1_COMP_PARAMS[] = {
 static const nanocore_param_info_t FX1_ENV_WAH_PARAMS[] = {
     PARAM_EXP   ("Freq", "Hz", 10.0f, 20000.0f, 0),
     PARAM_LINEAR("Env",  "Hz",  0.0f, 20000.0f, 0),
-    PARAM_3PT   ("Q",    "",    0.1f,    10.0f, 20.0f, 1),
+    PARAM_LINEAR("Q",    "",    0.1f,   20.0f, 1),
     PARAM_LINEAR("Mix",  "",    0.0f,   100.0f, 0),
 };
 
@@ -81,34 +86,34 @@ static const nanocore_param_info_t FX1_MOTION_WAH_PARAMS[] = {
 
 static const nanocore_param_info_t FX1_PEAK_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -60.0f,   0.0f, 0),
-    PARAM_3PT   ("Ratio",     ":1",   1.0f,  10.0f, 20.0f, 1),
+    PARAM_LINEAR("Ratio",     ":1",   1.0f,  20.0f, 1),
     PARAM_EXP   ("Attack",    "ms",   0.1f, 200.0f, 1),
-    PARAM_3PT   ("Release",   "ms",   1.0f,  40.0f, 2000.0f, 1),
+    PARAM_EXP   ("Release",   "ms",   1.0f, 2000.0f, 1),
     PARAM_LINEAR("Makeup",    "dB", -24.0f,  24.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_PARALLEL_COMP_PARAMS[] = {
     PARAM_LINEAR("Threshold", "dB", -60.0f,    0.0f, 0),
-    PARAM_3PT   ("Attack",    "ms",   0.01f,  30.0f, 250.0f, 2),
-    PARAM_3PT   ("Release",   "ms",  10.0f,  300.0f, 2500.0f, 1),
+    PARAM_CUBIC ("Attack",    "ms",   0.01f, 250.0f, 2),
+    PARAM_CUBIC ("Release",   "ms",  10.0f, 2500.0f, 1),
     PARAM_LINEAR("Mix",       "",     0.0f,  200.0f, 0),
     PARAM_LINEAR("Level",     "dB", -24.0f,   24.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_CLASSIC_WAH_PARAMS[] = {
-    PARAM_LINEAR("Position", " ",   0.0f, 100.0f, 0),
-    PARAM_3PT   ("Low",      "Hz", 20.0f, 250.0f, 500.0f, 0),
+    PARAM_LINEAR("Position", "",    0.0f, 100.0f, 0),
+    PARAM_LINEAR("Low",      "Hz", 20.0f, 500.0f, 0),
     PARAM_LINEAR("High",     "Hz", 500.0f, 5000.0f, 0),
     PARAM_LINEAR("Mix",      "",    0.0f, 100.0f, 0),
-    PARAM_3PT   ("Level",    "dB",-60.0f, -30.0f, 6.0f, 0),
+    PARAM_LINEAR("Level",    "dB",-60.0f, 6.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_RETRO_WAH_PARAMS[] = {
-    PARAM_LINEAR("Position", " ",   0.0f, 100.0f, 0),
-    PARAM_3PT   ("Low",      "Hz", 20.0f, 250.0f, 500.0f, 0),
+    PARAM_LINEAR("Position", "",    0.0f, 100.0f, 0),
+    PARAM_LINEAR("Low",      "Hz", 20.0f, 500.0f, 0),
     PARAM_LINEAR("High",     "Hz", 500.0f, 5000.0f, 0),
     PARAM_LINEAR("Mix",      "",    0.0f, 100.0f, 0),
-    PARAM_3PT   ("Level",    "dB",-60.0f, -30.0f, 6.0f, 0),
+    PARAM_LINEAR("Level",    "dB",-60.0f, 6.0f, 0),
 };
 
 static const nanocore_param_info_t FX1_BASS_WAH_PARAMS[] = {
@@ -116,7 +121,7 @@ static const nanocore_param_info_t FX1_BASS_WAH_PARAMS[] = {
     PARAM_LINEAR("Q Trim",      "",   0.0f, 100.0f, 0),
     PARAM_LINEAR("Volume Trim", "",   0.0f, 100.0f, 0),
     PARAM_LINEAR("Mix",         "",   0.0f, 100.0f, 0),
-    PARAM_3PT   ("Level",       "dB",-60.0f, -30.0f, 6.0f, 0),
+    PARAM_LINEAR("Level",       "dB",-60.0f, 6.0f, 0),
 };
 
 static const nanocore_effect_type_info_t FX1_TYPES[] = {
@@ -158,6 +163,13 @@ float nanocore_spec_normalized_to_real(
                powf(param->max_value / param->min_value, normalized);
     }
 
+    if (param->curve == NC_PARAM_CUBIC) {
+        const float n2 = normalized * normalized;
+        return param->min_value +
+               (param->max_value - param->min_value) *
+               n2 * normalized;
+    }
+
     if (param->curve == NC_PARAM_THREE_POINT) {
         if (normalized <= 0.5f) {
             const float t = normalized * 2.0f;
@@ -188,6 +200,13 @@ float nanocore_spec_real_to_normalized(
         param->max_value > param->min_value) {
         return logf(real_value / param->min_value) /
                logf(param->max_value / param->min_value);
+    }
+
+    if (param->curve == NC_PARAM_CUBIC) {
+        const float span = param->max_value - param->min_value;
+        if (span <= 0.0f) return 0.0f;
+        const float t = (real_value - param->min_value) / span;
+        return cbrtf(t);
     }
 
     if (param->curve == NC_PARAM_THREE_POINT) {
