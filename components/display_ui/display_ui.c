@@ -249,10 +249,25 @@ static void performance(const display_ui_state_t *s)
         int row=i/4,col=i%4;
         int x=x0+col*(w+gx), y=y0+row*(h+gy);
         bool sel=(i==(int)s->selected_block);
+
+        uint16_t state_color = C_MUTED;
+        const char *state_text = "?";
+        if (s->block_known[i]) {
+            state_color = s->block_on[i] ? C_GREEN : C_YELLOW;
+            state_text = s->block_on[i] ? "ON" : "OFF";
+        }
+
         fill_rect(x,y,w,h,sel?C_PANEL2:C_PANEL);
-        rect(x,y,w,h,sel?C_CYAN:C_MUTED,sel?3:1);
-        text_center(x+w/2,y+20,nanocore_block_name((controller_block_t)i),
-                    sel?C_WHITE:C_MUTED,2);
+        rect(x,y,w,h,state_color,sel?4:2);
+
+        if (sel) {
+            fill_rect(x+7,y+6,22,3,C_CYAN);
+        }
+
+        text_center(x+w/2,y+17,
+                    nanocore_block_name((controller_block_t)i),
+                    C_WHITE,2);
+        text_center(x+w/2,y+43,state_text,state_color,1);
     }
 }
 
@@ -456,6 +471,16 @@ void display_ui_render(const display_ui_state_t *s)
 
     if(s->screen!=UI_SCREEN_NAME_EDITOR && s->screen!=UI_SCREEN_TUNER)
         footer(s);
+
+    if (s->notice && s->notice[0]) {
+        const int nw = 420;
+        const int nh = 54;
+        const int nx = (LCD_W - nw) / 2;
+        const int ny = 132;
+        fill_rect(nx, ny, nw, nh, C_BG);
+        rect(nx, ny, nw, nh, C_ORANGE, 3);
+        text_center(LCD_W/2, ny+19, s->notice, C_WHITE, 1);
+    }
 
     esp_err_t rc=flush_screen();
     if(rc!=ESP_OK)ESP_LOGW(TAG,"LCD flush: %s",esp_err_to_name(rc));
