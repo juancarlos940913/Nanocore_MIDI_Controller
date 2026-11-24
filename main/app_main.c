@@ -1132,6 +1132,16 @@ static void handle_input(input_event_t e)
         return;
     }
 
+    /*
+     * Stage 06.2 Live Mapper is capture-on-demand. ENC2 is deliberately
+     * intercepted before normal UI Back behavior while mapper mode is active.
+     */
+    if (nanocore_mapper_is_enabled() && e == INPUT_ENC2_CLICK) {
+        nanocore_mapper_request_capture();
+        show_notice("MAPPER CAPTURE");
+        return;
+    }
+
     switch (e) {
     case INPUT_ENC1_CLICK:
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
@@ -1191,7 +1201,7 @@ static void handle_input(input_event_t e)
         bool next = !nanocore_mapper_is_enabled();
         nanocore_mapper_set_enabled(next);
         show_notice(next
-            ? "LIVE MAPPER ON - EDIT NANOCORE"
+            ? "MAPPER ON - ENC2 CAPTURE"
             : "LIVE MAPPER OFF");
         break;
     }
