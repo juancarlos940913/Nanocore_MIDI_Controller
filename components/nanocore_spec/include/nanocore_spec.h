@@ -61,6 +61,24 @@ size_t nanocore_spec_fx1_selector_count(void);
 const nanocore_effect_type_info_t *nanocore_spec_fx1_selector(size_t index);
 int nanocore_spec_fx1_selector_index(uint8_t raw_type_id);
 
+/*
+ * Stage 06.5 candidate database used by Assisted Mapper.
+ * These entries come from captured ToneCommand protocol data and are treated
+ * as candidates until the user's physical NanoCore confirms raw id/count.
+ */
+typedef struct {
+    uint8_t id;
+    const char *name;
+    uint8_t expected_param_count;
+    const char *parameter_names;
+} nanocore_candidate_type_t;
+
+const nanocore_candidate_type_t *nanocore_spec_candidate_type(
+    uint8_t block_id,
+    uint8_t raw_type_id);
+
+size_t nanocore_spec_candidate_count(uint8_t block_id);
+
 #ifdef __cplusplus
 }
 #endif
