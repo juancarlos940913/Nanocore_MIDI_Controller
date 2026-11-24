@@ -521,6 +521,11 @@ void nanocore_protocol_on_sysex(const uint8_t *msg, size_t len)
 
     if (msg[4] != NC_DIR_REPLY) return;
 
+    // Heartbeat replies are intentionally not state-bearing. Ignoring them
+    // also prevents a one-segment 0x68 reply from disturbing a larger 0x63
+    // or 0x41 BLE reassembly in progress.
+    if (msg[9] == OP_PING) return;
+
     /* Short save ACK uses the verified direct, non-packed shape. */
     if (msg[9] == OP_SAVE_PRESET &&
         s_wait_save_slot != 0xFF &&
