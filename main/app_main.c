@@ -838,6 +838,21 @@ static void open_block_editor(void)
     s_selected_parameter = 0;
     s_parameter_editing = false;
     s_screen = UI_SCREEN_BLOCK_EDITOR;
+
+    /*
+     * Refresh the authoritative live profile once when opening FX1. This
+     * prevents stale/blank values if a physical knob was moved after preset
+     * recall but before entering the editor.
+     */
+    if (s_selected_block == BLOCK_FX1 && s_midi_ready &&
+        !s_recall_pending && !s_recall_poll_inflight) {
+        esp_err_t rc = nanocore_protocol_request_live_state();
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "FX1 editor live refresh failed: %s",
+                     esp_err_to_name(rc));
+        }
+    }
+
     render_ui();
 }
 
