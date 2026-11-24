@@ -11,6 +11,9 @@ extern "C" {
 
 esp_err_t nanocore_mapper_init(void);
 
+void nanocore_mapper_set_target(controller_block_t block);
+controller_block_t nanocore_mapper_target(void);
+
 void nanocore_mapper_set_enabled(bool enabled);
 bool nanocore_mapper_is_enabled(void);
 
