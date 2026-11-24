@@ -7,6 +7,7 @@ idf_component_register(
         bt
         nanocore_midi
         nanocore_protocol
+        nanocore_mapper
         display_ui
         board
         input_manager
