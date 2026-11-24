@@ -235,10 +235,16 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
     }
     if (anchor_pos == SIZE_MAX) return;
 
+    /*
+     * This function receives the DATA portion of a 0x41 window after the
+     * outer NanoCore 7-bit wrapper has already been unpacked by
+     * handle_segmented_reply(). Therefore the preset name is contiguous
+     * ASCII here. Skipping offsets 2/10 (needed only when parsing the still-
+     * packed full frame) incorrectly turned "ClnArp" into "ClArp".
+     */
     char name[13] = {0};
     size_t out = 0;
     for (size_t read = 0; out < 12 && anchor_pos + read < len; ++read) {
-        if (read == 2 || read == 10) continue;
         uint8_t ch = payload[anchor_pos + read];
         if (ch == 0) break;
         if (ch < 0x20 || ch > 0x7E) return;
