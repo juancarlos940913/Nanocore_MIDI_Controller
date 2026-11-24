@@ -167,3 +167,65 @@ Assisted Mapper is read-only.
 It never saves or renames the preset.
 Use a preset you are comfortable changing temporarily and do not press SAVE
 during characterization unless persistence itself is being tested.
+
+
+## Stage 06.6 physical-validation results
+
+### EQ — VERIFIED
+Physical firmware-1.2 session:
+- raw 0 = 3-band EQ, count 4
+- raw 1 = 6-band EQ, count 7
+- raw 2 = 8-band EQ, count 9
+
+Session summary: 3 unique / 3 match / 0 mismatch / 0 unknown.
+
+### MOD — VERIFIED
+Physical session confirms all 9 candidate ids/counts:
+- 0 Chorus
+- 11 Chorus II
+- 1 Phaser
+- 12 Phaser II
+- 2 Flanger
+- 17 Jet Flanger
+- 4 Vibrato
+- 10 Velvet Vibrato
+- 3 Tremolo
+
+Session summary: 9 unique / 9 match.
+
+### FX2 — VERIFIED TYPE/COUNT CATALOG
+Physical session confirms all 21 candidate raw ids 0..20 with their expected
+parameter counts. The newer Gate/Compressor/Wah-family defaults also match the
+already verified FX1 normalized defaults.
+
+Session summary: 21 unique / 21 match.
+
+### REVERB — firmware 1.2 correction
+Physical session confirms:
+- 0 Room
+- 1 Plate
+- 2 Hall
+- 3 Concert
+- 7 Shimmer
+- 5 Cloud
+- 6 Spring
+
+Important: Shimmer live raw id is 7 on firmware 1.2, not legacy id/CC value 4.
+
+### DELAY — firmware 1.2 Ping Pong extension
+Official firmware 1.2 adds a Ping Pong option to every delay type. Physical
+0x63 captures confirm one additional final parameter on the current firmware.
+
+Current live counts:
+- BBD: 5
+- Digital: 4
+- Duck: 9
+- Ice: 5
+- Reverse: 4
+- LoFi: 6
+- Smear: 6
+- Mod Delay: 6
+
+The final parameter is treated as Ping Pong. Duck's 9-parameter profile required
+raising the Stage 06 live parser from its old per-block limit of 8 to the full
+NC_PROTO_MAX_PARAMS=9.
