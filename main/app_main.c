@@ -1864,6 +1864,27 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         break;
     }
 
+    case NC_PROTO_EVENT_PARAM_VALUE:
+        if (e->block < BLOCK_COUNT &&
+            e->param_index < NC_PROTO_MAX_PARAMS) {
+            s_block_profile_known[e->block] = true;
+            if (s_block_param_count[e->block] <= e->param_index) {
+                s_block_param_count[e->block] =
+                    (uint8_t)(e->param_index + 1);
+            }
+            s_block_params[e->block][e->param_index] =
+                e->param_value;
+
+            /*
+             * 0x06 is emitted by a physical panel knob turn; MIDI/SysEx
+             * writes do not echo it. Therefore this is a genuine unsaved
+             * device-side edit and must participate in the dirty guard.
+             */
+            s_dirty = true;
+            render_ui();
+        }
+        break;
+
     default:
         break;
     }
