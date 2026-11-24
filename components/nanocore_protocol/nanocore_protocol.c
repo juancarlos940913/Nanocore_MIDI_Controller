@@ -316,6 +316,11 @@ static void dispatch_complete_reply(uint16_t opcode,
         parse_live_payload(payload, len);
     } else if (opcode == OP_READ_PRESET) {
         parse_name_payload(payload, len);
+    } else if (opcode == OP_SAVE_PRESET &&
+               s_wait_save_slot != 0xFF &&
+               len > 0 &&
+               payload[len - 1] == s_wait_save_slot) {
+        xSemaphoreGive(s_save_ack);
     }
 }
 
