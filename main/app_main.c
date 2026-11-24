@@ -1,5 +1,5 @@
 /*
- * Nanocore MIDI Controller - Stage 05 / Hardware V2
+ * Nanocore MIDI Controller - Stage 06 / Live Mapper
  *
  * ESP32-S3 N16R8 + ST7796S 3.5" + 2 encoders + 5 footswitches + 2 LEDs.
  *
@@ -34,6 +34,7 @@
 #include "input_manager.h"
 #include "name_editor.h"
 #include "nanocore_map.h"
+#include "nanocore_mapper.h"
 #include "nanocore_midi.h"
 #include "nanocore_protocol.h"
 #include "status_leds.h"
@@ -77,6 +78,7 @@ static int64_t s_notice_until_us;
  */
 static bool s_recall_pending;
 static bool s_recall_poll_inflight;
+static bool s_name_after_live;
 static uint8_t s_recall_target;
 static uint8_t s_recall_poll_count;
 static int64_t s_recall_started_us;
@@ -127,6 +129,7 @@ static void schedule_recall_sync(uint8_t target)
 {
     s_recall_pending = true;
     s_recall_poll_inflight = false;
+    s_name_after_live = true;
     s_recall_target = target;
     s_recall_poll_count = 0;
     s_recall_started_us = esp_timer_get_time();
@@ -731,6 +734,7 @@ static void commit_name_and_save(void)
     s_screen = UI_SCREEN_PERFORMANCE;
     (void)persist_runtime();
 
+    s_name_after_live = true;
     (void)nanocore_protocol_request_live_state();
 
     ESP_LOGI(TAG, "NanoCore + NVS saved P%02u / %s",
@@ -1061,10 +1065,12 @@ static void handle_name_editor_event(input_event_t e)
     case INPUT_FS_TOP_RIGHT:
         name_editor_cursor_move(&s_name_editor, +1);
         break;
-    case INPUT_FS_PRESET_DOWN:
+    case INPUT_FS_PRESET_UP:
+        // Physical bottom #1 after corrected pin map.
         name_editor_backspace(&s_name_editor);
         break;
-    case INPUT_FS_PRESET_UP:
+    case INPUT_FS_PRESET_DOWN:
+        // Physical bottom #2 after corrected pin map.
         cancel_name_editor();
         return;
     case INPUT_CHORD_SAVE:
@@ -1143,11 +1149,22 @@ static void handle_input(input_event_t e)
         break;
 
     case INPUT_FS_PRESET_DOWN:
-        change_preset(-1);
+        // Physical bottom #2: PRESET-/SCENE preset navigation,
+        // but dedicated REVERB stomp while in STOMP mode.
+        if (s_runtime.mode == CTRL_MODE_STOMP) {
+            toggle_block(BLOCK_REVERB);
+        } else {
+            change_preset(-1);
+        }
         break;
 
     case INPUT_FS_PRESET_UP:
-        change_preset(+1);
+        // Physical bottom #1: PRESET+, dedicated MOD stomp in STOMP.
+        if (s_runtime.mode == CTRL_MODE_STOMP) {
+            toggle_block(BLOCK_MOD);
+        } else {
+            change_preset(+1);
+        }
         break;
 
     case INPUT_FS_MODE_SHORT:
@@ -1170,11 +1187,20 @@ static void handle_input(input_event_t e)
         open_name_editor();
         break;
 
+    case INPUT_CHORD_MAPPER: {
+        bool next = !nanocore_mapper_is_enabled();
+        nanocore_mapper_set_enabled(next);
+        show_notice(next
+            ? "LIVE MAPPER ON - EDIT NANOCORE"
+            : "LIVE MAPPER OFF");
+        break;
+    }
+
     case INPUT_FS_TOP_LEFT:
         if (s_runtime.mode == CTRL_MODE_SCENE) {
             change_scene(-1);
         } else if (s_runtime.mode == CTRL_MODE_STOMP) {
-            toggle_block(s_selected_block);
+            toggle_block(BLOCK_FX2);
         }
         break;
 
@@ -1239,6 +1265,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         memcpy(s_block_known, e->block_known, sizeof(s_block_known));
         memcpy(s_block_on, e->block_on, sizeof(s_block_on));
+
+        // Stage 06 mapper consumes the exact accepted LIVE snapshot.
+        nanocore_mapper_on_live_state(e);
+
         render_ui();
 
         if (s_runtime.mode == CTRL_MODE_SCENE) {
@@ -1247,9 +1277,13 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             apply_current_scene();
         }
 
-        // Serialize BLE reads: name only after confirmed live-state slot.
-        (void)nanocore_protocol_request_preset_name(
-            s_runtime.current_preset);
+        // Mapper polls must not trigger continuous 0x41/name traffic.
+        // Read the name only after recall/save explicitly asked for it.
+        if (s_name_after_live) {
+            s_name_after_live = false;
+            (void)nanocore_protocol_request_preset_name(
+                s_runtime.current_preset);
+        }
         break;
 
     case NC_PROTO_EVENT_BLOCK_STATE: {
@@ -1335,7 +1369,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 05 / HW V2");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06 / LIVE MAPPER");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -1362,6 +1396,7 @@ void app_main(void)
     ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
     ESP_ERROR_CHECK(input_manager_init());
     ESP_ERROR_CHECK(nanocore_protocol_init());
+    ESP_ERROR_CHECK(nanocore_mapper_init());
 
     ble_init();
 
@@ -1391,6 +1426,9 @@ void app_main(void)
         }
 
         service_recall_sync();
+        nanocore_mapper_service(
+            s_midi_ready,
+            s_recall_pending || s_recall_poll_inflight);
         tempo_engine_service();
 
         bool tap_active = tempo_engine_tap_active();
