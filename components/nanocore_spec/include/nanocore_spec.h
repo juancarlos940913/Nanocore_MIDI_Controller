@@ -79,6 +79,12 @@ const nanocore_candidate_type_t *nanocore_spec_candidate_type(
 
 size_t nanocore_spec_candidate_count(uint8_t block_id);
 
+/* Authoritative 0..29 factory model order used by AMP/CAB saved-preset footer. */
+size_t nanocore_spec_amp_model_count(void);
+const char *nanocore_spec_amp_model_name(uint8_t model_id);
+size_t nanocore_spec_cab_model_count(void);
+const char *nanocore_spec_cab_model_name(uint8_t model_id);
+
 #ifdef __cplusplus
 }
 #endif
