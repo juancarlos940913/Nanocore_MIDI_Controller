@@ -70,6 +70,8 @@ static bool s_block_known[BLOCK_COUNT];
 static bool s_block_on[BLOCK_COUNT];
 static bool s_block_profile_known[BLOCK_COUNT];
 static uint8_t s_block_variant[BLOCK_COUNT];
+static uint8_t s_block_param_count[BLOCK_COUNT];
+static float s_block_params[BLOCK_COUNT][NC_PROTO_MAX_PARAMS];
 
 static char s_notice[64];
 static int64_t s_notice_until_us;
@@ -120,6 +122,8 @@ static void clear_block_state(void)
     memset(s_block_on, 0, sizeof(s_block_on));
     memset(s_block_profile_known, 0, sizeof(s_block_profile_known));
     memset(s_block_variant, 0, sizeof(s_block_variant));
+    memset(s_block_param_count, 0, sizeof(s_block_param_count));
+    memset(s_block_params, 0, sizeof(s_block_params));
 }
 
 static int block_from_onoff_cc(uint8_t cc)
@@ -261,6 +265,57 @@ static esp_err_t send_cc(uint8_t cc, uint8_t value)
     return rc;
 }
 
+static const nanocore_effect_type_info_t *current_fx1_info(void)
+{
+    if (!s_block_profile_known[BLOCK_FX1]) return NULL;
+    return nanocore_spec_fx1_type(s_block_variant[BLOCK_FX1]);
+}
+
+static size_t editor_parameter_count(void)
+{
+    if (s_selected_block == BLOCK_FX1) {
+        const nanocore_effect_type_info_t *info = current_fx1_info();
+        return 2 + (info ? info->expected_param_count : 0);
+    }
+
+    return nanocore_parameter_count(s_selected_block);
+}
+
+static esp_err_t set_fx1_profile_param(uint8_t param_index, float normalized)
+{
+    const nanocore_effect_type_info_t *info = current_fx1_info();
+    if (!info ||
+        param_index >= info->expected_param_count ||
+        param_index >= NC_PROTO_MAX_PARAMS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    esp_err_t rc = nanocore_protocol_set_block_param(
+        BLOCK_FX1, param_index, normalized);
+
+    if (rc == ESP_OK) {
+        s_block_param_count[BLOCK_FX1] = info->expected_param_count;
+        s_block_params[BLOCK_FX1][param_index] = normalized;
+        s_dirty = true;
+
+        const nanocore_param_info_t *p = &info->params[param_index];
+        float real = nanocore_spec_normalized_to_real(p, normalized);
+
+        ESP_LOGI(TAG,
+                 "FX1 %s %s -> norm=%.6f real=%.3f%s",
+                 info->name,
+                 p->name,
+                 (double)normalized,
+                 (double)real,
+                 p->unit ? p->unit : "");
+    }
+
+    return rc;
+}
+
 static esp_err_t send_fx1_type_raw(uint8_t raw_type)
 {
     const nanocore_effect_type_info_t *info =
@@ -279,10 +334,16 @@ static esp_err_t send_fx1_type_raw(uint8_t raw_type)
     if (rc == ESP_OK) {
         s_block_profile_known[BLOCK_FX1] = true;
         s_block_variant[BLOCK_FX1] = raw_type;
+        s_block_param_count[BLOCK_FX1] = info->expected_param_count;
+        memset(s_block_params[BLOCK_FX1], 0,
+               sizeof(s_block_params[BLOCK_FX1]));
+        memcpy(s_block_params[BLOCK_FX1],
+               info->default_normalized,
+               (size_t)info->expected_param_count * sizeof(float));
 
         ESP_LOGI(TAG,
-                 "FX1 TYPE -> %s (raw=%u)",
-                 info->name, raw_type);
+                 "FX1 TYPE -> %s (raw=%u params=%u)",
+                 info->name, raw_type, info->expected_param_count);
     }
 
     return rc;
@@ -645,7 +706,7 @@ static uint16_t current_parameter_value(bool *known)
 
 static void select_parameter(int delta)
 {
-    size_t count = nanocore_parameter_count(s_selected_block);
+    size_t count = editor_parameter_count();
     if (count == 0) return;
 
     int p = (int)s_selected_parameter + delta;
@@ -657,11 +718,80 @@ static void select_parameter(int delta)
 
 static void adjust_parameter(int delta)
 {
+    if (delta == 0) return;
+
+    if (s_selected_block == BLOCK_FX1) {
+        /* 0=ON/OFF, 1=TYPE, 2.. = selected type's real parameters. */
+        if (s_selected_parameter == 0) {
+            uint8_t current =
+                (s_block_known[BLOCK_FX1] && s_block_on[BLOCK_FX1])
+                    ? 127 : 0;
+            uint8_t next = delta > 0 ? 127 : 0;
+            if (next != current) {
+                (void)set_working_cc(
+                    nanocore_block_onoff_cc(BLOCK_FX1), next);
+            }
+            return;
+        }
+
+        if (s_selected_parameter == 1) {
+            bool known = false;
+            int current = (int)current_parameter_value(&known);
+            if (!known) current = 0;
+
+            const int count =
+                (int)nanocore_spec_fx1_selector_count();
+            int next = current + delta;
+            while (next < 0) next += count;
+            while (next >= count) next -= count;
+
+            const nanocore_effect_type_info_t *info =
+                nanocore_spec_fx1_selector((size_t)next);
+            if (!info) return;
+
+            (void)set_working_cc(
+                nanocore_block_type_cc(BLOCK_FX1),
+                info->id);
+            return;
+        }
+
+        const nanocore_effect_type_info_t *info =
+            current_fx1_info();
+        if (!info || !info->params) return;
+
+        uint8_t param_index =
+            (uint8_t)(s_selected_parameter - 2);
+        if (param_index >= info->expected_param_count) return;
+
+        float current = info->default_normalized[param_index];
+        if (s_block_profile_known[BLOCK_FX1] &&
+            param_index < s_block_param_count[BLOCK_FX1]) {
+            current = s_block_params[BLOCK_FX1][param_index];
+        }
+
+        /*
+         * NanoCore profile parameters are normalized 0..1. One encoder
+         * detent = one percent of normalized travel; coalesced fast turns
+         * still apply the whole delta in one SysEx write.
+         */
+        float next = current + ((float)delta * 0.01f);
+        if (next < 0.0f) next = 0.0f;
+        if (next > 1.0f) next = 1.0f;
+
+        if (set_fx1_profile_param(param_index, next) != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "FX1 parameter write failed type=%u param=%u",
+                     s_block_variant[BLOCK_FX1], param_index);
+        }
+        render_ui();
+        return;
+    }
+
     const nc_parameter_t *p = nanocore_parameter(
         s_selected_block,
         s_selected_parameter);
 
-    if (!p || delta == 0) return;
+    if (!p) return;
 
     if (p->kind == NC_PARAM_TEMPO_BPM) {
         int bpm = (int)s_preset.bpm + delta;
@@ -684,31 +814,6 @@ static void adjust_parameter(int delta)
         s_preset.delay_subdivision = (delay_subdivision_t)sub;
         s_dirty = true;
         update_delay_from_tempo();
-        return;
-    }
-
-    if (p->kind == NC_PARAM_MIDI &&
-        s_selected_block == BLOCK_FX1 &&
-        p->cc == nanocore_block_type_cc(BLOCK_FX1)) {
-        bool known = false;
-        int current = (int)current_parameter_value(&known);
-        if (!known) current = 0;
-
-        const int count =
-            (int)nanocore_spec_fx1_selector_count();
-        int next = current + delta;
-        while (next < 0) next += count;
-        while (next >= count) next -= count;
-
-        const nanocore_effect_type_info_t *info =
-            nanocore_spec_fx1_selector((size_t)next);
-        if (!info) return;
-
-        /*
-         * Persist the raw wire type id in the same CC40 mirror slot used by
-         * older stages, but transmit through SysEx in set_working_cc().
-         */
-        (void)set_working_cc(p->cc, info->id);
         return;
     }
 
@@ -1398,6 +1503,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                sizeof(s_block_profile_known));
         memcpy(s_block_variant, e->block_variant,
                sizeof(s_block_variant));
+        memcpy(s_block_param_count, e->block_param_count,
+               sizeof(s_block_param_count));
+        memcpy(s_block_params, e->block_params,
+               sizeof(s_block_params));
 
         // Stage 06 mapper consumes the exact accepted LIVE snapshot.
         nanocore_mapper_on_live_state(e);
