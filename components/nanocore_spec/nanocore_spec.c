@@ -289,3 +289,148 @@ float nanocore_spec_real_to_normalized(
     if (span <= 0.0f) return 0.0f;
     return (real_value - param->min_value) / span;
 }
+
+
+/* -------------------------------------------------------------------------
+ * Stage 06.5 Assisted Mapper candidate catalogs
+ *
+ * block_id follows controller_block_t wire order:
+ * 0 FX1, 1 FX2, 2 AMP, 3 CAB, 4 DELAY, 5 MOD, 6 REVERB, 7 EQ.
+ *
+ * AMP/CAB are intentionally omitted here: current 0x63's raw variant byte is
+ * not a trustworthy model id for those two blocks. Their common parameter
+ * profiles can still be observed, but model identity needs a dedicated read.
+ * ------------------------------------------------------------------------- */
+
+static const nanocore_candidate_type_t FX2_CANDIDATES[] = {
+    {0,  "Scream",              3, "Gain,Tone,Level"},
+    {1,  "Klone",               3, "Gain,Tone,Level"},
+    {2,  "OCD",                 3, "Gain,Tone,Level"},
+    {3,  "DS2",                 3, "Gain,Tone,Level"},
+    {4,  "PIFUZZ",              3, "Gain,Tone,Level"},
+    {5,  "Range",               3, "Gain,Tone,Level"},
+    {6,  "XAC",                 3, "Gain,Tone,Level"},
+    {7,  "Fiman",               3, "Gain,Tone,Level"},
+    {8,  "Pitch",               3, "Pitch,Fine,Mix"},
+    {9,  "Envelope Wah",        4, "Freq,Env,Q,Mix"},
+    {10, "Wah",                 5, "Freq,Sweep,Rate,Shape,Mix"},
+    {11, "Motion Wah",          4, "Rate,Voice,Sweep,Mix"},
+    {12, "Gate",                2, "Threshold,Release"},
+    {13, "Auto Gate",           2, "Sensitivity,Release"},
+    {14, "Gate + Compressor",   7, "Gate,Threshold,Ratio,Knee,Attack,Release,Makeup"},
+    {15, "Compressor",          6, "Threshold,Ratio,Knee,Attack,Release,Makeup"},
+    {16, "Peak Comp",           5, "Threshold,Ratio,Attack,Release,Makeup"},
+    {17, "Parallel Comp",       5, "Threshold,Attack,Release,Mix,Level"},
+    {18, "Classic Wah",         5, "Position,Low,High,Mix,Level"},
+    {19, "Retro Wah",           5, "Position,Low,High,Mix,Level"},
+    {20, "Bass Wah",            5, "Position,Q Trim,Volume Trim,Mix,Level"},
+};
+
+static const nanocore_candidate_type_t DELAY_CANDIDATES[] = {
+    {0, "BBD",       4, "Time,Feedback,Tone,Mix"},
+    {1, "Digital",   3, "Time,Feedback,Mix"},
+    {2, "Duck",      8, "Time,Feedback,Sensitivity,Depth,Attack,Release,Filter,Mix"},
+    {3, "Ice",       4, "Time,Feedback,Interval,Mix"},
+    {4, "Reverse",   3, "Time,Feedback,Mix"},
+    {5, "LoFi",      5, "Time,Feedback,Bit Depth,LoFi Mix,Mix"},
+    {6, "Smear",     5, "Time,Feedback,Smear,Filter,Mix"},
+    {7, "Mod Delay", 5, "Time,Feedback,Mod Depth,Mod Rate,Mix"},
+};
+
+static const nanocore_candidate_type_t MOD_CANDIDATES[] = {
+    {0,  "Chorus",          2, "Rate,Depth"},
+    {1,  "Phaser",          3, "Rate,Feedback,Mix"},
+    {2,  "Flanger",         3, "Rate,Feedback,Mix"},
+    {3,  "Tremolo",         5, "Rate,Depth,Wave,Smooth,Mix"},
+    {4,  "Vibrato",         4, "Rate,Depth,Wave,Mix"},
+    {10, "Velvet Vibrato",  5, "Rate,Depth,Wave,Smooth,Mix"},
+    {11, "Chorus II",       4, "Rate,Depth,Tone,Mix"},
+    {12, "Phaser II",       4, "Rate,Feedback,Tone,Mix"},
+    {17, "Jet Flanger",     5, "Rate,Depth,Feedback,Tone,Mix"},
+};
+
+static const nanocore_candidate_type_t REVERB_CANDIDATES[] = {
+    {0, "Room",    5, "Decay,Pre Delay,Tone,Mod,Mix"},
+    {1, "Plate",   5, "Decay,Pre Delay,Tone,Mod,Mix"},
+    {2, "Hall",    5, "Decay,Pre Delay,Tone,LF Damp,Mix"},
+    {3, "Concert", 5, "Decay,Pre Delay,HF Damp,Mod,Mix"},
+    {4, "Shimmer", 5, "Decay,Pre Delay,Tone,Pitch,Mix"},
+    {5, "Cloud",   5, "Decay,Tone,Mod Depth,Mod Rate,Mix"},
+    {6, "Spring",  5, "Decay,Pre Delay,Crossover,Tone,Mix"},
+};
+
+static const nanocore_candidate_type_t EQ_CANDIDATES[] = {
+    {0, "3-band EQ", 4, "Low,Mid,High,Level"},
+    {1, "6-band EQ", 7, "120Hz,250Hz,500Hz,1kHz,2kHz,4kHz,Level"},
+    {2, "8-band EQ", 9, "60Hz,120Hz,250Hz,500Hz,1kHz,2kHz,4kHz,8kHz,Level"},
+};
+
+static const nanocore_candidate_type_t *candidate_lookup(
+    const nanocore_candidate_type_t *items,
+    size_t count,
+    uint8_t raw_type_id)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i].id == raw_type_id) return &items[i];
+    }
+    return 0;
+}
+
+const nanocore_candidate_type_t *nanocore_spec_candidate_type(
+    uint8_t block_id,
+    uint8_t raw_type_id)
+{
+    switch (block_id) {
+    case 0: {
+        const nanocore_effect_type_info_t *fx1 =
+            nanocore_spec_fx1_type(raw_type_id);
+        static nanocore_candidate_type_t converted;
+        if (!fx1) return 0;
+        converted.id = fx1->id;
+        converted.name = fx1->name;
+        converted.expected_param_count = fx1->expected_param_count;
+        converted.parameter_names = "verified FX1";
+        return &converted;
+    }
+    case 1:
+        return candidate_lookup(
+            FX2_CANDIDATES,
+            sizeof(FX2_CANDIDATES) / sizeof(FX2_CANDIDATES[0]),
+            raw_type_id);
+    case 4:
+        return candidate_lookup(
+            DELAY_CANDIDATES,
+            sizeof(DELAY_CANDIDATES) / sizeof(DELAY_CANDIDATES[0]),
+            raw_type_id);
+    case 5:
+        return candidate_lookup(
+            MOD_CANDIDATES,
+            sizeof(MOD_CANDIDATES) / sizeof(MOD_CANDIDATES[0]),
+            raw_type_id);
+    case 6:
+        return candidate_lookup(
+            REVERB_CANDIDATES,
+            sizeof(REVERB_CANDIDATES) / sizeof(REVERB_CANDIDATES[0]),
+            raw_type_id);
+    case 7:
+        return candidate_lookup(
+            EQ_CANDIDATES,
+            sizeof(EQ_CANDIDATES) / sizeof(EQ_CANDIDATES[0]),
+            raw_type_id);
+    default:
+        return 0;
+    }
+}
+
+size_t nanocore_spec_candidate_count(uint8_t block_id)
+{
+    switch (block_id) {
+    case 0: return nanocore_spec_fx1_selector_count();
+    case 1: return sizeof(FX2_CANDIDATES) / sizeof(FX2_CANDIDATES[0]);
+    case 4: return sizeof(DELAY_CANDIDATES) / sizeof(DELAY_CANDIDATES[0]);
+    case 5: return sizeof(MOD_CANDIDATES) / sizeof(MOD_CANDIDATES[0]);
+    case 6: return sizeof(REVERB_CANDIDATES) / sizeof(REVERB_CANDIDATES[0]);
+    case 7: return sizeof(EQ_CANDIDATES) / sizeof(EQ_CANDIDATES[0]);
+    default: return 0;
+    }
+}
