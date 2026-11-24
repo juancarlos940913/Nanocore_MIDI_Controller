@@ -15,9 +15,16 @@ void nanocore_mapper_set_enabled(bool enabled);
 bool nanocore_mapper_is_enabled(void);
 
 /*
- * Poll the NanoCore live profile only while mapper mode is enabled.
- * Set transport_busy while a Program Change recall is being synchronized,
- * so mapper traffic never overlaps the slot-confirmation state machine.
+ * Queue one explicit live-profile capture. Stage 06.2 intentionally avoids
+ * continuous polling because a long characterization session can exhaust the
+ * BLE write-no-response mbuf pool.
+ */
+void nanocore_mapper_request_capture(void);
+
+/*
+ * Service a queued capture only while mapper mode is enabled.
+ * Set transport_busy while Program Change recall is being synchronized so
+ * diagnostic traffic never overlaps the slot-confirmation state machine.
  */
 void nanocore_mapper_service(bool midi_ready, bool transport_busy);
 
