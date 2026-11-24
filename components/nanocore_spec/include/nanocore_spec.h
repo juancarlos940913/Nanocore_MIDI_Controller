@@ -37,6 +37,10 @@ float nanocore_spec_normalized_to_real(
     const nanocore_param_info_t *param,
     float normalized);
 
+float nanocore_spec_real_to_normalized(
+    const nanocore_param_info_t *param,
+    float real_value);
+
 /*
  * FX1 catalog for current NanoCore firmware generation.
  *
