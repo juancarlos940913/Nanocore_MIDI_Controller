@@ -655,7 +655,6 @@ static void commit_name_and_save(void)
     (void)persist_runtime();
 
     (void)nanocore_protocol_request_live_state();
-    (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
 
     ESP_LOGI(TAG, "NanoCore + NVS saved P%02u / %s",
              s_runtime.current_preset + 1, s_preset.name);
