@@ -68,6 +68,13 @@ typedef struct {
 
 static reassembly_t s_reassembly;
 
+static float read_float32_le(const uint8_t *p)
+{
+    float value = 0.0f;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
 static uint8_t next_seq(void)
 {
     s_seq = (uint8_t)((s_seq + 1) & 0x7F);
@@ -315,30 +322,116 @@ static void parse_live_payload(const uint8_t *p, size_t len)
 
     size_t pos = 3;
 
-    /* FX1: [on][type][count] + floats */
+    /*
+     * Reassembled live-profile block stream:
+     * FX1 [on][variant][count][count * float32LE], then
+     * FX2, AMP, CAB, DELAY, MOD, REVERB, EQ in the same shape.
+     *
+     * variant is kept RAW. Current firmware does not make AMP/CAB's raw
+     * variant byte a trustworthy live model id, and REV/EQ have historical
+     * encoding quirks. Stage 06 captures before translating.
+     */
+
     if (pos + 3 > len) return;
     uint8_t count = p[pos + 2];
-    if (count > 9 || pos + 3 + (size_t)count * 4 > len) return;
+    if (count > NC_PROTO_MAX_PARAMS ||
+        pos + 3 + (size_t)count * 4 > len) {
+        ESP_LOGW(TAG, "Invalid FX1 live param count=%u len=%u",
+                 count, (unsigned)len);
+        return;
+    }
+
     e.block_known[BLOCK_FX1] = true;
     e.block_on[BLOCK_FX1] = p[pos] != 0;
-    pos += 3 + (size_t)count * 4;
+    e.block_profile_known[BLOCK_FX1] = true;
+    e.block_variant[BLOCK_FX1] = p[pos + 1];
+    e.block_param_count[BLOCK_FX1] = count;
+    pos += 3;
 
-    /* The actual NanoCore serialization order is:
-     * FX2, AMP, CAB, DELAY, MOD, REVERB, EQ.
-     * Stage05.1's controller enum intentionally matches that order.
-     */
+    for (uint8_t i = 0; i < count; ++i, pos += 4) {
+        e.block_params[BLOCK_FX1][i] = read_float32_le(&p[pos]);
+    }
+
     for (int block = BLOCK_FX2; block < BLOCK_COUNT; ++block) {
-        if (pos + 3 > len) return;
+        if (pos + 3 > len) {
+            ESP_LOGW(TAG, "Live profile ended before block=%d", block);
+            break;
+        }
+
+        const uint8_t on = p[pos];
+        const uint8_t variant = p[pos + 1];
         count = p[pos + 2];
-        uint8_t max_count = block == BLOCK_EQ ? 9 : 8;
+        pos += 3;
+
+        const uint8_t max_count =
+            block == BLOCK_EQ ? NC_PROTO_MAX_PARAMS : 8;
+
         if (count > max_count ||
-            pos + 3 + (size_t)count * 4 > len) {
-            return;
+            pos + (size_t)count * 4 > len) {
+            ESP_LOGW(TAG,
+                     "Invalid live block=%d count=%u pos=%u len=%u",
+                     block, count, (unsigned)pos, (unsigned)len);
+            break;
         }
 
         e.block_known[block] = true;
-        e.block_on[block] = p[pos] != 0;
-        pos += 3 + (size_t)count * 4;
+        e.block_on[block] = on != 0;
+        e.block_profile_known[block] = true;
+        e.block_variant[block] = variant;
+        e.block_param_count[block] = count;
+
+        for (uint8_t i = 0; i < count; ++i, pos += 4) {
+            e.block_params[block][i] = read_float32_le(&p[pos]);
+        }
+    }
+
+    const size_t after_blocks = pos;
+
+    /* Optional chain footer: 0x08 + permutation of block ids 0..7. */
+    if (pos + 9 <= len && p[pos] == 0x08) {
+        bool seen[BLOCK_COUNT] = {0};
+        bool valid = true;
+
+        for (int i = 0; i < BLOCK_COUNT; ++i) {
+            uint8_t id = p[pos + 1 + i];
+            if (id >= BLOCK_COUNT || seen[id]) {
+                valid = false;
+                break;
+            }
+            seen[id] = true;
+            e.chain_order[i] = id;
+        }
+
+        e.chain_order_known = valid;
+    }
+
+    /*
+     * Firmware 1.2 Synth (protocol block id 10) has been observed 15 bytes
+     * after the end of the normal 8-block stream:
+     * 9-byte chain footer + 6 reserved/unknown bytes, then
+     * [on][voice][count][float32 params...].
+     * Observe only; normal UI is not changed by Stage 06.
+     */
+    size_t synth_pos = after_blocks + 15;
+    if (synth_pos + 3 <= len) {
+        uint8_t synth_on = p[synth_pos];
+        uint8_t synth_variant = p[synth_pos + 1];
+        uint8_t synth_count = p[synth_pos + 2];
+
+        if (synth_on <= 1 &&
+            synth_count <= NC_PROTO_SYNTH_MAX_PARAMS &&
+            synth_pos + 3 + (size_t)synth_count * 4 <= len) {
+
+            e.synth_known = true;
+            e.synth_on = synth_on != 0;
+            e.synth_variant = synth_variant;
+            e.synth_param_count = synth_count;
+
+            synth_pos += 3;
+            for (uint8_t i = 0; i < synth_count; ++i, synth_pos += 4) {
+                e.synth_params[i] = read_float32_le(&p[synth_pos]);
+            }
+        }
     }
 
     queue_event(&e);
@@ -350,6 +443,22 @@ static void parse_live_payload(const uint8_t *p, size_t len)
              e.block_on[BLOCK_AMP], e.block_on[BLOCK_CAB],
              e.block_on[BLOCK_DELAY], e.block_on[BLOCK_MOD],
              e.block_on[BLOCK_REVERB], e.block_on[BLOCK_EQ]);
+
+    ESP_LOGD(TAG,
+             "LIVE profile variants/counts: "
+             "FX1=%u/%u FX2=%u/%u AMP=%u/%u CAB=%u/%u "
+             "DEL=%u/%u MOD=%u/%u REV=%u/%u EQ=%u/%u SYN=%u/%u/%u",
+             e.block_variant[BLOCK_FX1], e.block_param_count[BLOCK_FX1],
+             e.block_variant[BLOCK_FX2], e.block_param_count[BLOCK_FX2],
+             e.block_variant[BLOCK_AMP], e.block_param_count[BLOCK_AMP],
+             e.block_variant[BLOCK_CAB], e.block_param_count[BLOCK_CAB],
+             e.block_variant[BLOCK_DELAY], e.block_param_count[BLOCK_DELAY],
+             e.block_variant[BLOCK_MOD], e.block_param_count[BLOCK_MOD],
+             e.block_variant[BLOCK_REVERB], e.block_param_count[BLOCK_REVERB],
+             e.block_variant[BLOCK_EQ], e.block_param_count[BLOCK_EQ],
+             e.synth_known ? 1 : 0,
+             e.synth_variant,
+             e.synth_param_count);
 }
 
 static void dispatch_complete_reply(uint16_t opcode,
