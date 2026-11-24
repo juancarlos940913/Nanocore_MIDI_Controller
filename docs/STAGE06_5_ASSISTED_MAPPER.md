@@ -275,16 +275,24 @@ The controller now reads the saved-preset 0x41 footer:
 Both indices are direct 0..29 model ids.
 
 Assisted Mapper behavior for AMP/CAB:
-1. Select AMP or CAB in PERFORMANCE.
-2. Enable mapper with TOP LEFT + TOP RIGHT.
-3. Change the model on the physical NanoCore.
+1. Recall a normal SAVED preset and let the controller finish its 0x63 sync.
+2. Select AMP or CAB in PERFORMANCE.
+3. Enable mapper with TOP LEFT + TOP RIGHT.
 4. Press ENC2 once.
 5. Serial prints:
    `MODEL|slot=N|AMP=<name>(id)|CAB=<name>(id)`
-6. Repeat with one or two additional models only.
+6. Compare those names against the currently loaded preset on the NanoCore.
+7. For additional validation, recall one or two DIFFERENT SAVED presets and
+   repeat. Do not change AMP/CAB physically just before the read unless you
+   also intentionally save that edit.
 
-There is no need to sweep all 30 AMP and 30 CAB models if the direct indices
-track the physical selections correctly.
+Important: opcode 0x41 is saved-preset state. It is authoritative for the
+model stored in the preset, but it cannot observe an unsaved physical model
+change. Live opcode 0x63 observes AMP/CAB parameters but, on current firmware,
+does not expose their model index.
+
+There is no need to sweep all 30 AMP and 30 CAB models. A few saved presets
+with different models are enough to validate the direct 0..29 index mapping.
 
 Common live profiles remain:
 - AMP: 5 params = Gain, Bass, Mid, Treble, Level
