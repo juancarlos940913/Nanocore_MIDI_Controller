@@ -12,6 +12,9 @@
 extern "C" {
 #endif
 
+#define NC_PROTO_MAX_PARAMS       9
+#define NC_PROTO_SYNTH_MAX_PARAMS 8
+
 typedef enum {
     NC_PROTO_EVENT_NONE = 0,
     NC_PROTO_EVENT_LIVE_STATE,
@@ -28,6 +31,31 @@ typedef struct {
 
     bool block_known[BLOCK_COUNT];
     bool block_on[BLOCK_COUNT];
+
+    /*
+     * Raw live-profile data from opcode 0x63.
+     * variant is the byte reported by the device; for AMP/CAB this byte is
+     * not a reliable model index on current firmware, so the mapper keeps it
+     * raw rather than silently translating it.
+     */
+    bool block_profile_known[BLOCK_COUNT];
+    uint8_t block_variant[BLOCK_COUNT];
+    uint8_t block_param_count[BLOCK_COUNT];
+    float block_params[BLOCK_COUNT][NC_PROTO_MAX_PARAMS];
+
+    /* Optional effect-chain footer from the same live profile. */
+    bool chain_order_known;
+    uint8_t chain_order[BLOCK_COUNT];
+
+    /*
+     * Firmware 1.2 Synth Mode is exposed separately (protocol block id 10).
+     * Stage 06 only observes/maps it; normal 8-block UI behavior is unchanged.
+     */
+    bool synth_known;
+    bool synth_on;
+    uint8_t synth_variant;
+    uint8_t synth_param_count;
+    float synth_params[NC_PROTO_SYNTH_MAX_PARAMS];
 
     char name[13];
 } nanocore_protocol_event_t;
