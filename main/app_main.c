@@ -1764,7 +1764,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06.5 / ASSISTED MAPPER");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06.8 / AMP-CAB MODEL READ");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
