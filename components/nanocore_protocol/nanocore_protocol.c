@@ -53,6 +53,15 @@ static QueueHandle_t s_events;
 static SemaphoreHandle_t s_save_ack;
 static TaskHandle_t s_ping_task;
 
+/*
+ * nanocore_protocol_event_t became intentionally large in Stage 06 because
+ * a LIVE event carries every block's float parameters. Do NOT place it on
+ * the BLE/system event task stack. The BLE callback path is serialized, so
+ * one static scratch object is sufficient; queue_event() copies it into the
+ * FreeRTOS queue before the next parse reuses it.
+ */
+static nanocore_protocol_event_t s_event_scratch;
+
 static volatile bool s_connected;
 static uint8_t s_seq;
 static volatile uint8_t s_wait_save_slot = 0xFF;
@@ -80,6 +89,14 @@ static uint8_t next_seq(void)
     s_seq = (uint8_t)((s_seq + 1) & 0x7F);
     if (s_seq == 0) s_seq = 1;
     return s_seq;
+}
+
+static nanocore_protocol_event_t *scratch_event(
+    nanocore_protocol_event_type_t type)
+{
+    memset(&s_event_scratch, 0, sizeof(s_event_scratch));
+    s_event_scratch.type = type;
+    return &s_event_scratch;
 }
 
 static void queue_event(const nanocore_protocol_event_t *e)
@@ -297,12 +314,11 @@ static void parse_name_payload(const uint8_t *payload, size_t len)
 
     if (!out) return;
 
-    nanocore_protocol_event_t e = {
-        .type = NC_PROTO_EVENT_PRESET_NAME,
-        .slot = slot,
-    };
-    memcpy(e.name, name, sizeof(e.name));
-    queue_event(&e);
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_PRESET_NAME);
+    e->slot = slot;
+    memcpy(e->name, name, sizeof(e->name));
+    queue_event(e);
 
     ESP_LOGI(TAG, "Preset %u name RX: %s", slot, name);
 }
@@ -315,10 +331,9 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         return;
     }
 
-    nanocore_protocol_event_t e = {
-        .type = NC_PROTO_EVENT_LIVE_STATE,
-        .slot = p[1],
-    };
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_LIVE_STATE);
+    e->slot = p[1];
 
     size_t pos = 3;
 
@@ -341,15 +356,15 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         return;
     }
 
-    e.block_known[BLOCK_FX1] = true;
-    e.block_on[BLOCK_FX1] = p[pos] != 0;
-    e.block_profile_known[BLOCK_FX1] = true;
-    e.block_variant[BLOCK_FX1] = p[pos + 1];
-    e.block_param_count[BLOCK_FX1] = count;
+    e->block_known[BLOCK_FX1] = true;
+    e->block_on[BLOCK_FX1] = p[pos] != 0;
+    e->block_profile_known[BLOCK_FX1] = true;
+    e->block_variant[BLOCK_FX1] = p[pos + 1];
+    e->block_param_count[BLOCK_FX1] = count;
     pos += 3;
 
     for (uint8_t i = 0; i < count; ++i, pos += 4) {
-        e.block_params[BLOCK_FX1][i] = read_float32_le(&p[pos]);
+        e->block_params[BLOCK_FX1][i] = read_float32_le(&p[pos]);
     }
 
     for (int block = BLOCK_FX2; block < BLOCK_COUNT; ++block) {
@@ -374,14 +389,14 @@ static void parse_live_payload(const uint8_t *p, size_t len)
             break;
         }
 
-        e.block_known[block] = true;
-        e.block_on[block] = on != 0;
-        e.block_profile_known[block] = true;
-        e.block_variant[block] = variant;
-        e.block_param_count[block] = count;
+        e->block_known[block] = true;
+        e->block_on[block] = on != 0;
+        e->block_profile_known[block] = true;
+        e->block_variant[block] = variant;
+        e->block_param_count[block] = count;
 
         for (uint8_t i = 0; i < count; ++i, pos += 4) {
-            e.block_params[block][i] = read_float32_le(&p[pos]);
+            e->block_params[block][i] = read_float32_le(&p[pos]);
         }
     }
 
@@ -399,10 +414,10 @@ static void parse_live_payload(const uint8_t *p, size_t len)
                 break;
             }
             seen[id] = true;
-            e.chain_order[i] = id;
+            e->chain_order[i] = id;
         }
 
-        e.chain_order_known = valid;
+        e->chain_order_known = valid;
     }
 
     /*
@@ -422,43 +437,43 @@ static void parse_live_payload(const uint8_t *p, size_t len)
             synth_count <= NC_PROTO_SYNTH_MAX_PARAMS &&
             synth_pos + 3 + (size_t)synth_count * 4 <= len) {
 
-            e.synth_known = true;
-            e.synth_on = synth_on != 0;
-            e.synth_variant = synth_variant;
-            e.synth_param_count = synth_count;
+            e->synth_known = true;
+            e->synth_on = synth_on != 0;
+            e->synth_variant = synth_variant;
+            e->synth_param_count = synth_count;
 
             synth_pos += 3;
             for (uint8_t i = 0; i < synth_count; ++i, synth_pos += 4) {
-                e.synth_params[i] = read_float32_le(&p[synth_pos]);
+                e->synth_params[i] = read_float32_le(&p[synth_pos]);
             }
         }
     }
 
-    queue_event(&e);
+    queue_event(e);
 
     ESP_LOGI(TAG,
              "LIVE slot=%u FX1=%u FX2=%u AMP=%u CAB=%u DEL=%u MOD=%u REV=%u EQ=%u",
-             e.slot,
-             e.block_on[BLOCK_FX1], e.block_on[BLOCK_FX2],
-             e.block_on[BLOCK_AMP], e.block_on[BLOCK_CAB],
-             e.block_on[BLOCK_DELAY], e.block_on[BLOCK_MOD],
-             e.block_on[BLOCK_REVERB], e.block_on[BLOCK_EQ]);
+             e->slot,
+             e->block_on[BLOCK_FX1], e->block_on[BLOCK_FX2],
+             e->block_on[BLOCK_AMP], e->block_on[BLOCK_CAB],
+             e->block_on[BLOCK_DELAY], e->block_on[BLOCK_MOD],
+             e->block_on[BLOCK_REVERB], e->block_on[BLOCK_EQ]);
 
     ESP_LOGD(TAG,
              "LIVE profile variants/counts: "
              "FX1=%u/%u FX2=%u/%u AMP=%u/%u CAB=%u/%u "
              "DEL=%u/%u MOD=%u/%u REV=%u/%u EQ=%u/%u SYN=%u/%u/%u",
-             e.block_variant[BLOCK_FX1], e.block_param_count[BLOCK_FX1],
-             e.block_variant[BLOCK_FX2], e.block_param_count[BLOCK_FX2],
-             e.block_variant[BLOCK_AMP], e.block_param_count[BLOCK_AMP],
-             e.block_variant[BLOCK_CAB], e.block_param_count[BLOCK_CAB],
-             e.block_variant[BLOCK_DELAY], e.block_param_count[BLOCK_DELAY],
-             e.block_variant[BLOCK_MOD], e.block_param_count[BLOCK_MOD],
-             e.block_variant[BLOCK_REVERB], e.block_param_count[BLOCK_REVERB],
-             e.block_variant[BLOCK_EQ], e.block_param_count[BLOCK_EQ],
-             e.synth_known ? 1 : 0,
-             e.synth_variant,
-             e.synth_param_count);
+             e->block_variant[BLOCK_FX1], e->block_param_count[BLOCK_FX1],
+             e->block_variant[BLOCK_FX2], e->block_param_count[BLOCK_FX2],
+             e->block_variant[BLOCK_AMP], e->block_param_count[BLOCK_AMP],
+             e->block_variant[BLOCK_CAB], e->block_param_count[BLOCK_CAB],
+             e->block_variant[BLOCK_DELAY], e->block_param_count[BLOCK_DELAY],
+             e->block_variant[BLOCK_MOD], e->block_param_count[BLOCK_MOD],
+             e->block_variant[BLOCK_REVERB], e->block_param_count[BLOCK_REVERB],
+             e->block_variant[BLOCK_EQ], e->block_param_count[BLOCK_EQ],
+             e->synth_known ? 1 : 0,
+             e->synth_variant,
+             e->synth_param_count);
 }
 
 static void dispatch_complete_reply(uint16_t opcode,
@@ -560,23 +575,21 @@ static void parse_push(const uint8_t *msg, size_t len)
             return;
         }
 
-        nanocore_protocol_event_t e = {
-            .type = NC_PROTO_EVENT_ACTIVE_SLOT,
-            .slot = raw_slot,
-        };
-        queue_event(&e);
-        ESP_LOGI(TAG, "Active slot push -> %u", e.slot);
+        nanocore_protocol_event_t *e =
+            scratch_event(NC_PROTO_EVENT_ACTIVE_SLOT);
+        e->slot = raw_slot;
+        queue_event(e);
+        ESP_LOGI(TAG, "Active slot push -> %u", e->slot);
     } else if (opcode == OP_BLOCK_STATE && len > 12) {
         uint8_t block_id = msg[11];
         if (block_id < BLOCK_COUNT) {
-            nanocore_protocol_event_t e = {
-                .type = NC_PROTO_EVENT_BLOCK_STATE,
-                .block = (controller_block_t)block_id,
-                .on = msg[12] != 0,
-            };
-            queue_event(&e);
+            nanocore_protocol_event_t *e =
+                scratch_event(NC_PROTO_EVENT_BLOCK_STATE);
+            e->block = (controller_block_t)block_id;
+            e->on = msg[12] != 0;
+            queue_event(e);
             ESP_LOGI(TAG, "Block push %u -> %s",
-                     block_id, e.on ? "ON" : "OFF");
+                     block_id, e->on ? "ON" : "OFF");
         }
     }
 }
