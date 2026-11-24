@@ -45,13 +45,15 @@ Block editor:
 
 ## 4. Five footswitches
 
-- Bottom FS1 = preset down.
-- Bottom FS2 = preset up.
+- Bottom FS1 = preset up.
+- Bottom FS2 = preset down.
 - Bottom FS3 short = mode cycle.
 - Bottom FS3 long = Tap Capture.
 - Top-left/top-right = Scene -/+ in SCENE.
-- Top-left = selected block stomp in STOMP.
-- Top-right = Delay stomp in STOMP.
+- STOMP: Top-left = FX2.
+- STOMP: Top-right = Delay.
+- STOMP: Bottom FS1 = Mod.
+- STOMP: Bottom FS2 = Reverb.
 
 ## 5. LEDs
 
@@ -66,7 +68,8 @@ Block editor:
 Press both switches nearly together and keep them down briefly.
 
 - Bottom FS3 + Top-right = tuner toggle.
-- Bottom FS1 + Top-left = SAVE/name editor.
+- Physical Bottom FS1 + Top-left = SAVE/name editor.
+- Top-left + Top-right = toggle Stage 06 Live Mapper.
 
 No individual footswitch action should leak through a recognized chord.
 
@@ -176,3 +179,58 @@ CC74 is now calibrated linearly:
 ### Block order
 Performance layout and protocol block IDs:
 `FX1, FX2, AMP, CAB, DELAY, MOD, REVERB, EQ`
+
+
+## Stage 06 — Live Mapper
+
+Purpose: characterize the exact live data exposed by the user's NanoCore firmware
+instead of assuming that the legacy MIDI guide is complete.
+
+### Toggle
+Hold both TOP footswitches together briefly.
+
+Expected:
+- `NC_MAP: Live Mapper ON`
+- screen notice `LIVE MAPPER ON - EDIT NANOCORE`
+
+Repeat the chord to disable.
+
+### Polling behavior
+While enabled and BLE-MIDI is ready:
+- opcode 0x63 is requested approximately every 800 ms;
+- only one mapper request may be in flight;
+- Program Change recall synchronization has priority over mapper polling;
+- identical snapshots are suppressed.
+
+### Serial format
+When live state changes, expect:
+
+```
+NC_MAP: MAP|BEGIN|slot=...
+NC_MAP: MAP|slot=...|block=FX1|on=1|variant=...|count=...|p0=...|p1=...
+...
+NC_MAP: MAP|slot=...|block=EQ|...
+NC_MAP: MAP|slot=...|chain=...
+NC_MAP: MAP|slot=...|block=SYNTH|on=...|variant=...|count=...|...
+NC_MAP: MAP|END|slot=...
+```
+
+`variant` is intentionally RAW device data. Do not assume AMP/CAB's live
+variant byte is their model number. Parameter values are raw normalized float32
+values from the device.
+
+### Recommended mapping procedure
+Use a preset you are willing to edit live and DO NOT press SAVE during
+characterization unless explicitly testing persistence.
+
+For each block:
+1. enable Live Mapper;
+2. select one effect/type on the physical NanoCore;
+3. wait for a MAP snapshot;
+4. record the physical type name and its reported `variant/count`;
+5. move one parameter at a time to clearly different positions;
+6. capture the MAP snapshots;
+7. move to the next type.
+
+Send the resulting serial log for conversion into the firmware-specific
+metadata table (type names, parameter names, ranges, units and scaling curves).
