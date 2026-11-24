@@ -482,8 +482,12 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         count = p[pos + 2];
         pos += 3;
 
-        const uint8_t max_count =
-            block == BLOCK_EQ ? NC_PROTO_MAX_PARAMS : 8;
+        /*
+         * Firmware 1.2 adds Ping Pong to every DELAY type. Duck now reports
+         * 9 live parameters, so all normal blocks must accept the full
+         * NC_PROTO_MAX_PARAMS capacity instead of the old hard limit of 8.
+         */
+        const uint8_t max_count = NC_PROTO_MAX_PARAMS;
 
         if (count > max_count ||
             pos + (size_t)count * 4 > len) {
