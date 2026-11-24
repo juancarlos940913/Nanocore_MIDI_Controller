@@ -1632,8 +1632,20 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         memcpy(s_block_params, e->block_params,
                sizeof(s_block_params));
 
-        // Stage 06 mapper consumes the exact accepted LIVE snapshot.
+        // Assisted Mapper can still consume the accepted LIVE snapshot.
         nanocore_mapper_on_live_state(e);
+
+        /*
+         * AMP/CAB model identity is not present in 0x63. If their editor
+         * requested a fresh snapshot, follow it with one saved-footer read.
+         * During normal recall the name flow below will request models after
+         * the 0x41 name reply, avoiding overlapping 0x41 transactions.
+         */
+        if (s_editor_models_after_live && !s_name_after_live) {
+            s_editor_models_after_live = false;
+            (void)nanocore_protocol_request_preset_models(
+                s_runtime.current_preset);
+        }
 
         render_ui();
 
@@ -1724,11 +1736,31 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             }
 
             render_ui();
+
+            /*
+             * The preset-name request is serialized after accepted 0x63.
+             * Reuse that completed 0x41 transaction as the trigger for the
+             * separate footer read that supplies AMP/CAB model ids.
+             */
+            if (s_midi_ready) {
+                (void)nanocore_protocol_request_preset_models(
+                    s_runtime.current_preset);
+            }
         }
         break;
 
     case NC_PROTO_EVENT_PRESET_MODELS: {
         if (e->slot != s_runtime.current_preset) break;
+
+        if (e->amp_model_known) {
+            s_amp_model = e->amp_model;
+            s_amp_model_known = true;
+        }
+        if (e->cab_model_known) {
+            s_cab_model = e->cab_model;
+            s_cab_model_known = true;
+        }
+        s_editor_models_after_live = false;
 
         const char *amp_name = e->amp_model_known
             ? nanocore_spec_amp_model_name(e->amp_model) : NULL;
@@ -1755,6 +1787,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                      e->cab_model, cab_name ? cab_name : "?");
             show_notice(notice);
         }
+
+        render_ui();
         break;
     }
 
@@ -1818,7 +1852,7 @@ void app_main(void)
         }
 
         /*
-         * Stage 06 protocol events carry all live float parameters and are
+         * Live protocol events carry all block float parameters and are
          * intentionally large. Keep the receive buffer out of app_main's
          * task stack as well.
          */
