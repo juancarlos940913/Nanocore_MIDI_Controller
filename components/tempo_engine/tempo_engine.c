@@ -12,7 +12,7 @@
 
 // Provisional calibration endpoints for CC74.
 // The public NanoCore guide does not document its ms curve.
-#define DELAY_CAL_MIN_MS      20
+#define DELAY_CAL_MIN_MS       0
 #define DELAY_CAL_MAX_MS    2000
 
 static uint16_t s_bpm = 120;
@@ -153,7 +153,8 @@ uint8_t tempo_engine_delay_ms_to_cc74(uint32_t ms)
     if (ms <= DELAY_CAL_MIN_MS) return 0;
     if (ms >= DELAY_CAL_MAX_MS) return 127;
 
-    uint32_t span = DELAY_CAL_MAX_MS - DELAY_CAL_MIN_MS;
-    uint32_t pos = ms - DELAY_CAL_MIN_MS;
-    return (uint8_t)((pos * 127UL + span / 2) / span);
+    // NanoCore Delay Time is linear from 0..2000 ms over MIDI 0..127.
+    // Choose the nearest representable 7-bit value.
+    return (uint8_t)((ms * 127UL + (DELAY_CAL_MAX_MS / 2)) /
+                     DELAY_CAL_MAX_MS);
 }
