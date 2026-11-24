@@ -117,3 +117,62 @@ In DELAY editor:
 - verify calculated delay changes
 
 Then calibrate `tempo_engine_delay_ms_to_cc74()` against real NanoCore delay times. The current public MIDI guide does not define this conversion.
+
+
+## Stage 05.1 validation — controller behavior
+
+### Fast encoder
+- Spin ENC1 rapidly through the name keyboard.
+- Cursor must jump to the current physical position without continuing for seconds afterward.
+- Slow one-detent movement must remain one logical step.
+- If a single detent is skipped/doubled, tune only `BOARD_ENCODER_EDGES_PER_DETENT`.
+
+### Device live-state sync
+After BLE-MIDI becomes READY, expect serial messages from `NC_PROTO`:
+- heartbeat/ping traffic
+- reassembled opcode 0x63 live-state reply
+- `LIVE slot=... FX1=... FX2=... AMP=... CAB=... DEL=... MOD=... REV=... EQ=...`
+
+The eight block cards should then be:
+- green outline = ON
+- yellow outline = OFF
+- gray = not yet known
+
+Change a block physically on the NanoCore. The controller should update from the unsolicited block-state push.
+
+### Device preset name
+After recall, the controller requests the NanoCore's saved preset name. The performance screen should use the device name after the response arrives.
+
+### Save to NanoCore
+In PRESET or STOMP:
+1. make a live edit
+2. invoke SAVE
+3. enter a name (NanoCore write limit: 8 chars)
+4. confirm SAVE chord
+
+Expected:
+- rename SysEx
+- opcode 0x46 save
+- NanoCore ACK
+- NVS mirror written only after the device ACK
+- notice: PRESET SAVED TO NANOCORE
+
+Recall another preset and return. The saved name/block state must already be present in the NanoCore without a second base-CC replay.
+
+SCENE saves remain controller/NVS-only by design.
+
+### Dirty preset guard
+Make an edit and press Preset +/- without saving.
+Expected on-screen notice:
+`SAVE CHANGES BEFORE PRESET +/-`
+
+### Delay calibration
+CC74 is now calibrated linearly:
+- CC0 = 0 ms
+- CC127 = 2000 ms
+- 300 BPM quarter = 200 ms target -> nearest 7-bit CC13
+- 30 BPM quarter = 2000 ms -> CC127
+
+### Block order
+Performance layout and protocol block IDs:
+`FX1, FX2, AMP, CAB, DELAY, MOD, REVERB, EQ`
