@@ -21,6 +21,7 @@ typedef enum {
     NC_PROTO_EVENT_BLOCK_STATE,
     NC_PROTO_EVENT_ACTIVE_SLOT,
     NC_PROTO_EVENT_PRESET_NAME,
+    NC_PROTO_EVENT_PRESET_MODELS,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
@@ -58,6 +59,11 @@ typedef struct {
     float synth_params[NC_PROTO_SYNTH_MAX_PARAMS];
 
     char name[13];
+
+    bool amp_model_known;
+    bool cab_model_known;
+    uint8_t amp_model;
+    uint8_t cab_model;
 } nanocore_protocol_event_t;
 
 esp_err_t nanocore_protocol_init(void);
@@ -66,6 +72,12 @@ void nanocore_protocol_set_connected(bool connected);
 /* Known-safe ToneCommand protocol operations captured from real hardware. */
 esp_err_t nanocore_protocol_request_live_state(void);
 esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
+
+/*
+ * Read the saved-preset footer that contains authoritative AMP/CAB model
+ * indices. Unlike live opcode 0x63, these values are the real 0..29 model ids.
+ */
+esp_err_t nanocore_protocol_request_preset_models(uint8_t slot);
 
 /*
  * Set one block's effect type using the same 0x6D live-edit command family
