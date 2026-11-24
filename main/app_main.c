@@ -1233,7 +1233,9 @@ void app_main(void)
         if (enc2) handle_encoder_delta(2, enc2);
 
         input_event_t e = INPUT_NONE;
-        if (input_manager_get_event(&e, pdMS_TO_TICKS(5))) {
+        TickType_t input_wait = pdMS_TO_TICKS(10);
+        if (input_wait < 1) input_wait = 1;
+        if (input_manager_get_event(&e, input_wait)) {
             handle_input(e);
         }
 
@@ -1256,5 +1258,10 @@ void app_main(void)
             s_notice[0] = '\0';
             render_ui();
         }
+
+        // Always give IDLE0 CPU time. On a 100 Hz FreeRTOS tick,
+        // pdMS_TO_TICKS(5) was zero and the previous loop could spin forever,
+        // tripping the task watchdog even while the controller appeared alive.
+        vTaskDelay(1);
     }
 }
