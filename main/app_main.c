@@ -326,7 +326,14 @@ static size_t editor_parameter_count(void)
 {
     const nanocore_effect_type_info_t *info =
         current_type_info(s_selected_block);
-    return 2 + (info ? info->expected_param_count : 0);
+    size_t count = 2 + (info ? info->expected_param_count : 0);
+
+    /* Preserve Stage-05 tempo utilities after the real Delay parameters. */
+    if (s_selected_block == BLOCK_DELAY && info) {
+        count += 2;  // TEMPO BPM, NOTE
+    }
+
+    return count;
 }
 
 static esp_err_t set_profile_param(controller_block_t block,
@@ -801,7 +808,37 @@ static void adjust_parameter(int delta)
 
     const nanocore_effect_type_info_t *info =
         current_type_info(s_selected_block);
-    if (!info || !info->params) return;
+    if (!info) return;
+
+    if (s_selected_block == BLOCK_DELAY) {
+        const size_t bpm_index = 2 + info->expected_param_count;
+        const size_t note_index = bpm_index + 1;
+
+        if (s_selected_parameter == bpm_index) {
+            int bpm = (int)s_preset.bpm + delta;
+            if (bpm < 30) bpm = 30;
+            if (bpm > 300) bpm = 300;
+
+            s_preset.bpm = (uint16_t)bpm;
+            tempo_engine_set_bpm(s_preset.bpm);
+            status_leds_set_bpm(s_preset.bpm);
+            s_dirty = true;
+            update_delay_from_tempo();
+            return;
+        }
+
+        if (s_selected_parameter == note_index) {
+            int sub = (int)s_preset.delay_subdivision + delta;
+            while (sub < 0) sub += DELAY_SUBDIV_COUNT;
+            while (sub >= DELAY_SUBDIV_COUNT) sub -= DELAY_SUBDIV_COUNT;
+
+            s_preset.delay_subdivision = (delay_subdivision_t)sub;
+            s_dirty = true;
+            update_delay_from_tempo();
+            return;
+        }
+    }
+    if (!info->params) return;
 
     uint8_t param_index =
         (uint8_t)(s_selected_parameter - 2);
@@ -1015,8 +1052,7 @@ static void render_ui(void)
         current_type_info(s_selected_block);
 
     u.editor_override = true;
-    u.editor_parameter_count =
-        2 + (info ? info->expected_param_count : 0);
+    u.editor_parameter_count = editor_parameter_count();
     u.editor_parameter_labels[0] = "ON/OFF";
     u.editor_parameter_labels[1] =
         nanocore_spec_editor_is_model_block(s_selected_block)
@@ -1029,6 +1065,15 @@ static void render_ui(void)
              ++i) {
             u.editor_parameter_labels[i + 2] =
                 info->params[i].name;
+        }
+
+        if (s_selected_block == BLOCK_DELAY) {
+            size_t bpm_index = 2 + info->expected_param_count;
+            size_t note_index = bpm_index + 1;
+            if (bpm_index < UI_MAX_EDITOR_PARAMETERS)
+                u.editor_parameter_labels[bpm_index] = "TEMPO BPM";
+            if (note_index < UI_MAX_EDITOR_PARAMETERS)
+                u.editor_parameter_labels[note_index] = "NOTE";
         }
     }
 
@@ -1069,6 +1114,21 @@ static void render_ui(void)
                 u.parameter_text = selected_type->name;
             }
         }
+    } else if (info && s_selected_block == BLOCK_DELAY &&
+               s_selected_parameter ==
+                   (size_t)(2 + info->expected_param_count)) {
+        u.parameter_known = true;
+        snprintf(parameter_text, sizeof(parameter_text),
+                 "%u BPM", s_preset.bpm);
+        u.parameter_text = parameter_text;
+    } else if (info && s_selected_block == BLOCK_DELAY &&
+               s_selected_parameter ==
+                   (size_t)(3 + info->expected_param_count)) {
+        u.parameter_known = true;
+        snprintf(parameter_text, sizeof(parameter_text), "%s",
+                 tempo_engine_subdivision_name(
+                     s_preset.delay_subdivision));
+        u.parameter_text = parameter_text;
     } else if (info && info->params) {
         uint8_t param_index =
             (uint8_t)(s_selected_parameter - 2);
