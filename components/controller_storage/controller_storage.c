@@ -294,3 +294,37 @@ esp_err_t controller_storage_base_mode_save(uint8_t preset, bool synth)
     nvs_close(h);
     return rc;
 }
+
+/* Controller-local per-preset input gain: pedal 0x65/0x66 is global. */
+esp_err_t controller_storage_base_gain_load(uint8_t preset, int8_t *db)
+{
+    if(!db || preset>=CTRL_PRESET_COUNT) return ESP_ERR_INVALID_ARG;
+    if(!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t h;
+    esp_err_t rc=nvs_open_from_partition(SCENE_PARTITION,SCENE_NAMESPACE,NVS_READONLY,&h);
+    if(rc!=ESP_OK) return rc;
+    char key[12];
+    snprintf(key,sizeof(key),"p%02u_gain",(unsigned)preset);
+    uint8_t code=0;
+    rc=nvs_get_u8(h,key,&code);
+    nvs_close(h);
+    if(rc!=ESP_OK) return rc;
+    if(code<1 || code>41) return ESP_ERR_INVALID_ARG;
+    *db=(int8_t)((int)code-21);
+    return ESP_OK;
+}
+
+esp_err_t controller_storage_base_gain_save(uint8_t preset, int8_t db)
+{
+    if(preset>=CTRL_PRESET_COUNT || db < -20 || db > 20) return ESP_ERR_INVALID_ARG;
+    if(!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t h;
+    esp_err_t rc=nvs_open_from_partition(SCENE_PARTITION,SCENE_NAMESPACE,NVS_READWRITE,&h);
+    if(rc!=ESP_OK) return rc;
+    char key[12];
+    snprintf(key,sizeof(key),"p%02u_gain",(unsigned)preset);
+    rc=nvs_set_u8(h,key,(uint8_t)((int)db+21));
+    if(rc==ESP_OK) rc=nvs_commit(h);
+    nvs_close(h);
+    return rc;
+}

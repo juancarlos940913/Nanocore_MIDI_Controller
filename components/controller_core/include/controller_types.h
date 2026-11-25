@@ -86,7 +86,8 @@ typedef struct {
      * volume_valid=0 means inherit physical base, 1 means explicit 0..100. */
     uint8_t volume_valid;
     uint8_t preset_volume;
-    uint8_t reserved[1];
+    /* 0 = legacy/inherit; 1..41 encode -20..+20 dB as db+21. */
+    uint8_t gain_code;
     char name[CTRL_NAME_LEN];
     controller_scene_block_t block[BLOCK_COUNT];
     float synth_params[CTRL_PROFILE_SYNTH_PARAMS];

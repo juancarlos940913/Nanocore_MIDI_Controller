@@ -359,7 +359,7 @@ static void levels_screen(const display_ui_state_t *s)
     char buf[48];
     fill_rect(18,108,444,54,s->levels_row==0?C_PANEL2:C_PANEL);
     rect(18,108,444,54,s->levels_row==0?C_CYAN:C_MUTED,2);
-    text(30,119,"GLOBAL INPUT",C_WHITE,2);
+    text(30,119,"INPUT GAIN",C_WHITE,2);
     if(s->levels_known) snprintf(buf,sizeof(buf),"%d dB",(int)s->input_gain_db);
     else snprintf(buf,sizeof(buf),"UNKNOWN");
     text(300,119,buf,s->levels_known?C_GREEN:C_YELLOW,2);

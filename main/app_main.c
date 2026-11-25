@@ -160,6 +160,10 @@ static uint8_t s_volume_target;
 static int64_t s_volume_deadline;
 static bool s_base_volume_known;
 static uint8_t s_base_volume;
+static bool s_base_gain_known;
+static int8_t s_base_gain_db;
+static int8_t s_gain_capture_db;
+static int8_t s_gain_target_db;
 static int8_t s_input_gain_db;
 static uint16_t s_levels_seq;
 static int64_t s_levels_deadline;
@@ -185,7 +189,9 @@ static bool s_name_target_scene;
 /* Main-task scene transaction. Legacy preset blobs remain unchanged. */
 typedef enum {
     SCENE_IDLE = 0, SCENE_MODE_EDIT, SCENE_MODE_RECALL,
-    SCENE_VERIFY, SCENE_SAVE, SCENE_BASE_RESTORE, SCENE_BASE_SAVE
+    SCENE_VERIFY, SCENE_SAVE, SCENE_BASE_RESTORE, SCENE_BASE_SAVE,
+    SCENE_GAIN_SAVE, SCENE_BASE_GAIN_SAVE, SCENE_GAIN_READ, SCENE_GAIN_WRITE,
+    SCENE_BASE_GAIN_READ, SCENE_BASE_GAIN_WRITE
 } scene_phase_t;
 static scene_phase_t s_scene_phase;
 static bool s_scene_after_models;
@@ -246,6 +252,7 @@ static void sound_edit_begin(void)
     memset(p,0,sizeof(*p));
     p->volume_valid=s_level_raw_known;
     p->preset_volume=s_level_raw;
+    p->gain_code=s_levels_known?(uint8_t)((int)s_input_gain_db+21):0;
     p->synth_mode=s_synth_mode;
     p->synth_on=s_synth_voice_on;
     p->synth_voice=s_synth_voice;
@@ -274,7 +281,8 @@ static void sound_edit_confirm(const nanocore_protocol_event_t *e)
     s_dirty=true;
     if(!s_sound_origin_valid || e->synth_mode!=s_sound_origin.synth_mode) return;
     const controller_scene_profile_t *p=&s_sound_origin;
-    bool same=(!p->volume_valid || e->live_header_byte==p->preset_volume) &&
+    bool same=(!p->gain_code || (s_levels_known && (int)s_input_gain_db==(int)p->gain_code-21)) &&
+        (!p->volume_valid || e->live_header_byte==p->preset_volume) &&
         e->synth_known && e->synth_on==p->synth_on &&
         e->synth_variant==p->synth_voice && e->synth_param_count==p->synth_count &&
         sound_vector_equal(e->synth_params,p->synth_params,p->synth_count);
@@ -1194,6 +1202,7 @@ static void scene_load_names(void)
 {
     s_base_mode_known = controller_storage_base_mode_load(s_runtime.current_preset,
                                                           &s_base_mode) == ESP_OK;
+    s_base_gain_known=controller_storage_base_gain_load(s_runtime.current_preset,&s_base_gain_db)==ESP_OK;
     memset(s_scene_saved, 0, sizeof(s_scene_saved));
     for (uint8_t i = 0; i < CTRL_SCENE_COUNT; ++i) {
         esp_err_t rc = controller_storage_scene_load(
@@ -1220,7 +1229,7 @@ static bool scene_values_valid(const float *p, uint8_t count)
 
 static bool scene_profile_valid(const controller_scene_profile_t *p)
 {
-    if (p->version != CTRL_PROFILE_VERSION || p->synth_mode > 1 ||
+    if (p->version != CTRL_PROFILE_VERSION || p->gain_code>41 || p->synth_mode > 1 ||
         p->synth_on > 1 || p->volume_valid>1 ||
         (p->volume_valid && p->preset_volume>100)) return false;
     if (p->synth_mode) {
@@ -1250,7 +1259,9 @@ static void scene_fail(const char *notice)
     /* A rejected save must leave the editor usable so a bad type (e.g.
      * a hidden drive in Synth) can be corrected. Recall faults lock edits
      * until an explicit retry or another scene/mode selection. */
-    bool save_failed = s_scene_phase == SCENE_SAVE || s_scene_phase == SCENE_BASE_SAVE;
+    bool save_failed = s_scene_phase == SCENE_SAVE || s_scene_phase == SCENE_BASE_SAVE ||
+        s_scene_phase==SCENE_GAIN_SAVE || s_scene_phase==SCENE_BASE_GAIN_SAVE;
+    if(s_scene_phase>=SCENE_GAIN_SAVE) { s_levels_known=false; s_levels_write_ready=false; }
     s_scene_phase = SCENE_IDLE;
     s_scene_after_models = false;
     s_scene_fault = !save_failed;
@@ -1274,6 +1285,20 @@ static bool scene_start_read(scene_phase_t phase)
         return false;
     }
     s_scene_deadline = esp_timer_get_time() + 3000000LL;
+    return true;
+}
+
+/* All gain phases share the scene transaction lock and sequence/deadline.
+ * Save reads actual device state; recall reads before deciding whether to write. */
+static bool scene_gain_start(scene_phase_t phase)
+{
+    s_scene_phase=phase;
+    catalog_defer(CATALOG_IDLE_MS);
+    if(nanocore_protocol_request_global_levels(&s_scene_seq)!=ESP_OK) {
+        scene_fail("INPUT GAIN READ FAILED");
+        return false;
+    }
+    s_scene_deadline=esp_timer_get_time()+3000000LL;
     return true;
 }
 
@@ -1451,9 +1476,8 @@ static void scene_request_save(void)
         return;
     }
     s_scene_read_retries = 0;
-    s_scene_phase = SCENE_SAVE;
     show_notice("CAPTURING SCENE");
-    (void)scene_start_read(SCENE_SAVE);
+    (void)scene_gain_start(SCENE_GAIN_SAVE);
 }
 
 static void scene_save_from_live(const nanocore_protocol_event_t *e)
@@ -1468,6 +1492,7 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
     p->version = CTRL_PROFILE_VERSION;
     p->volume_valid=1;
     p->preset_volume=e->live_header_byte;
+    p->gain_code=(uint8_t)((int)s_gain_capture_db+21);
     p->synth_mode = e->synth_mode;
     p->synth_on = e->synth_on;
     p->synth_voice = e->synth_variant;
@@ -1515,7 +1540,83 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
              s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
              p->synth_mode, p->name);
     ESP_LOGI(TAG,"SCENE|VOLUME_SAVED|value=%u",p->preset_volume);
+    ESP_LOGI(TAG,"SCENE|GAIN_SAVED|db=%d",(int)s_gain_capture_db);
     show_notice("SCENE SAVED TO CONTROLLER");
+}
+
+static void scene_finish_ready(void)
+{
+        s_scene_phase = SCENE_IDLE;
+        s_scene_fault = false;
+        clear_edit_dirty();
+        s_scene_verified_models = !s_scene_profile.synth_mode &&
+                                  s_amp_model_known && s_cab_model_known;
+        s_preset.active_scene = s_runtime.current_scene;
+        (void)persist_runtime();
+        ESP_LOGI(TAG,"SCENE|LATENCY|ms=%lu",(unsigned long)((esp_timer_get_time()-s_scene_started_us)/1000));
+        ESP_LOGI(TAG, "SCENE|READY|preset=%u|scene=%c|mode=%u|name=%s",
+                 s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
+                 s_scene_profile.synth_mode, s_scene_profile.name);
+        if(s_scene_profile.volume_valid) ESP_LOGI(TAG,"SCENE|VOLUME_OK|value=%u",s_level_raw);
+        ESP_LOGI(TAG,"SCENE|GAIN_OK|db=%d",(int)s_input_gain_db);
+        show_notice("SCENE READY");
+}
+
+static void base_finish_recall(void)
+{
+    s_scene_phase=SCENE_IDLE;
+    s_scene_fault=false;
+    clear_edit_dirty();
+    ESP_LOGI(TAG,"BASE|GAIN_OK|db=%d",(int)s_input_gain_db);
+    if(s_name_after_live) {
+        if(s_runtime.mode==CTRL_MODE_SCENE) {
+            s_scene_after_models=true;
+            s_scene_base_deadline=esp_timer_get_time()+5000000LL;
+        }
+        s_name_after_live=false;
+        (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
+    }
+    render_ui();
+}
+
+static void scene_handle_gain(const nanocore_protocol_event_t *e)
+{
+    if(e->global_push || e->global_seq!=s_scene_seq) return;
+    scene_phase_t phase=s_scene_phase;
+    s_levels_known=true;
+    s_levels_write_ready=true;
+    s_input_gain_db=e->input_gain_db;
+    if(phase==SCENE_GAIN_SAVE || phase==SCENE_BASE_GAIN_SAVE) {
+        s_gain_capture_db=e->input_gain_db;
+        (void)scene_start_read(phase==SCENE_GAIN_SAVE?SCENE_SAVE:SCENE_BASE_SAVE);
+        return;
+    }
+    bool base=phase==SCENE_BASE_GAIN_READ || phase==SCENE_BASE_GAIN_WRITE;
+    if(phase==SCENE_GAIN_READ || phase==SCENE_BASE_GAIN_READ) {
+        if(base && !s_base_gain_known) {
+            /* Legacy preset: capture actual global level in RAM, no implicit NVS write. */
+            s_base_gain_db=e->input_gain_db;
+            s_base_gain_known=true;
+        }
+        s_gain_target_db=base?s_base_gain_db:
+            (s_scene_profile.gain_code?(int8_t)((int)s_scene_profile.gain_code-21):
+             (s_base_gain_known?s_base_gain_db:e->input_gain_db));
+        if(s_gain_target_db!=e->input_gain_db) {
+            s_scene_phase=base?SCENE_BASE_GAIN_WRITE:SCENE_GAIN_WRITE;
+            if(nanocore_protocol_set_input_gain(s_gain_target_db,&s_scene_seq)!=ESP_OK) {
+                scene_fail("INPUT GAIN TX FAILED");
+                return;
+            }
+            s_scene_deadline=esp_timer_get_time()+3000000LL;
+            ESP_LOGI(TAG,"%s|GAIN_TX|db=%d",base?"BASE":"SCENE",(int)s_gain_target_db);
+            return;
+        }
+    } else if(e->input_gain_db!=s_gain_target_db) {
+        ESP_LOGW(TAG,"GAIN|MISMATCH|wanted=%d|read=%d",(int)s_gain_target_db,(int)e->input_gain_db);
+        scene_fail("INPUT GAIN NOT CONFIRMED");
+        return;
+    }
+    if(base) base_finish_recall(); else scene_finish_ready();
 }
 
 static void scene_handle_live(const nanocore_protocol_event_t *e)
@@ -1534,11 +1635,8 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
         }
         ESP_LOGI(TAG, "SCENE|MODE_OK|mode=%u", e->synth_mode);
         if (phase == SCENE_BASE_RESTORE) {
-            s_scene_phase = SCENE_IDLE;
-            s_scene_fault = false;
-            clear_edit_dirty();
             ESP_LOGI(TAG,"BASE|MODE_RESTORED|mode=%u",e->synth_mode);
-            show_notice(e->synth_mode ? "PRESET SYNTH MODE" : "PRESET GUITAR MODE");
+            (void)scene_gain_start(SCENE_BASE_GAIN_READ);
         } else if (phase == SCENE_MODE_EDIT) {
             s_scene_phase = SCENE_IDLE;
             s_scene_fault = false;
@@ -1556,19 +1654,8 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
             scene_fail("SCENE VERIFY FAILED");
             return;
         }
-        s_scene_phase = SCENE_IDLE;
-        s_scene_fault = false;
-        clear_edit_dirty();
-        s_scene_verified_models = !s_scene_profile.synth_mode &&
-                                  s_amp_model_known && s_cab_model_known;
-        s_preset.active_scene = s_runtime.current_scene;
-        (void)persist_runtime();
-        ESP_LOGI(TAG,"SCENE|LATENCY|ms=%lu",(unsigned long)((esp_timer_get_time()-s_scene_started_us)/1000));
-        ESP_LOGI(TAG, "SCENE|READY|preset=%u|scene=%c|mode=%u|name=%s",
-                 s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
-                 s_scene_profile.synth_mode, s_scene_profile.name);
-        if(s_scene_profile.volume_valid) ESP_LOGI(TAG,"SCENE|VOLUME_OK|value=%u",e->live_header_byte);
-        show_notice("SCENE READY");
+        /* Verify gain as a separate global transaction before READY. */
+        (void)scene_gain_start(SCENE_GAIN_READ);
     } else if (phase == SCENE_SAVE) {
         scene_save_from_live(e);
     } else if (phase == SCENE_BASE_SAVE) {
@@ -2171,9 +2258,8 @@ static void commit_name_and_save(void)
     /* Confirm the active physical slot and sound mode before a real SAVE. */
     s_scene_target_mode=s_synth_mode;
     s_scene_read_retries=0;
-    s_scene_phase=SCENE_BASE_SAVE;
     queue_notice("CHECKING PRESET");
-    (void)scene_start_read(SCENE_BASE_SAVE);
+    (void)scene_gain_start(SCENE_BASE_GAIN_SAVE);
 }
 
 static void commit_base_save(void)
@@ -2231,6 +2317,15 @@ static void commit_base_save(void)
         show_notice("PEDAL SAVED / MODE NVS ERROR");
         return;
     }
+    rc=controller_storage_base_gain_save(s_runtime.current_preset,s_gain_capture_db);
+    if(rc!=ESP_OK) {
+        ESP_LOGW(TAG,"BASE|GAIN_STORE_FAILED|%s",esp_err_to_name(rc));
+        show_notice("PEDAL SAVED / GAIN NVS ERROR");
+        return;
+    }
+    s_base_gain_known=true;
+    s_base_gain_db=s_gain_capture_db;
+    ESP_LOGI(TAG,"BASE|GAIN_SAVED|db=%d",(int)s_base_gain_db);
     s_base_volume_known=s_level_raw_known;
     s_base_volume=s_level_raw;
     ESP_LOGI(TAG,"BASE|VOLUME_SAVED|value=%u",s_base_volume);
@@ -2783,6 +2878,7 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
                 !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
             int next=(int)s_input_gain_db+(delta>0?1:-1);
             if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
+                mark_edit_dirty();
                 s_levels_wait=true;
                 s_levels_write_pending=true;
                 s_levels_target_db=(int8_t)next;
@@ -2852,7 +2948,8 @@ static void handle_input(input_event_t e)
         /* Avoid a full TFT redraw during a pending read; allow a deliberate
          * next/previous scene command to be consumed once recall finishes. */
         if (s_runtime.mode==CTRL_MODE_SCENE && !s_dirty &&
-            (s_scene_phase==SCENE_MODE_RECALL || s_scene_phase==SCENE_VERIFY)) {
+            (s_scene_phase==SCENE_MODE_RECALL || s_scene_phase==SCENE_VERIFY ||
+             s_scene_phase==SCENE_GAIN_READ || s_scene_phase==SCENE_GAIN_WRITE)) {
             if(e==INPUT_FS_TOP_LEFT) s_pending_scene_delta=(s_pending_scene_delta-1)%CTRL_SCENE_COUNT;
             if(e==INPUT_FS_TOP_RIGHT) s_pending_scene_delta=(s_pending_scene_delta+1)%CTRL_SCENE_COUNT;
         }
@@ -3137,6 +3234,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
     switch (e->type) {
     case NC_PROTO_EVENT_GLOBAL_LEVELS:
+        if(s_scene_phase>=SCENE_GAIN_SAVE) {
+            scene_handle_gain(e);
+            break;
+        }
         if(!e->global_push && s_levels_wait && e->global_seq==s_levels_seq) {
             s_levels_wait=false;
             s_levels_known=true;
@@ -3150,12 +3251,15 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             } else ESP_LOGI(TAG,"LEVEL|CONFIRMED|input_db=%d",(int)s_input_gain_db);
             s_levels_write_pending=false;
         } else if(e->global_push && !s_levels_wait) {
+            if(s_levels_known && s_input_gain_db!=e->input_gain_db && !scene_busy() && !s_recall_pending)
+                mark_edit_dirty();
             s_levels_known=true;
             s_input_gain_db=e->input_gain_db;
         }
         if(s_screen==UI_SCREEN_LEVELS) render_ui();
         break;
     case NC_PROTO_EVENT_LIVE_STATE: {
+        if(s_scene_phase>=SCENE_GAIN_SAVE) break;
         bool was_recall = s_recall_pending;
         bool probe=s_slot_probe_inflight && e->live_seq==s_slot_probe_seq;
         if(probe) {
@@ -3312,17 +3416,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         /* Avoid a complete TFT redraw before sending scene commands. */
         if (s_scene_phase != SCENE_IDLE) {
-            scene_phase_t completed = s_scene_phase;
             scene_handle_live(e);
-            if (completed == SCENE_BASE_RESTORE && s_scene_phase == SCENE_IDLE &&
-                !s_scene_fault && s_name_after_live) {
-                if(s_runtime.mode==CTRL_MODE_SCENE) {
-                    s_scene_after_models=true;
-                    s_scene_base_deadline=esp_timer_get_time()+5000000LL;
-                }
-                s_name_after_live = false;
-                (void)nanocore_protocol_request_preset_name(s_runtime.current_preset);
-            }
             break;
         }
 
@@ -3341,6 +3435,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                 } else scene_fail("PRESET MODE TX FAILED");
                 break;
             }
+            (void)scene_gain_start(SCENE_BASE_GAIN_READ);
+            break;
         }
         render_ui();
 
@@ -3546,7 +3642,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10D / PRESET + SCENE VOLUME");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10E / PRESET + SCENE GAIN AND VOLUME");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 

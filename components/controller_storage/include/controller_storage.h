@@ -33,6 +33,8 @@ esp_err_t controller_storage_scene_save(uint8_t preset, uint8_t scene,
 /* Optional preset sound-mode preference, separate from scene profiles. */
 esp_err_t controller_storage_base_mode_load(uint8_t preset, bool *synth);
 esp_err_t controller_storage_base_mode_save(uint8_t preset, bool synth);
+esp_err_t controller_storage_base_gain_load(uint8_t preset, int8_t *db);
+esp_err_t controller_storage_base_gain_save(uint8_t preset, int8_t db);
 bool controller_assignment_get(const midi_assignment_t *items,
                                size_t count,
                                uint8_t cc,
