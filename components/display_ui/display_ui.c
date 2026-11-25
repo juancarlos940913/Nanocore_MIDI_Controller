@@ -229,7 +229,13 @@ static void footer(const display_ui_state_t *s)
              tempo_engine_subdivision_name(s->subdivision),
              s->tap_capture?"  TAP":"");
     text(12,296,buf,s->tap_capture?C_BLUE:C_MUTED,1);
-    text(300,296,"ENC1 SELECT  ENC2 BACK",C_MUTED,1);
+
+    if (s->mode == CTRL_MODE_STOMP &&
+        s->screen == UI_SCREEN_PERFORMANCE) {
+        text(215,296,"TL FX2  TR DLY  B1 MOD  B2 REV",C_MUTED,1);
+    } else {
+        text(300,296,"ENC1 SELECT  ENC2 BACK",C_MUTED,1);
+    }
 }
 
 static void performance(const display_ui_state_t *s)
@@ -278,7 +284,10 @@ static void block_editor(const display_ui_state_t *s)
              nanocore_block_name(s->selected_block));
     text(20,58,title,C_WHITE,2);
 
-    size_t count=nanocore_parameter_count(s->selected_block);
+    size_t count = s->editor_override
+        ? s->editor_parameter_count
+        : nanocore_parameter_count(s->selected_block);
+
     const size_t visible=8;
     size_t first=0;
     if(s->selected_parameter>=visible)
@@ -289,35 +298,71 @@ static void block_editor(const display_ui_state_t *s)
     const int start_y=98;
     for(size_t row=0;row<visible && first+row<count;++row){
         size_t i=first+row;
-        const nc_parameter_t *p=nanocore_parameter(s->selected_block,i);
+        const char *label = "?";
+
+        if (s->editor_override) {
+            if (i < UI_MAX_EDITOR_PARAMETERS &&
+                s->editor_parameter_labels[i]) {
+                label = s->editor_parameter_labels[i];
+            }
+        } else {
+            const nc_parameter_t *p =
+                nanocore_parameter(s->selected_block,i);
+            if (p && p->label) label = p->label;
+        }
+
         int y=start_y+(int)row*22;
         bool sel=i==s->selected_parameter;
         if(sel) fill_rect(16,y-3,260,20,C_PANEL2);
-        text(28,y,p?p->label:"?",sel?C_CYAN:C_MUTED,1);
+        text(28,y,label,sel?C_CYAN:C_MUTED,1);
     }
 
-    const nc_parameter_t *p=nanocore_parameter(
-        s->selected_block,s->selected_parameter);
-    if(p){
+    const nc_parameter_t *legacy_p = NULL;
+    const char *selected_label = s->selected_parameter_label;
+
+    if (!s->editor_override) {
+        legacy_p = nanocore_parameter(
+            s->selected_block,s->selected_parameter);
+        if (legacy_p) selected_label = legacy_p->label;
+    }
+
+    if(selected_label){
         char val[72];
-        if(p->kind==NC_PARAM_TEMPO_BPM){
+
+        if(!s->editor_override &&
+           legacy_p &&
+           legacy_p->kind==NC_PARAM_TEMPO_BPM){
             snprintf(val,sizeof(val),"%u BPM",s->bpm);
-        }else if(p->kind==NC_PARAM_TEMPO_SUBDIV){
+        }else if(!s->editor_override &&
+                 legacy_p &&
+                 legacy_p->kind==NC_PARAM_TEMPO_SUBDIV){
             snprintf(val,sizeof(val),"%s",
                      tempo_engine_subdivision_name(s->subdivision));
         }else if(s->parameter_known){
-            if(p->cc>=20 && p->cc<=28)
-                snprintf(val,sizeof(val),"%s",s->parameter_value>=64?"ON":"OFF");
-            else
-                snprintf(val,sizeof(val),"%u",(unsigned)s->parameter_value);
+            if(s->parameter_text && s->parameter_text[0]) {
+                snprintf(val,sizeof(val),"%s",s->parameter_text);
+            } else if(!s->editor_override &&
+                      legacy_p &&
+                      legacy_p->cc>=20 && legacy_p->cc<=28) {
+                snprintf(val,sizeof(val),"%s",
+                         s->parameter_value>=64?"ON":"OFF");
+            } else {
+                snprintf(val,sizeof(val),"%u",
+                         (unsigned)s->parameter_value);
+            }
         }else{
             snprintf(val,sizeof(val),"--");
         }
+
         fill_rect(300,92,150,70,C_PANEL);
-        rect(300,92,150,70,s->parameter_editing?C_YELLOW:C_PURPLE,2);
-        text_center(375,105,p->label,C_WHITE,1);
-        text_center(375,130,val,s->parameter_editing?C_YELLOW:C_WHITE,2);
+        rect(300,92,150,70,
+             s->parameter_editing?C_YELLOW:C_PURPLE,2);
+        text_center(375,105,selected_label,C_WHITE,1);
+        text_center(375,130,val,
+                    s->parameter_editing?C_YELLOW:C_WHITE,
+                    (s->parameter_text && s->parameter_text[0]) ? 1 : 2);
     }
+
     text(300,180,s->parameter_editing?"ENC2 CHANGE":"ENC1 PARAM",C_MUTED,1);
     text(300,200,"ENC1 CLICK EDIT",C_MUTED,1);
     text(300,220,"ENC2 CLICK BACK",C_MUTED,1);

@@ -40,8 +40,8 @@
 
 // Footswitch layout
 // Bottom row, left -> right
-#define BOARD_FS_BOTTOM_1       18   // preset down / delete in name editor
-#define BOARD_FS_BOTTOM_2       21   // preset up / cancel in name editor
+#define BOARD_FS_BOTTOM_1       21   // physical bottom #2 after wiring validation
+#define BOARD_FS_BOTTOM_2       18   // physical bottom #1 after wiring validation
 #define BOARD_FS_BOTTOM_3       47   // mode short / tap-tempo long
 
 // Top row

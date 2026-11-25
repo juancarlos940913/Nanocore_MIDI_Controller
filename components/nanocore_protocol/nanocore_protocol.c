@@ -53,6 +53,15 @@ static QueueHandle_t s_events;
 static SemaphoreHandle_t s_save_ack;
 static TaskHandle_t s_ping_task;
 
+/*
+ * nanocore_protocol_event_t became intentionally large in Stage 06 because
+ * a LIVE event carries every block's float parameters. Do NOT place it on
+ * the BLE/system event task stack. The BLE callback path is serialized, so
+ * one static scratch object is sufficient; queue_event() copies it into the
+ * FreeRTOS queue before the next parse reuses it.
+ */
+static nanocore_protocol_event_t s_event_scratch;
+
 static volatile bool s_connected;
 static uint8_t s_seq;
 static volatile uint8_t s_wait_save_slot = 0xFF;
@@ -68,11 +77,26 @@ typedef struct {
 
 static reassembly_t s_reassembly;
 
+static float read_float32_le(const uint8_t *p)
+{
+    float value = 0.0f;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
 static uint8_t next_seq(void)
 {
     s_seq = (uint8_t)((s_seq + 1) & 0x7F);
     if (s_seq == 0) s_seq = 1;
     return s_seq;
+}
+
+static nanocore_protocol_event_t *scratch_event(
+    nanocore_protocol_event_type_t type)
+{
+    memset(&s_event_scratch, 0, sizeof(s_event_scratch));
+    s_event_scratch.type = type;
+    return &s_event_scratch;
 }
 
 static void queue_event(const nanocore_protocol_event_t *e)
@@ -127,6 +151,128 @@ static esp_err_t send_short_command(uint8_t opcode)
         opcode, 0x00, 0x00, 0x00, 0xF7
     };
     return nanocore_midi_send_sysex(msg, sizeof(msg));
+}
+
+static esp_err_t send_type_prime(void)
+{
+    /*
+     * ToneCommand sends this field-0 prime immediately before every
+     * set-block-type command.
+     */
+    uint8_t msg[] = {
+        0xF0, NC_MFR, NC_TAG_N, NC_TAG_C,
+        NC_DIR_HOST, 0x00, 0x02, next_seq(), 0x00,
+        OP_SET_FIELD, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0xF7
+    };
+    return nanocore_midi_send_sysex(msg, sizeof(msg));
+}
+
+static esp_err_t send_block_type(controller_block_t block,
+                                 uint8_t type_id,
+                                 const float *defaults,
+                                 uint8_t count)
+{
+    if (block >= BLOCK_COUNT ||
+        count > NC_PROTO_MAX_PARAMS ||
+        (count > 0 && !defaults)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t logical[4 + NC_PROTO_MAX_PARAMS * 4] = {0};
+    size_t logical_len = 0;
+
+    logical[logical_len++] = 0x02;
+    logical[logical_len++] = (uint8_t)block;
+    logical[logical_len++] = type_id & 0x7F;
+    logical[logical_len++] = count & 0x7F;
+
+    for (uint8_t i = 0; i < count; ++i) {
+        uint8_t raw[sizeof(float)] = {0};
+        memcpy(raw, &defaults[i], sizeof(raw));
+        memcpy(&logical[logical_len], raw, sizeof(raw));
+        logical_len += sizeof(raw);
+    }
+
+    uint8_t packed[64] = {0};
+    size_t packed_len = pack7(logical, logical_len,
+                              packed, sizeof(packed));
+    if (!packed_len) return ESP_FAIL;
+
+    uint8_t msg[96] = {0};
+    size_t pos = 0;
+    msg[pos++] = 0xF0;
+    msg[pos++] = NC_MFR;
+    msg[pos++] = NC_TAG_N;
+    msg[pos++] = NC_TAG_C;
+    msg[pos++] = NC_DIR_HOST;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x02;
+    msg[pos++] = next_seq();
+    msg[pos++] = 0x00;
+    msg[pos++] = OP_SET_FIELD;
+    msg[pos++] = 0x00;
+    msg[pos++] = (uint8_t)logical_len;
+    msg[pos++] = 0x00;
+    memcpy(&msg[pos], packed, packed_len);
+    pos += packed_len;
+    msg[pos++] = 0xF7;
+
+    ESP_LOGI(TAG,
+             "Set block type -> block=%u type=%u params=%u",
+             (unsigned)block, type_id, count);
+
+    return nanocore_midi_send_sysex(msg, pos);
+}
+
+static esp_err_t send_block_param(controller_block_t block,
+                                  uint8_t param_index,
+                                  float normalized)
+{
+    if (block >= BLOCK_COUNT || param_index >= NC_PROTO_MAX_PARAMS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+
+    uint8_t logical[7] = {
+        0x01,
+        (uint8_t)block,
+        param_index,
+        0, 0, 0, 0
+    };
+    memcpy(&logical[3], &normalized, sizeof(normalized));
+
+    uint8_t packed[8] = {0};
+    size_t packed_len = pack7(logical, sizeof(logical),
+                              packed, sizeof(packed));
+    if (!packed_len) return ESP_FAIL;
+
+    uint8_t msg[32] = {0};
+    size_t pos = 0;
+    msg[pos++] = 0xF0;
+    msg[pos++] = NC_MFR;
+    msg[pos++] = NC_TAG_N;
+    msg[pos++] = NC_TAG_C;
+    msg[pos++] = NC_DIR_HOST;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x02;
+    msg[pos++] = next_seq();
+    msg[pos++] = 0x00;
+    msg[pos++] = OP_SET_FIELD;
+    msg[pos++] = 0x00;
+    msg[pos++] = 0x07;
+    msg[pos++] = 0x00;
+    memcpy(&msg[pos], packed, packed_len);
+    pos += packed_len;
+    msg[pos++] = 0xF7;
+
+    ESP_LOGI(TAG,
+             "Set block param -> block=%u param=%u norm=%.6f",
+             (unsigned)block, param_index, (double)normalized);
+
+    return nanocore_midi_send_sysex(msg, pos);
 }
 
 static esp_err_t send_rename(const char *name)
@@ -189,17 +335,25 @@ static esp_err_t send_save(uint8_t slot)
     return nanocore_midi_send_sysex(msg, sizeof(msg));
 }
 
-static esp_err_t send_read_name_window(uint8_t slot)
+static esp_err_t send_read_preset_window(uint8_t slot,
+                                             uint16_t offset,
+                                             uint8_t length)
 {
-    /* Raw command body documented by ToneCommand captures:
-     * [02, seqLo, seqHi, 41,00, len=4,00, slot, offsetLo,offsetHi, length]
-     * Then 7-bit pack everything after F0 7D 4E 43 70.
+    /*
+     * ToneCommand window read:
+     * [02, seqLo, seqHi, 41,00, len=4,00,
+     *  slot, offsetLo, offsetHi, length]
+     *
+     * BLE replies carry at most 59 preset-data bytes per request.
      */
     uint8_t raw[] = {
         0x02, next_seq(), 0x00,
         OP_READ_PRESET, 0x00,
         0x04, 0x00,
-        slot, 0x00, 0x00, 59
+        slot,
+        (uint8_t)(offset & 0xFF),
+        (uint8_t)((offset >> 8) & 0xFF),
+        length
     };
     uint8_t packed[20] = {0};
     size_t packed_len = pack7(raw, sizeof(raw), packed, sizeof(packed));
@@ -216,88 +370,146 @@ static esp_err_t send_read_name_window(uint8_t slot)
     p += packed_len;
     msg[p++] = 0xF7;
 
+    ESP_LOGI(TAG, "Read preset window slot=%u offset=%u len=%u",
+             slot, offset, length);
     return nanocore_midi_send_sysex(msg, p);
+}
+
+static esp_err_t send_read_name_window(uint8_t slot)
+{
+    return send_read_preset_window(slot, 0, 59);
 }
 
 static void parse_name_payload(const uint8_t *payload, size_t len)
 {
-    static const uint8_t anchor[] = {0x02,0x07,0x00,0x02,0x10};
+    if (!payload || len < 8) return;
 
-    if (!payload || len < sizeof(anchor) + 3) return;
-
-    uint8_t slot = payload[0];
+    const uint8_t slot = payload[0];
     size_t anchor_pos = SIZE_MAX;
-    for (size_t i = 0; i + sizeof(anchor) <= len; ++i) {
-        if (memcmp(&payload[i], anchor, sizeof(anchor)) == 0) {
-            anchor_pos = i + sizeof(anchor);
+
+    /*
+     * Real 0x41 captures show the name tag as:
+     *
+     *   02 <record-length> 00 02 10 <ASCII name...>
+     *
+     * The second byte is NOT fixed:
+     *   factory/shorter names were observed with 0x07,
+     *   the user-written 8-char "ColdCln1" uses 0x08.
+     *
+     * Therefore match the structural bytes and deliberately ignore the
+     * variable length byte instead of hard-coding 0x07.
+     */
+    for (size_t i = 0; i + 5 <= len; ++i) {
+        if (payload[i]     == 0x02 &&
+            payload[i + 2] == 0x00 &&
+            payload[i + 3] == 0x02 &&
+            payload[i + 4] == 0x10) {
+            anchor_pos = i + 5;
             break;
         }
     }
+
     if (anchor_pos == SIZE_MAX) {
-        ESP_LOGW(TAG, "Preset name anchor not found in 0x41 payload len=%u",
+        ESP_LOGW(TAG,
+                 "Preset name tag not found in 0x41 payload len=%u",
                  (unsigned)len);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, len, ESP_LOG_INFO);
         return;
     }
 
-    /*
-     * Two name-field layouts have now been observed on real hardware:
-     *
-     *  A) already-unpacked/contiguous ASCII:
-     *       C l n A r p ...
-     *
-     *  B) the device's inner 7-bit-safe name field:
-     *       C l 00 n A r p ... [00 after the next 7 data bytes]
-     *
-     * The outer segmented BLE reply has already been unpacked, but a
-     * user-written name can still retain these *inner* packing-header bytes.
-     * Factory names such as "ClnArp" were observed in layout A, while
-     * readback after writing a 7-char name can use layout B.
-     *
-     * Auto-detect from byte +2: a NUL there cannot be a valid printable
-     * name character, so it unambiguously selects layout B.
-     */
     char name[13] = {0};
     size_t out = 0;
-    bool inner_packed =
-        (anchor_pos + 2 < len && payload[anchor_pos + 2] == 0x00);
 
-    for (size_t read = 0;
-         out < 12 && anchor_pos + read < len;
-         ++read) {
-
-        if (inner_packed && (read == 2 || read == 10)) {
-            continue;
-        }
-
-        uint8_t ch = payload[anchor_pos + read];
+    while (out < 12 && anchor_pos + out < len) {
+        const uint8_t ch = payload[anchor_pos + out];
         if (ch == 0) break;
         if (ch < 0x20 || ch > 0x7E) {
             ESP_LOGW(TAG,
-                     "Preset name decode rejected byte 0x%02X at +%u (anchor=%u packed=%u)",
-                     ch, (unsigned)read, (unsigned)anchor_pos,
-                     inner_packed ? 1 : 0);
-            size_t dump_start = anchor_pos > 8 ? anchor_pos - 8 : 0;
-            size_t dump_len = len - dump_start;
-            if (dump_len > 32) dump_len = 32;
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, &payload[dump_start],
-                                     dump_len, ESP_LOG_INFO);
+                     "Preset name invalid byte 0x%02X at index=%u",
+                     ch, (unsigned)out);
             return;
         }
-
         name[out++] = (char)ch;
     }
 
     if (!out) return;
 
-    nanocore_protocol_event_t e = {
-        .type = NC_PROTO_EVENT_PRESET_NAME,
-        .slot = slot,
-    };
-    memcpy(e.name, name, sizeof(e.name));
-    queue_event(&e);
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_PRESET_NAME);
+    e->slot = slot;
+    memcpy(e->name, name, sizeof(e->name));
+    queue_event(e);
 
     ESP_LOGI(TAG, "Preset %u name RX: %s", slot, name);
+}
+
+
+static bool parse_preset_window_header(const uint8_t *payload,
+                                       size_t len,
+                                       uint8_t *slot,
+                                       uint16_t *offset,
+                                       const uint8_t **data,
+                                       size_t *data_len)
+{
+    if (!payload || len < 5) return false;
+
+    if (slot) *slot = payload[0];
+    if (offset) {
+        *offset = (uint16_t)(payload[1] |
+                            ((uint16_t)payload[2] << 8));
+    }
+    if (data) *data = &payload[5];
+    if (data_len) *data_len = len - 5;
+    return true;
+}
+
+static void parse_models_payload(const uint8_t *payload, size_t len)
+{
+    uint8_t slot = 0;
+    uint16_t offset = 0;
+    const uint8_t *data = NULL;
+    size_t data_len = 0;
+
+    if (!parse_preset_window_header(payload, len,
+                                    &slot, &offset,
+                                    &data, &data_len)) {
+        return;
+    }
+
+    /*
+     * Saved-preset footer:
+     *   ... <AMP_INDEX> 21 01 <CAB_INDEX> 24 01 ...
+     *
+     * Both indices are plain 0..29 model ids.
+     */
+    for (size_t i = data_len; i-- > 1;) {
+        if (i + 4 >= data_len) continue;
+        if (data[i] == 0x21 &&
+            data[i + 1] == 0x01 &&
+            data[i + 3] == 0x24 &&
+            data[i + 4] == 0x01) {
+
+            const uint8_t amp = data[i - 1];
+            const uint8_t cab = data[i + 2];
+
+            nanocore_protocol_event_t *e =
+                scratch_event(NC_PROTO_EVENT_PRESET_MODELS);
+            e->slot = slot;
+            e->amp_model_known = amp < 30;
+            e->cab_model_known = cab < 30;
+            e->amp_model = amp;
+            e->cab_model = cab;
+            queue_event(e);
+
+            ESP_LOGI(TAG,
+                     "Preset models slot=%u offset=%u AMP=%u CAB=%u",
+                     slot, offset, amp, cab);
+            return;
+        }
+    }
+
+    ESP_LOGW(TAG,
+             "AMP/CAB footer not found slot=%u offset=%u data=%u",
+             slot, offset, (unsigned)data_len);
 }
 
 static void parse_live_payload(const uint8_t *p, size_t len)
@@ -308,48 +520,130 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         return;
     }
 
-    nanocore_protocol_event_t e = {
-        .type = NC_PROTO_EVENT_LIVE_STATE,
-        .slot = p[1],
-    };
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_LIVE_STATE);
+    e->slot = p[1];
 
     size_t pos = 3;
 
-    /* FX1: [on][type][count] + floats */
+    /*
+     * Reassembled live-profile block stream:
+     * FX1 [on][variant][count][count * float32LE], then
+     * FX2, AMP, CAB, DELAY, MOD, REVERB, EQ in the same shape.
+     *
+     * variant is kept RAW. Current firmware does not make AMP/CAB's raw
+     * variant byte a trustworthy live model id, and REV/EQ have historical
+     * encoding quirks. Stage 06 captures before translating.
+     */
+
     if (pos + 3 > len) return;
     uint8_t count = p[pos + 2];
-    if (count > 9 || pos + 3 + (size_t)count * 4 > len) return;
-    e.block_known[BLOCK_FX1] = true;
-    e.block_on[BLOCK_FX1] = p[pos] != 0;
-    pos += 3 + (size_t)count * 4;
-
-    /* The actual NanoCore serialization order is:
-     * FX2, AMP, CAB, DELAY, MOD, REVERB, EQ.
-     * Stage05.1's controller enum intentionally matches that order.
-     */
-    for (int block = BLOCK_FX2; block < BLOCK_COUNT; ++block) {
-        if (pos + 3 > len) return;
-        count = p[pos + 2];
-        uint8_t max_count = block == BLOCK_EQ ? 9 : 8;
-        if (count > max_count ||
-            pos + 3 + (size_t)count * 4 > len) {
-            return;
-        }
-
-        e.block_known[block] = true;
-        e.block_on[block] = p[pos] != 0;
-        pos += 3 + (size_t)count * 4;
+    if (count > NC_PROTO_MAX_PARAMS ||
+        pos + 3 + (size_t)count * 4 > len) {
+        ESP_LOGW(TAG, "Invalid FX1 live param count=%u len=%u",
+                 count, (unsigned)len);
+        return;
     }
 
-    queue_event(&e);
+    e->block_known[BLOCK_FX1] = true;
+    e->block_on[BLOCK_FX1] = p[pos] != 0;
+    e->block_profile_known[BLOCK_FX1] = true;
+    e->block_variant[BLOCK_FX1] = p[pos + 1];
+    e->block_param_count[BLOCK_FX1] = count;
+    pos += 3;
+
+    for (uint8_t i = 0; i < count; ++i, pos += 4) {
+        e->block_params[BLOCK_FX1][i] = read_float32_le(&p[pos]);
+    }
+
+    for (int block = BLOCK_FX2; block < BLOCK_COUNT; ++block) {
+        if (pos + 3 > len) {
+            ESP_LOGW(TAG, "Live profile ended before block=%d", block);
+            break;
+        }
+
+        const uint8_t on = p[pos];
+        const uint8_t variant = p[pos + 1];
+        count = p[pos + 2];
+        pos += 3;
+
+        /*
+         * Firmware 1.2 adds Ping Pong to every DELAY type. Duck now reports
+         * 9 live parameters, so all normal blocks must accept the full
+         * NC_PROTO_MAX_PARAMS capacity instead of the old hard limit of 8.
+         */
+        const uint8_t max_count = NC_PROTO_MAX_PARAMS;
+
+        if (count > max_count ||
+            pos + (size_t)count * 4 > len) {
+            ESP_LOGW(TAG,
+                     "Invalid live block=%d count=%u pos=%u len=%u",
+                     block, count, (unsigned)pos, (unsigned)len);
+            break;
+        }
+
+        e->block_known[block] = true;
+        e->block_on[block] = on != 0;
+        e->block_profile_known[block] = true;
+        e->block_variant[block] = variant;
+        e->block_param_count[block] = count;
+
+        for (uint8_t i = 0; i < count; ++i, pos += 4) {
+            e->block_params[block][i] = read_float32_le(&p[pos]);
+        }
+    }
+
+    /* Optional chain footer: 0x08 + permutation of block ids 0..7. */
+    if (pos + 9 <= len && p[pos] == 0x08) {
+        bool seen[BLOCK_COUNT] = {0};
+        bool valid = true;
+
+        for (int i = 0; i < BLOCK_COUNT; ++i) {
+            uint8_t id = p[pos + 1 + i];
+            if (id >= BLOCK_COUNT || seen[id]) {
+                valid = false;
+                break;
+            }
+            seen[id] = true;
+            e->chain_order[i] = id;
+        }
+
+        e->chain_order_known = valid;
+    }
+
+    /*
+     * Do not infer Synth Mode from the trailing bytes of the normal 0x63
+     * profile. The earlier Stage 06 heuristic produced a false SYNTH=ON in
+     * every normal preset. Dedicated Synth discovery will be implemented
+     * from a real Synth-mode capture later.
+     */
+
+
+    queue_event(e);
 
     ESP_LOGI(TAG,
              "LIVE slot=%u FX1=%u FX2=%u AMP=%u CAB=%u DEL=%u MOD=%u REV=%u EQ=%u",
-             e.slot,
-             e.block_on[BLOCK_FX1], e.block_on[BLOCK_FX2],
-             e.block_on[BLOCK_AMP], e.block_on[BLOCK_CAB],
-             e.block_on[BLOCK_DELAY], e.block_on[BLOCK_MOD],
-             e.block_on[BLOCK_REVERB], e.block_on[BLOCK_EQ]);
+             e->slot,
+             e->block_on[BLOCK_FX1], e->block_on[BLOCK_FX2],
+             e->block_on[BLOCK_AMP], e->block_on[BLOCK_CAB],
+             e->block_on[BLOCK_DELAY], e->block_on[BLOCK_MOD],
+             e->block_on[BLOCK_REVERB], e->block_on[BLOCK_EQ]);
+
+    ESP_LOGD(TAG,
+             "LIVE profile variants/counts: "
+             "FX1=%u/%u FX2=%u/%u AMP=%u/%u CAB=%u/%u "
+             "DEL=%u/%u MOD=%u/%u REV=%u/%u EQ=%u/%u SYN=%u/%u/%u",
+             e->block_variant[BLOCK_FX1], e->block_param_count[BLOCK_FX1],
+             e->block_variant[BLOCK_FX2], e->block_param_count[BLOCK_FX2],
+             e->block_variant[BLOCK_AMP], e->block_param_count[BLOCK_AMP],
+             e->block_variant[BLOCK_CAB], e->block_param_count[BLOCK_CAB],
+             e->block_variant[BLOCK_DELAY], e->block_param_count[BLOCK_DELAY],
+             e->block_variant[BLOCK_MOD], e->block_param_count[BLOCK_MOD],
+             e->block_variant[BLOCK_REVERB], e->block_param_count[BLOCK_REVERB],
+             e->block_variant[BLOCK_EQ], e->block_param_count[BLOCK_EQ],
+             e->synth_known ? 1 : 0,
+             e->synth_variant,
+             e->synth_param_count);
 }
 
 static void dispatch_complete_reply(uint16_t opcode,
@@ -359,7 +653,20 @@ static void dispatch_complete_reply(uint16_t opcode,
     if (opcode == OP_LIVE_STATE) {
         parse_live_payload(payload, len);
     } else if (opcode == OP_READ_PRESET) {
-        parse_name_payload(payload, len);
+        /*
+         * 0x41 replies echo slot + offset at payload[0..2].
+         * Offset 0 is our short name read; offset 200 is the saved-preset
+         * tail containing authoritative AMP/CAB model indices.
+         */
+        uint16_t offset = len >= 3
+            ? (uint16_t)(payload[1] | ((uint16_t)payload[2] << 8))
+            : 0xFFFF;
+
+        if (offset == 0) {
+            parse_name_payload(payload, len);
+        } else {
+            parse_models_payload(payload, len);
+        }
     } else if (opcode == OP_SAVE_PRESET &&
                s_wait_save_slot != 0xFF &&
                len > 0 &&
@@ -451,23 +758,21 @@ static void parse_push(const uint8_t *msg, size_t len)
             return;
         }
 
-        nanocore_protocol_event_t e = {
-            .type = NC_PROTO_EVENT_ACTIVE_SLOT,
-            .slot = raw_slot,
-        };
-        queue_event(&e);
-        ESP_LOGI(TAG, "Active slot push -> %u", e.slot);
+        nanocore_protocol_event_t *e =
+            scratch_event(NC_PROTO_EVENT_ACTIVE_SLOT);
+        e->slot = raw_slot;
+        queue_event(e);
+        ESP_LOGI(TAG, "Active slot push -> %u", e->slot);
     } else if (opcode == OP_BLOCK_STATE && len > 12) {
         uint8_t block_id = msg[11];
         if (block_id < BLOCK_COUNT) {
-            nanocore_protocol_event_t e = {
-                .type = NC_PROTO_EVENT_BLOCK_STATE,
-                .block = (controller_block_t)block_id,
-                .on = msg[12] != 0,
-            };
-            queue_event(&e);
+            nanocore_protocol_event_t *e =
+                scratch_event(NC_PROTO_EVENT_BLOCK_STATE);
+            e->block = (controller_block_t)block_id;
+            e->on = msg[12] != 0;
+            queue_event(e);
             ESP_LOGI(TAG, "Block push %u -> %s",
-                     block_id, e.on ? "ON" : "OFF");
+                     block_id, e->on ? "ON" : "OFF");
         }
     }
 }
@@ -522,6 +827,59 @@ esp_err_t nanocore_protocol_request_preset_name(uint8_t slot)
         return ESP_ERR_INVALID_STATE;
     }
     return send_read_name_window(slot);
+}
+
+esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
+{
+    if (!s_connected || slot >= CTRL_PRESET_COUNT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Real saved presets are ~265 bytes and the AMP/CAB footer lives near the
+     * tail of page 2. A real captured preset places AMP at absolute byte 258
+     * and the 0x21 footer marker at byte 259. Starting at 220 keeps the whole
+     * footer inside one BLE-capped 59-byte response (220..278) instead of
+     * splitting it exactly at the 59-byte boundary.
+     */
+    return send_read_preset_window(slot, 220, 59);
+}
+
+esp_err_t nanocore_protocol_set_block_type(
+    controller_block_t block,
+    uint8_t type_id,
+    const float *default_normalized,
+    uint8_t param_count)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t rc = send_type_prime();
+    if (rc != ESP_OK) return rc;
+
+    /*
+     * Keep a small gap between the prime and the type payload. On a 100 Hz
+     * tick this becomes one scheduler tick, which is still negligible to UI.
+     */
+    TickType_t gap = pdMS_TO_TICKS(4);
+    if (gap < 1) gap = 1;
+    vTaskDelay(gap);
+
+    return send_block_type(block, type_id,
+                           default_normalized, param_count);
+}
+
+esp_err_t nanocore_protocol_set_block_param(
+    controller_block_t block,
+    uint8_t param_index,
+    float normalized_value)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return send_block_param(block, param_index, normalized_value);
 }
 
 esp_err_t nanocore_protocol_rename_and_save(uint8_t slot,

@@ -9,7 +9,7 @@
 
 static const nc_parameter_t FX1[] = {
     P_MIDI("ON/OFF", 20, 0, 127),
-    P_MIDI("TYPE", 40, 0, 3),
+    P_MIDI("TYPE", 40, 0, 11),
     P_MIDI("GATE THR", 50, 0, 127),
     P_MIDI("COMP THR", 51, 0, 127),
     P_MIDI("RATIO", 52, 0, 127),
@@ -120,7 +120,7 @@ uint8_t nanocore_block_type_cc(controller_block_t b)
 
 uint8_t nanocore_block_type_max(controller_block_t b)
 {
-    static const uint8_t M[] = {3,10,127,127,7,4,6,2};
+    static const uint8_t M[] = {11,10,127,127,7,4,6,2};
     return b < BLOCK_COUNT ? M[b] : 127;
 }
 

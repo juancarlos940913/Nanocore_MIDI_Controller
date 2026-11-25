@@ -172,8 +172,10 @@ static void input_task(void *arg)
 
     bool save_chord_active = false;
     bool tuner_chord_active = false;
+    bool mapper_chord_active = false;
     TickType_t save_chord_start = 0;
     TickType_t tuner_chord_start = 0;
+    TickType_t mapper_chord_start = 0;
 
     while (1) {
         now = xTaskGetTickCount();
@@ -187,18 +189,20 @@ static void input_task(void *arg)
         if (encoder_click(&s_enc1, now)) emit(INPUT_ENC1_CLICK);
         if (encoder_click(&s_enc2, now)) emit(INPUT_ENC2_CLICK);
 
-        if (down.stable && tl.stable) {
+        // SAVE stays on physical bottom #1 + top-left. After the wiring
+        // correction, physical bottom #1 is the 'up' button object.
+        if (up.stable && tl.stable) {
             if (!save_chord_active) {
                 save_chord_active = true;
                 save_chord_start = now;
             }
             if ((now - save_chord_start) >= pdMS_TO_TICKS(CHORD_HOLD_MS) &&
-                !down.consumed && !tl.consumed) {
-                down.consumed = true;
+                !up.consumed && !tl.consumed) {
+                up.consumed = true;
                 tl.consumed = true;
                 emit(INPUT_CHORD_SAVE);
             }
-        } else if (!down.stable && !tl.stable) {
+        } else if (!up.stable && !tl.stable) {
             save_chord_active = false;
         }
 
@@ -215,6 +219,23 @@ static void input_task(void *arg)
             }
         } else if (!mode.stable && !tr.stable) {
             tuner_chord_active = false;
+        }
+
+        // Diagnostic Live Mapper: hold both top footswitches together.
+        // Both individual actions are consumed so no Scene/STOMP action leaks.
+        if (tl.stable && tr.stable) {
+            if (!mapper_chord_active) {
+                mapper_chord_active = true;
+                mapper_chord_start = now;
+            }
+            if ((now - mapper_chord_start) >= pdMS_TO_TICKS(CHORD_HOLD_MS) &&
+                !tl.consumed && !tr.consumed) {
+                tl.consumed = true;
+                tr.consumed = true;
+                emit(INPUT_CHORD_MAPPER);
+            }
+        } else if (!tl.stable && !tr.stable) {
+            mapper_chord_active = false;
         }
 
         if (mode.stable && !mode.consumed && !mode.long_fired &&

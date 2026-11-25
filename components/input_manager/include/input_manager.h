@@ -26,6 +26,7 @@ typedef enum {
 
     INPUT_CHORD_SAVE,
     INPUT_CHORD_TUNER,
+    INPUT_CHORD_MAPPER,
 } input_event_t;
 
 esp_err_t input_manager_init(void);
