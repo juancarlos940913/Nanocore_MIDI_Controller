@@ -63,3 +63,10 @@ without divider expect unknown (floating input can be unpredictable).
 Capture SUMMARY_RX for both types and CATALOG DONE, second boot
 CACHE_LOADED and names lose ~ as verified. No flash changes to pedal
 except explicit SAVE command.
+
+Base SAVE now requests a fresh sequence-matched 0x63 preflight (slot and
+mode) before sending physical rename/save. If mode changes during the
+preflight, reject without writing. Scene movement during verified recall
+or a catalog request is queued; no synchronous notice redraw mid-recall.
+If saved base model footer read times out after accepted preset LIVE,
+allow a full stored scene to apply using its own IDs instead of failing.

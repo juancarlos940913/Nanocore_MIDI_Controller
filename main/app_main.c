@@ -169,7 +169,7 @@ static bool s_name_target_scene;
 /* Main-task scene transaction. Legacy preset blobs remain unchanged. */
 typedef enum {
     SCENE_IDLE = 0, SCENE_MODE_EDIT, SCENE_MODE_RECALL,
-    SCENE_VERIFY, SCENE_SAVE, SCENE_BASE_RESTORE
+    SCENE_VERIFY, SCENE_SAVE, SCENE_BASE_RESTORE, SCENE_BASE_SAVE
 } scene_phase_t;
 static scene_phase_t s_scene_phase;
 static bool s_scene_after_models;
@@ -184,7 +184,6 @@ static controller_scene_profile_t s_scene_name_scratch;
 static bool s_scene_saved[CTRL_SCENE_COUNT];
 static bool s_base_mode_known;
 static bool s_base_mode;
-static bool s_base_mode_persisted;
 static bool s_scene_verified_models;
 static bool s_scene_force_models;
 static int64_t s_scene_started_us;
@@ -196,6 +195,7 @@ static bool scene_busy(void)
 static void apply_current_scene(void);
 static void scene_select_mode(bool synth);
 static void scene_request_save(void);
+static void commit_base_save(void);
 
 static void render_ui(void);
 
@@ -973,7 +973,6 @@ static void scene_load_names(void)
 {
     s_base_mode_known = controller_storage_base_mode_load(s_runtime.current_preset,
                                                           &s_base_mode) == ESP_OK;
-    s_base_mode_persisted = s_base_mode_known;
     memset(s_scene_saved, 0, sizeof(s_scene_saved));
     for (uint8_t i = 0; i < CTRL_SCENE_COUNT; ++i) {
         esp_err_t rc = controller_storage_scene_load(
@@ -1029,10 +1028,11 @@ static void scene_fail(const char *notice)
     /* A rejected save must leave the editor usable so a bad type (e.g.
      * a hidden drive in Synth) can be corrected. Recall faults lock edits
      * until an explicit retry or another scene/mode selection. */
-    bool save_failed = s_scene_phase == SCENE_SAVE;
+    bool save_failed = s_scene_phase == SCENE_SAVE || s_scene_phase == SCENE_BASE_SAVE;
     s_scene_phase = SCENE_IDLE;
     s_scene_after_models = false;
     s_scene_fault = !save_failed;
+    s_pending_scene_delta = 0;
     s_scene_verified_models = false;
     s_parameter_editing = false;
     show_notice(notice);
@@ -1331,6 +1331,15 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
         show_notice("SCENE READY");
     } else if (phase == SCENE_SAVE) {
         scene_save_from_live(e);
+    } else if (phase == SCENE_BASE_SAVE) {
+        if (!e->synth_mode_known || e->synth_mode != s_scene_target_mode) {
+            s_screen = UI_SCREEN_NAME_EDITOR;
+            scene_fail("PRESET MODE CHANGED - CHECK");
+            return;
+        }
+        s_scene_phase = SCENE_IDLE;
+        s_scene_fault = false;
+        commit_base_save();
     }
 }
 
@@ -1508,7 +1517,7 @@ static void change_scene(int delta)
 static void cycle_mode(void)
 {
     if (scene_busy() || s_recall_pending || s_recall_poll_inflight ||
-        (s_dirty && s_runtime.mode != CTRL_MODE_PRESET)) {
+        s_catalog_inflight || (s_dirty && s_runtime.mode != CTRL_MODE_PRESET)) {
         show_notice("SAVE CHANGES / WAIT SYNC");
         return;
     }
@@ -1857,12 +1866,26 @@ static void cancel_name_editor(void)
 static void commit_name_and_save(void)
 {
     if (!s_name_editor.active) return;
-
     if (s_name_target_scene) {
         scene_request_save();
         return;
     }
+    if (!s_midi_ready || !s_synth_mode_known || scene_busy() ||
+        s_recall_pending || s_catalog_inflight || s_scene_fault) {
+        show_notice("WAIT LIVE SYNC / NOT SAVED");
+        return;
+    }
+    /* Confirm the active physical slot and sound mode before a real SAVE. */
+    s_scene_target_mode=s_synth_mode;
+    s_scene_read_retries=0;
+    s_scene_phase=SCENE_BASE_SAVE;
+    queue_notice("CHECKING PRESET");
+    (void)scene_start_read(SCENE_BASE_SAVE);
+}
 
+static void commit_base_save(void)
+{
+    if (!s_name_editor.active || s_name_target_scene) return;
     /*
      * NanoCore's real preset-name write limit is 8 characters.
      * Keep the controller's mirror identical to what the pedal stores.
@@ -1910,7 +1933,6 @@ static void commit_name_and_save(void)
     s_base_mode = s_synth_mode;
     s_base_mode_known = true;
     rc = controller_storage_base_mode_save(s_runtime.current_preset, s_base_mode);
-    s_base_mode_persisted = rc == ESP_OK;
     if (rc != ESP_OK) {
         ESP_LOGW(TAG,"BASE|MODE_STORE_FAILED|%s",esp_err_to_name(rc));
         show_notice("PEDAL SAVED / MODE NVS ERROR");
@@ -2491,7 +2513,13 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
 static void handle_input(input_event_t e)
 {
     if (scene_busy()) {
-        show_notice("WAIT SCENE SYNC");
+        /* Avoid a full TFT redraw during a pending read; allow a deliberate
+         * next/previous scene command to be consumed once recall finishes. */
+        if (s_runtime.mode==CTRL_MODE_SCENE && !s_dirty &&
+            (s_scene_phase==SCENE_MODE_RECALL || s_scene_phase==SCENE_VERIFY)) {
+            if(e==INPUT_FS_TOP_LEFT) s_pending_scene_delta=(s_pending_scene_delta-1)%CTRL_SCENE_COUNT;
+            if(e==INPUT_FS_TOP_RIGHT) s_pending_scene_delta=(s_pending_scene_delta+1)%CTRL_SCENE_COUNT;
+        }
         return;
     }
     if (s_synmap_enabled) {
@@ -2789,7 +2817,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                 s_selected_block = BLOCK_FX1;
                 s_selected_parameter = 0;
                 s_parameter_editing = false;
-                s_screen = UI_SCREEN_PERFORMANCE;
+                if (s_scene_phase != SCENE_BASE_SAVE && s_scene_phase != SCENE_SAVE)
+                    s_screen = UI_SCREEN_PERFORMANCE;
                 if (s_synth_mode && tempo_engine_tap_active()) {
                     tempo_engine_cancel_tap();
                     status_leds_set_tap_capture(false);
@@ -3096,7 +3125,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 09B / ALL MODE SYNTH + SCENE FAST PATH");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 09 / BATTERY + ALL MODES + FAST SCENES");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -3133,9 +3162,13 @@ void app_main(void)
 
     while (1) {
         catalog_reset_if_needed();
-        if (scene_busy() &&
+        if (s_scene_after_models && s_midi_ready &&
+            esp_timer_get_time() >= s_scene_base_deadline) {
+            s_scene_after_models=false;
+            ESP_LOGW(TAG,"MODEL|BASE_READ_TIMEOUT|using scene snapshot if present");
+            apply_current_scene();
+        } else if (scene_busy() &&
             (!s_midi_ready ||
-             (s_scene_after_models && esp_timer_get_time() >= s_scene_base_deadline) ||
              (s_scene_phase != SCENE_IDLE && esp_timer_get_time() >= s_scene_deadline))) {
             scene_fail("SCENE SYNC TIMEOUT");
         }
