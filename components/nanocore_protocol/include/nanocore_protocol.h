@@ -94,6 +94,9 @@ esp_err_t nanocore_protocol_request_preset_models(uint8_t slot);
 
 /* Request a single read-only model catalog record. The echoed sequence,
  * block and slot identify its reply; no model data or presets are written. */
+/* Read-only AMP/FX2 storage information (0x30). Diagnostic/priming probe. */
+esp_err_t nanocore_protocol_request_amp_storage_info(void);
+
 esp_err_t nanocore_protocol_request_model_catalog(
     controller_block_t block, uint8_t model_id, uint16_t *seq_out);
 

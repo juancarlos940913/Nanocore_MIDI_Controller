@@ -66,6 +66,8 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CATALOG_EVENT_GAP_MS    300
 #define CATALOG_GAP_MS          150
 #define CATALOG_TIMEOUT_MS      900
+#define CATALOG_AMP_TIMEOUT_MS 2500
+#define CATALOG_AMP_INFO_GAP_MS 3000
 #define CATALOG_MAX_FAILURES      3
 #define CATALOG_TOTAL          (2 * NC_PROTO_MODEL_COUNT)
 
@@ -98,6 +100,7 @@ static char s_catalog_names[2][NC_PROTO_MODEL_COUNT][NC_PROTO_MODEL_NAME_LEN + 1
 /* 0 = unknown/unread, 1 = real name, 2 = empty slot. */
 static uint8_t s_catalog_state[2][NC_PROTO_MODEL_COUNT];
 static bool s_catalog_inflight;
+static bool s_catalog_amp_info_sent;
 static uint16_t s_catalog_seq;
 static uint8_t s_catalog_cursor;
 static uint8_t s_catalog_retry;
@@ -369,6 +372,7 @@ static void catalog_reset_if_needed(void)
     if (!changed) return;
 
     s_catalog_inflight = false;
+    s_catalog_amp_info_sent = false;
     s_catalog_cursor = 0;
     s_catalog_retry = 0;
     s_catalog_failures = 0;
@@ -483,7 +487,9 @@ static void service_model_catalog(void)
     int64_t now = esp_timer_get_time();
 
     if (s_catalog_inflight) {
-        if (now - s_catalog_sent_us >= CATALOG_TIMEOUT_MS * 1000LL) {
+        unsigned timeout_ms = catalog_current_block() == BLOCK_AMP
+            ? CATALOG_AMP_TIMEOUT_MS : CATALOG_TIMEOUT_MS;
+        if (now - s_catalog_sent_us >= timeout_ms * 1000LL) {
             ESP_LOGW(TAG, "CATALOG|TIMEOUT|%s|slot=%u|seq=%u",
                      catalog_current_block() == BLOCK_AMP ? "AMP" : "CAB",
                      catalog_current_id(), s_catalog_seq);
@@ -497,6 +503,19 @@ static void service_model_catalog(void)
         s_tuner_on || s_screen == UI_SCREEN_NAME_EDITOR ||
         nanocore_mapper_is_enabled() ||
         now < s_catalog_next_us || now < s_catalog_quiet_until_us) {
+        return;
+    }
+
+    /* ToneCommand's USB captures include storage-info before AMP reads.
+     * Try this once per connection, with a bounded quiet interval, whether
+     * or not this particular firmware answers the information request. */
+    if (!s_catalog_amp_info_sent && catalog_current_block() == BLOCK_AMP) {
+        s_catalog_amp_info_sent = true;
+        esp_err_t info_rc = nanocore_protocol_request_amp_storage_info();
+        ESP_LOGI(TAG, "CATALOG|AMP_INFO_TX|op=0x30|%s",
+                 esp_err_to_name(info_rc));
+        s_catalog_next_us = esp_timer_get_time() +
+                            CATALOG_AMP_INFO_GAP_MS * 1000LL;
         return;
     }
 
@@ -2158,7 +2177,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07.1 / AMP CAB CATALOG");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07.1A / AMP CATALOG DIAGNOSTICS");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 

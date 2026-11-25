@@ -32,6 +32,7 @@
 #define OP_ACTIVE_SLOT         0x01
 #define OP_BLOCK_STATE         0x02
 #define OP_PARAM_VALUE         0x06
+#define OP_AMP_STORAGE_INFO    0x30
 #define OP_AMP_CATALOG         0x36
 #define OP_READ_PRESET         0x41
 #define OP_SAVE_PRESET         0x46
@@ -758,6 +759,11 @@ static void emit_catalog_reply(uint16_t opcode, uint16_t seq, uint8_t status,
 
 static void handle_catalog_reply(const uint8_t *msg, size_t len)
 {
+    bool amp = msg[9] == OP_AMP_CATALOG;
+    if (amp) {
+        ESP_LOGI(TAG, "CATALOG|AMP_RX|wire_len=%u", (unsigned)len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, len > 96 ? 96 : len, ESP_LOG_INFO);
+    }
     uint8_t raw[96] = {0};
     size_t raw_len = unpack7(&msg[5], len - 6, raw, sizeof(raw));
     if (raw_len < 8 || raw[0] != 0x02) return;
@@ -766,8 +772,15 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
     uint16_t opcode = (uint16_t)(raw[3] | ((uint16_t)raw[4] << 8));
     uint8_t status = raw[5];
     uint16_t body_len = (uint16_t)(raw[6] | ((uint16_t)raw[7] << 8));
+    if (amp) {
+        ESP_LOGI(TAG, "CATALOG|AMP_DECODE|op=0x%02X|seq=%u|status=0x%02X|body=%u|raw=%u",
+                 opcode, seq, status, body_len, (unsigned)raw_len);
+    }
     if ((opcode != OP_AMP_CATALOG && opcode != OP_CAB_CATALOG) ||
-        raw_len != (size_t)8 + body_len) return;
+        raw_len != (size_t)8 + body_len) {
+        if (amp) ESP_LOGW(TAG, "CATALOG|AMP_BAD_HEADER");
+        return;
+    }
 
     const uint8_t *body = &raw[8];
     if (status != SEG_MORE && status != SEG_LAST) {
@@ -794,7 +807,11 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
     }
     if (!s_catalog_reply.active || s_catalog_reply.seq != seq ||
         s_catalog_reply.opcode != opcode ||
-        s_catalog_reply.received != offset) return;
+        s_catalog_reply.received != offset) {
+        if (amp) ESP_LOGW(TAG, "CATALOG|AMP_BAD_SEGMENT|off=%u|received=%u",
+                          offset, s_catalog_reply.received);
+        return;
+    }
 
     memcpy(&s_catalog_reply.data[offset], &body[4], data_len);
     s_catalog_reply.received += (uint16_t)data_len;
@@ -1003,6 +1020,14 @@ esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
     return send_read_preset_window(slot, 220, 59);
 }
 
+esp_err_t nanocore_protocol_request_amp_storage_info(void)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return send_short_command(OP_AMP_STORAGE_INFO);
+}
+
 esp_err_t nanocore_protocol_request_model_catalog(
     controller_block_t block, uint8_t model_id, uint16_t *seq_out)
 {
@@ -1023,6 +1048,10 @@ esp_err_t nanocore_protocol_request_model_catalog(
     if (!packed) return ESP_FAIL;
     msg[5 + packed] = 0xF7;
     *seq_out = seq;
+    if (block == BLOCK_AMP) {
+        ESP_LOGI(TAG, "CATALOG|AMP_TX|slot=%u|seq=%u", model_id, seq);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, 6 + packed, ESP_LOG_INFO);
+    }
     return nanocore_midi_send_sysex(msg, 6 + packed);
 }
 
@@ -1145,6 +1174,20 @@ void nanocore_protocol_on_sysex(const uint8_t *msg, size_t len)
     // also prevents a one-segment 0x68 reply from disturbing a larger 0x63
     // or 0x41 BLE reassembly in progress.
     if (msg[9] == OP_PING) return;
+
+    if (msg[9] == OP_AMP_STORAGE_INFO) {
+        uint8_t raw[96] = {0};
+        size_t n = unpack7(&msg[5], len - 6, raw, sizeof(raw));
+        ESP_LOGI(TAG, "CATALOG|AMP_INFO_RX|wire_len=%u|decoded=%u",
+                 (unsigned)len, (unsigned)n);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, len > 96 ? 96 : len, ESP_LOG_INFO);
+        if (n >= 8) {
+            ESP_LOGI(TAG, "CATALOG|AMP_INFO_HEADER|seq=%u|status=0x%02X|body=%u",
+                     (unsigned)(raw[1] | ((uint16_t)raw[2] << 8)), raw[5],
+                     (unsigned)(raw[6] | ((uint16_t)raw[7] << 8)));
+        }
+        return;
+    }
 
     if (msg[9] == OP_AMP_CATALOG || msg[9] == OP_CAB_CATALOG) {
         handle_catalog_reply(msg, len);

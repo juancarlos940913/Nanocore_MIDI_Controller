@@ -69,3 +69,15 @@ Use an existing test preset, with known custom AMP and IR slot names.
 7. Only after successful physical verification close Stage 07 and
    reconcile the existing Stage 06/07 divergence before merging PR #5.
    Then begin Stage 08 Synth Mode.
+
+## Stage 07.1A — AMP diagnostics
+
+First physical test on firmware 1.2: 30/30 CAB records, 0/30 AMP records;
+all six attempted 0x36 requests timed out. Recall 0x63/0x41 remained stable.
+This revision sends one read-only 0x30 storage-info probe before 0x36,
+waits 3 s before starting AMP catalog reads, and uses 2500 ms AMP reply
+windows instead of 900 ms. CAB keeps the verified 900 ms timeout and
+unchanged parser. Logs AMP_TX, AMP_RX, AMP_DECODE, AMP_INFO_TX and
+AMP_INFO_RX (when received) expose the actual wire frames and response
+headers. No claim that 0x30 is required until tested; the probe and
+increased timeout are experimental. No writing of profiles or IRs.
