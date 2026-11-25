@@ -35,7 +35,7 @@ typedef struct {
     nanocore_protocol_event_type_t type;
     uint8_t slot;
     uint16_t live_seq; /* matched 0x63 reply sequence */
-    uint8_t live_header_byte; /* raw, not a verified volume */
+    uint8_t live_header_byte; /* FW1.2 preset volume 0..100, physical read verified */
     int8_t input_gain_db;
     uint8_t usb_volume, bt_volume;
     uint16_t global_seq;

@@ -1271,10 +1271,12 @@ esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out)
 esp_err_t nanocore_protocol_set_input_gain(int8_t db,uint16_t *seq_out)
 {
     if(!seq_out || !s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
-    if(db < -20 || db > 20) return ESP_ERR_INVALID_ARG;
+    /* FW1.2 physical trace: requested signed7 -1 (127) became +20 dB.
+     * Only the nonnegative range has been verified. Never encode negative. */
+    if(db < 0 || db > 20) return ESP_ERR_INVALID_ARG;
     uint8_t seq=next_seq();
     uint8_t msg[]={0xF0,NC_MFR,NC_TAG_N,NC_TAG_C,NC_DIR_HOST,
-        0,2,seq,0,OP_GLOBAL_SET,0,2,0,0,4,(uint8_t)(db<0?db+128:db),0xF7};
+        0,2,seq,0,OP_GLOBAL_SET,0,2,0,0,4,(uint8_t)db,0xF7};
     *seq_out=seq;
     ESP_LOGI(TAG,"LEVEL|INPUT_TX|db=%d|seq=%u",(int)db,seq);
     return nanocore_midi_send_sysex(msg,sizeof(msg));

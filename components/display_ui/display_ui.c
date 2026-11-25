@@ -355,23 +355,26 @@ static void performance(const display_ui_state_t *s)
 static void levels_screen(const display_ui_state_t *s)
 {
     text_center(LCD_W/2,58,"LEVELS",C_WHITE,2);
-    text_center(LCD_W/2,84,"GLOBAL INPUT - NOT A SCENE EFFECT",C_MUTED,1);
+    text_center(LCD_W/2,84,"GLOBAL GAIN / PRESET VOLUME",C_MUTED,1);
     char buf[48];
     fill_rect(18,108,444,54,s->levels_row==0?C_PANEL2:C_PANEL);
     rect(18,108,444,54,s->levels_row==0?C_CYAN:C_MUTED,2);
-    text(30,119,"INPUT GAIN",C_WHITE,2);
+    text(30,119,"GLOBAL INPUT",C_WHITE,2);
     if(s->levels_known) snprintf(buf,sizeof(buf),"%d dB",(int)s->input_gain_db);
     else snprintf(buf,sizeof(buf),"UNKNOWN");
     text(300,119,buf,s->levels_known?C_GREEN:C_YELLOW,2);
-    text(30,145,s->levels_wait?"WAIT READBACK":s->levels_edit?"ENC2 ADJUST 1 dB":"ENC1 CLICK TO EDIT / READ",C_MUTED,1);
+    text(30,145,s->levels_wait?"WAIT READBACK":s->levels_edit?"ENC2: 0 TO +20 dB (1 dB STEPS)":"ENC1 EDIT / READ (0 TO +20 dB)",C_MUTED,1);
     fill_rect(18,173,444,70,s->levels_row==1?C_PANEL2:C_PANEL);
     rect(18,173,444,70,s->levels_row==1?C_CYAN:C_MUTED,2);
-    text(30,185,"ANALOG OUTPUT",C_WHITE,2);
-    text(306,185,"LOCKED",C_YELLOW,2);
-    if(s->level_raw_known) snprintf(buf,sizeof(buf),"LIVE HEADER RAW: %u (UNVERIFIED)",(unsigned)s->level_raw);
-    else snprintf(buf,sizeof(buf),"OUTPUT MAPPING NOT VERIFIED");
-    text(30,211,buf,C_MUTED,1);
-    text(30,226,"ENC1 CLICK TO CAPTURE LEVELS",C_MUTED,1);
+    text(30,185,"PRESET VOLUME",C_WHITE,2);
+    if(s->level_raw_known) snprintf(buf,sizeof(buf),"%u%%",(unsigned)s->level_raw);
+    else snprintf(buf,sizeof(buf),"--");
+    text(340,185,buf,s->level_raw_known?C_GREEN:C_YELLOW,2);
+    rect(30,208,200,10,C_MUTED,1);
+    if(s->level_raw_known && s->level_raw>0)
+        fill_rect(31,209,198*(int)s->level_raw/100,8,C_GREEN);
+    text(250,210,"READ ONLY",C_YELLOW,1);
+    text(30,226,"ENC1 CLICK TO REFRESH VOLUME",C_MUTED,1);
     text_center(LCD_W/2,264,"TURN AMP DOWN BEFORE ADJUSTING",C_ORANGE,1);
 }
 

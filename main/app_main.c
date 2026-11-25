@@ -401,10 +401,10 @@ static void schedule_recall_sync(uint8_t target)
 static void slot_probe_request(bool immediate)
 {
     if(!s_midi_ready || s_recall_pending || scene_busy()) return;
-    if(!s_slot_probe_pending) {
-        s_slot_probe_pending=true;
-        s_slot_probe_due=esp_timer_get_time()+(immediate?0:150000LL);
-    } else if(immediate) s_slot_probe_due=esp_timer_get_time();
+    /* A burst of 0x01 volume hints is not a burst of preset changes.
+     * Read once after the last hint; manual ENC2 can request immediately. */
+    s_slot_probe_pending=true;
+    s_slot_probe_due=esp_timer_get_time()+(immediate?0:200000LL);
 }
 
 static void service_slot_probe(void)
@@ -2724,7 +2724,11 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known && s_levels_write_ready &&
                 !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
             int next=(int)s_input_gain_db+(delta>0?1:-1);
-            if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
+            if(s_input_gain_db<0 || s_input_gain_db>20 || next<0) {
+                show_notice("NEGATIVE GAIN NOT VERIFIED");
+                return;
+            }
+            if(next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
                 s_levels_wait=true;
                 s_levels_write_pending=true;
                 s_levels_target_db=(int8_t)next;
@@ -2864,7 +2868,8 @@ static void handle_input(input_event_t e)
             nanocore_protocol_set_level_diagnostics(false);
             s_notice[0]='\0';
         } else if(e==INPUT_ENC1_CLICK) {
-            if(s_levels_row==1 || !s_levels_known || !s_levels_write_ready) levels_read();
+            if(s_levels_row==1) { s_levels_edit=false; slot_probe_request(true); }
+            else if(!s_levels_known || !s_levels_write_ready) levels_read();
             else if(!s_levels_wait) s_levels_edit=!s_levels_edit;
         }
         render_ui();
@@ -3160,7 +3165,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             break;
         }
 
-        s_level_raw_known=true;
+        bool level_known=e->live_header_byte<=100;
+        if(level_known && (!s_level_raw_known || s_level_raw!=e->live_header_byte))
+            ESP_LOGI(TAG,"LEVEL|PRESET_VOLUME|slot=%u|value=%u",e->slot,e->live_header_byte);
+        s_level_raw_known=level_known;
         s_level_raw=e->live_header_byte;
         if (e->synth_mode_known) {
             bool changed = s_synth_mode != e->synth_mode;
@@ -3469,7 +3477,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10A / VERIFIED SLOT + GLOBAL INPUT");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10B / PRESET VOLUME READ + INPUT GUARD");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
