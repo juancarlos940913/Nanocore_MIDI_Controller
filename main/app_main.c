@@ -140,6 +140,18 @@ static controller_runtime_t s_runtime;
 static controller_preset_t s_preset;
 
 static controller_block_t s_selected_block = BLOCK_FX1;
+/* Stage 08D read-only preview: keep Synth outside legacy block arrays. */
+static bool s_synth_mode_known;
+static bool s_synth_mode;
+static bool s_synth_selected;
+static bool s_synth_voice_known;
+static bool s_synth_voice_on;
+static uint8_t s_synth_voice;
+static uint8_t s_synth_param_count;
+static float s_synth_params[NC_PROTO_SYNTH_MAX_PARAMS];
+static const controller_block_t s_synth_visible[] = {
+    BLOCK_FX1, BLOCK_FX1, BLOCK_FX2, BLOCK_DELAY, BLOCK_MOD, BLOCK_REVERB, BLOCK_EQ
+};
 static size_t s_selected_parameter;
 static bool s_parameter_editing;
 
@@ -161,6 +173,12 @@ static void show_notice(const char *text)
 
 static void clear_block_state(void)
 {
+    /* Keep last mode as a write lock until the next authoritative read. */
+    s_synth_mode_known = false;
+    s_synth_voice_known = false;
+    s_synth_voice_on = false;
+    s_synth_param_count = 0;
+    memset(s_synth_params, 0, sizeof(s_synth_params));
     memset(s_block_known, 0, sizeof(s_block_known));
     memset(s_block_on, 0, sizeof(s_block_on));
     memset(s_block_profile_known, 0, sizeof(s_block_profile_known));
@@ -594,6 +612,8 @@ static const nanocore_effect_type_info_t *current_type_info(
 {
     uint8_t raw = 0;
     if (!current_type_raw(block, &raw)) return NULL;
+    if (s_synth_mode &&
+        nanocore_spec_mode_selector_index(block, true, raw) < 0) return NULL;
     return nanocore_spec_editor_type_by_raw(block, raw);
 }
 
@@ -601,11 +621,16 @@ static int current_type_selector(controller_block_t block)
 {
     uint8_t raw = 0;
     if (!current_type_raw(block, &raw)) return -1;
-    return nanocore_spec_editor_selector_index(block, raw);
+    return nanocore_spec_mode_selector_index(block, s_synth_mode, raw);
 }
 
 static size_t editor_parameter_count(void)
 {
+    if (s_synth_selected) {
+        const nanocore_effect_type_info_t *voice =
+            s_synth_voice_known ? nanocore_spec_synth_voice(s_synth_voice) : NULL;
+        return 2 + (voice ? voice->expected_param_count : 0);
+    }
     const nanocore_effect_type_info_t *info =
         current_type_info(s_selected_block);
     size_t count = 2 + (info ? info->expected_param_count : 0);
@@ -801,6 +826,10 @@ static void apply_assignments(const midi_assignment_t *items,
 
 static void apply_current_scene(void)
 {
+    if (s_synth_mode) {
+        show_notice("SYNTH SCENE READ ONLY");
+        return;
+    }
     if (s_runtime.current_scene >= CTRL_SCENE_COUNT) {
         s_runtime.current_scene = 0;
     }
@@ -1039,7 +1068,7 @@ static void select_parameter(int delta)
 
 static void adjust_parameter(int delta)
 {
-    if (delta == 0 || s_selected_block >= BLOCK_COUNT) return;
+    if (delta == 0 || s_synth_mode || s_synth_selected || s_selected_block >= BLOCK_COUNT) return;
 
     /* 0=ON/OFF, 1=TYPE/MODEL, 2..=live type-local parameters. */
     if (s_selected_parameter == 0) {
@@ -1309,6 +1338,12 @@ static void render_ui(void)
         .subdivision = s_preset.delay_subdivision,
         .preset = &s_preset,
         .selected_block = s_selected_block,
+        .synth_mode_known = s_synth_mode_known,
+        .synth_mode = s_synth_mode,
+        .synth_selected = s_synth_selected,
+        .synth_voice_known = s_synth_voice_known,
+        .synth_voice_on = s_synth_voice_on,
+        .editor_read_only = s_synth_mode,
         .selected_parameter = s_selected_parameter,
         .parameter_editing = s_parameter_editing,
         .notice = s_notice,
@@ -1319,6 +1354,40 @@ static void render_ui(void)
     memcpy(u.block_on, s_block_on, sizeof(u.block_on));
 
     char parameter_text[72] = {0};
+
+    if (s_synth_selected) {
+        const nanocore_effect_type_info_t *voice =
+            s_synth_voice_known ? nanocore_spec_synth_voice(s_synth_voice) : NULL;
+        u.editor_override = true;
+        u.editor_parameter_count = editor_parameter_count();
+        u.editor_parameter_labels[0] = "ON/OFF";
+        u.editor_parameter_labels[1] = "TYPE";
+        if (voice) {
+            for (uint8_t i = 0; i < voice->expected_param_count; ++i)
+                u.editor_parameter_labels[i + 2] = voice->params[i].name;
+        }
+        if (s_selected_parameter >= u.editor_parameter_count)
+            s_selected_parameter = u.editor_parameter_count - 1;
+        u.selected_parameter = s_selected_parameter;
+        u.selected_parameter_label = u.editor_parameter_labels[s_selected_parameter];
+        if (s_synth_voice_known && s_selected_parameter == 0) {
+            u.parameter_known = true;
+            u.parameter_text = s_synth_voice_on ? "ON" : "OFF";
+        } else if (voice && s_selected_parameter == 1) {
+            u.parameter_known = true;
+            u.parameter_text = voice->name;
+        } else if (voice && s_selected_parameter >= 2 &&
+                   s_selected_parameter - 2 < s_synth_param_count &&
+                   s_selected_parameter - 2 < voice->expected_param_count) {
+            size_t i = s_selected_parameter - 2;
+            u.parameter_known = true;
+            nanocore_spec_format_normalized(&voice->params[i], s_synth_params[i],
+                                           parameter_text, sizeof(parameter_text));
+            u.parameter_text = parameter_text;
+        }
+        display_ui_render(&u);
+        return;
+    }
 
     const nanocore_effect_type_info_t *info =
         current_type_info(s_selected_block);
@@ -1380,8 +1449,8 @@ static void render_ui(void)
         if (selector >= 0) {
             u.parameter_value = (uint16_t)selector;
             const nanocore_effect_type_info_t *selected_type =
-                nanocore_spec_editor_type_by_selector(
-                    s_selected_block, (size_t)selector);
+                nanocore_spec_mode_type_by_selector(
+                    s_selected_block, s_synth_mode, (size_t)selector);
             if (selected_type) {
                 if (nanocore_spec_editor_is_model_block(s_selected_block)) {
                     format_model_name(s_selected_block, selected_type->id,
@@ -1391,6 +1460,11 @@ static void render_ui(void)
                     u.parameter_text = selected_type->name;
                 }
             }
+        } else if (s_synth_mode && s_block_profile_known[s_selected_block]) {
+            u.parameter_known = true;
+            snprintf(parameter_text, sizeof(parameter_text), "RAW %u UNAVAILABLE",
+                     s_block_variant[s_selected_block]);
+            u.parameter_text = parameter_text;
         }
     } else if (info && s_selected_block == BLOCK_DELAY &&
                s_selected_parameter ==
@@ -1762,10 +1836,27 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
                 select_parameter(delta);
             }
         } else {
-            int block = (int)s_selected_block + delta;
-            while (block < 0) block += BLOCK_COUNT;
-            while (block >= BLOCK_COUNT) block -= BLOCK_COUNT;
-            s_selected_block = (controller_block_t)block;
+            if (s_synth_mode) {
+                int index = 0;
+                if (!s_synth_selected) {
+                    for (int i = 1; i < 7; ++i) {
+                        if (s_synth_visible[i] == s_selected_block) {
+                            index = i;
+                            break;
+                        }
+                    }
+                }
+                index = (index + delta) % 7;
+                if (index < 0) index += 7;
+                s_synth_selected = index == 0;
+                s_selected_block = s_synth_visible[index];
+            } else {
+                int block = (int)s_selected_block + delta;
+                while (block < 0) block += BLOCK_COUNT;
+                while (block >= BLOCK_COUNT) block -= BLOCK_COUNT;
+                s_synth_selected = false;
+                s_selected_block = (controller_block_t)block;
+            }
             render_ui();
         }
     } else if (encoder == 2) {
@@ -1857,9 +1948,22 @@ static void handle_input(input_event_t e)
         return;
     }
 
+    /* Preview cannot write to the device or scene/preset mirrors. */
+    if (s_synth_mode && e != INPUT_ENC1_CLICK && e != INPUT_ENC2_CLICK &&
+        e != INPUT_CHORD_TUNER &&
+        !(s_runtime.mode == CTRL_MODE_PRESET &&
+          (e == INPUT_FS_PRESET_UP || e == INPUT_FS_PRESET_DOWN))) {
+        show_notice("SYNTH READ ONLY");
+        return;
+    }
+
     switch (e) {
     case INPUT_ENC1_CLICK:
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
+            if (s_synth_mode) {
+                show_notice("SYNTH READ ONLY");
+                return;
+            }
             s_parameter_editing = !s_parameter_editing;
             render_ui();
         } else {
@@ -1870,6 +1974,12 @@ static void handle_input(input_event_t e)
     case INPUT_ENC2_CLICK:
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
             back_from_block_editor();
+        } else if (s_screen == UI_SCREEN_PERFORMANCE && s_midi_ready &&
+                   !s_recall_pending && !s_recall_poll_inflight &&
+                   !s_catalog_inflight) {
+            /* Explicit physical mode/voice refresh, no periodic polling. */
+            if (nanocore_protocol_request_live_state() == ESP_OK)
+                show_notice("LIVE REFRESH");
         }
         break;
 
@@ -2029,6 +2139,31 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             break;
         }
 
+        if (e->synth_mode_known) {
+            bool changed = s_synth_mode != e->synth_mode;
+            s_synth_mode_known = true;
+            s_synth_mode = e->synth_mode;
+            s_synth_voice_known = e->synth_known;
+            s_synth_voice_on = e->synth_on;
+            s_synth_voice = e->synth_variant;
+            s_synth_param_count = e->synth_param_count;
+            memcpy(s_synth_params, e->synth_params, sizeof(s_synth_params));
+            if (changed) {
+                s_synth_selected = s_synth_mode;
+                s_selected_block = BLOCK_FX1;
+                s_selected_parameter = 0;
+                s_parameter_editing = false;
+                s_screen = UI_SCREEN_PERFORMANCE;
+                if (s_synth_mode && tempo_engine_tap_active()) {
+                    tempo_engine_cancel_tap();
+                    status_leds_set_tap_capture(false);
+                }
+                ESP_LOGI(TAG, "SYNTH|UI|mode=%u", s_synth_mode);
+            }
+        } else {
+            s_synth_mode_known = false;
+            s_synth_voice_known = false;
+        }
         memcpy(s_block_known, e->block_known, sizeof(s_block_known));
         memcpy(s_block_on, e->block_on, sizeof(s_block_on));
         memcpy(s_block_profile_known, e->block_profile_known,
@@ -2089,6 +2224,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         s_block_known[e->block] = true;
         s_block_on[e->block] = e->on;
+        if (s_synth_mode) {
+            render_ui();
+            break;
+        }
 
         /*
          * A physical NanoCore block toggle is a real unsaved live edit.
@@ -2229,7 +2368,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
              * writes do not echo it. Therefore this is a genuine unsaved
              * device-side edit and must participate in the dirty guard.
              */
-            s_dirty = true;
+            if (!s_synth_mode) s_dirty = true;
             render_ui();
         }
         break;
@@ -2242,7 +2381,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08B.1 / SYNTH CAPTURE STACK FIX");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08D / SYNTH READ ONLY UI");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 

@@ -123,7 +123,7 @@ size_t nanocore_spec_synth_voice_count(void);
 const nanocore_effect_type_info_t *nanocore_spec_synth_voice(uint8_t voice_id);
 
 /* Stage 08C: mode-aware selector API, separate from normal editor.
- * Synth FX2 remains deliberately unmapped until its physical sweep.
+ * Synth FX2 membership and order confirmed by physical sweep.
  * Voice lookup uses nanocore_spec_synth_voice(), not a legacy block ID.
  * A zero selector count means no validated selectable types. */
 size_t nanocore_spec_mode_type_count(controller_block_t block, bool synth_mode);

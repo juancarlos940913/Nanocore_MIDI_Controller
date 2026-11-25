@@ -206,7 +206,7 @@ static esp_err_t flush_screen(void)
 static void header(const display_ui_state_t *s)
 {
     fill_rect(0,0,LCD_W,42,C_PANEL2);
-    text(14,12,"NANOCORE MIDI",C_WHITE,2);
+    text(14,12,s->synth_mode ? "NANOCORE SYNTH" : "NANOCORE MIDI",C_WHITE,2);
 
     char buf[64];
     snprintf(buf,sizeof(buf),"P%02u  %s",
@@ -230,7 +230,9 @@ static void footer(const display_ui_state_t *s)
              s->tap_capture?"  TAP":"");
     text(12,296,buf,s->tap_capture?C_BLUE:C_MUTED,1);
 
-    if (s->mode == CTRL_MODE_STOMP &&
+    if (s->synth_mode && s->screen == UI_SCREEN_PERFORMANCE) {
+        text(205,296,"READ ONLY  ENC2 REFRESH",C_MUTED,1);
+    } else if (s->mode == CTRL_MODE_STOMP &&
         s->screen == UI_SCREEN_PERFORMANCE) {
         text(215,296,"TL FX2  TR DLY  B1 MOD  B2 REV",C_MUTED,1);
     } else {
@@ -250,17 +252,29 @@ static void performance(const display_ui_state_t *s)
         text_center(LCD_W/2,78,sb,C_ORANGE,1);
     }
 
+    if (s->synth_mode) {
+        text_center(LCD_W/2,88,s->synth_mode_known?"SYNTH MODE - READ ONLY":"SYNTH MODE - SYNC?",C_CYAN,1);
+    }
     const int x0=18,y0=108,w=102,h=64,gx=12,gy=12;
-    for(int i=0;i<BLOCK_COUNT;++i){
+    /* Visible order is independent of the legacy block enum. */
+    static const controller_block_t synth_order[] = {
+        BLOCK_FX1, BLOCK_FX1, BLOCK_FX2, BLOCK_DELAY, BLOCK_MOD, BLOCK_REVERB, BLOCK_EQ
+    };
+    int count = s->synth_mode ? 7 : BLOCK_COUNT;
+    for(int i=0;i<count;++i){
+        bool voice = s->synth_mode && i==0;
+        controller_block_t b = s->synth_mode ? synth_order[i] : (controller_block_t)i;
         int row=i/4,col=i%4;
         int x=x0+col*(w+gx), y=y0+row*(h+gy);
-        bool sel=(i==(int)s->selected_block);
+        bool sel=voice ? s->synth_selected : (!s->synth_selected && b==s->selected_block);
 
         uint16_t state_color = C_MUTED;
         const char *state_text = "?";
-        if (s->block_known[i]) {
-            state_color = s->block_on[i] ? C_GREEN : C_YELLOW;
-            state_text = s->block_on[i] ? "ON" : "OFF";
+        bool known = voice ? s->synth_voice_known : s->block_known[b];
+        bool on = voice ? s->synth_voice_on : s->block_on[b];
+        if (known) {
+            state_color = on ? C_GREEN : C_YELLOW;
+            state_text = on ? "ON" : "OFF";
         }
 
         fill_rect(x,y,w,h,sel?C_PANEL2:C_PANEL);
@@ -271,7 +285,7 @@ static void performance(const display_ui_state_t *s)
         }
 
         text_center(x+w/2,y+17,
-                    nanocore_block_name((controller_block_t)i),
+                    voice ? "SYNTH" : nanocore_block_name(b),
                     C_WHITE,2);
         text_center(x+w/2,y+43,state_text,state_color,1);
     }
@@ -280,8 +294,9 @@ static void performance(const display_ui_state_t *s)
 static void block_editor(const display_ui_state_t *s)
 {
     char title[64];
-    snprintf(title,sizeof(title),"%s EDIT",
-             nanocore_block_name(s->selected_block));
+    snprintf(title,sizeof(title),"%s %s",
+             s->synth_selected ? "SYNTH" : nanocore_block_name(s->selected_block),
+             s->editor_read_only ? "VIEW" : "EDIT");
     text(20,58,title,C_WHITE,2);
 
     size_t count = s->editor_override
@@ -364,7 +379,7 @@ static void block_editor(const display_ui_state_t *s)
     }
 
     text(300,180,s->parameter_editing?"ENC2 CHANGE":"ENC1 PARAM",C_MUTED,1);
-    text(300,200,"ENC1 CLICK EDIT",C_MUTED,1);
+    text(300,200,s->editor_read_only?"READ ONLY":"ENC1 CLICK EDIT",C_MUTED,1);
     text(300,220,"ENC2 CLICK BACK",C_MUTED,1);
 }
 

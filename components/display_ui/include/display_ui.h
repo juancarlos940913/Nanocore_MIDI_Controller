@@ -36,6 +36,13 @@ typedef struct {
 
     const controller_preset_t *preset;
 
+    /* SYNTH is a UI-only selection, never an index into BLOCK_COUNT. */
+    bool synth_mode_known;
+    bool synth_mode;
+    bool synth_selected;
+    bool synth_voice_known;
+    bool synth_voice_on;
+    bool editor_read_only;
     controller_block_t selected_block;
     size_t selected_parameter;
     bool parameter_editing;

@@ -817,6 +817,7 @@ const nanocore_effect_type_info_t *nanocore_spec_synth_voice(uint8_t id)
  * REV sequence is the order observed in the physical sweep; confirm it
  * is the actual consecutive selector order before final UI acceptance. */
 static const uint8_t SYNTH_REV_SELECTOR_ORDER[] = {0,1,2,3,7,5,6};
+static const uint8_t SYNTH_FX2_SELECTOR_ORDER[] = {8,12,13,14,15,16,17,9,10,11,18,19,20};
 
 size_t nanocore_spec_mode_type_count(controller_block_t block, bool synth_mode)
 {
@@ -829,7 +830,8 @@ size_t nanocore_spec_mode_type_count(controller_block_t block, bool synth_mode)
         return nanocore_spec_editor_type_count(block);
     case BLOCK_REVERB:
         return sizeof(SYNTH_REV_SELECTOR_ORDER)/sizeof(SYNTH_REV_SELECTOR_ORDER[0]);
-    case BLOCK_FX2: /* No physical Pitch..last sweep yet. */
+    case BLOCK_FX2:
+        return sizeof(SYNTH_FX2_SELECTOR_ORDER)/sizeof(SYNTH_FX2_SELECTOR_ORDER[0]);
     case BLOCK_AMP:
     case BLOCK_CAB:
     default:
@@ -841,6 +843,9 @@ const nanocore_effect_type_info_t *nanocore_spec_mode_type_by_selector(
     controller_block_t block, bool synth_mode, size_t index)
 {
     if (index >= nanocore_spec_mode_type_count(block, synth_mode)) return NULL;
+    if (synth_mode && block == BLOCK_FX2) {
+        return nanocore_spec_editor_type_by_raw(block, SYNTH_FX2_SELECTOR_ORDER[index]);
+    }
     if (synth_mode && block == BLOCK_REVERB) {
         return nanocore_spec_editor_type_by_raw(block, SYNTH_REV_SELECTOR_ORDER[index]);
     }
