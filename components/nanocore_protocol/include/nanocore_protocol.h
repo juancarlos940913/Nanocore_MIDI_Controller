@@ -100,6 +100,7 @@ void nanocore_protocol_set_connected(bool connected);
 esp_err_t nanocore_protocol_request_live_state(void);
 esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out);
 esp_err_t nanocore_protocol_set_input_gain(int8_t db, uint16_t *seq_out);
+esp_err_t nanocore_protocol_set_preset_volume(uint8_t volume);
 void nanocore_protocol_set_level_diagnostics(bool enabled);
 esp_err_t nanocore_protocol_request_live_state_seq(uint16_t *seq_out);
 esp_err_t nanocore_protocol_set_synth_mode(bool enabled);

@@ -82,7 +82,11 @@ typedef struct {
     uint8_t synth_on;
     uint8_t synth_voice;
     uint8_t synth_count;
-    uint8_t reserved[3];
+    /* Previously reserved bytes; old zero-initialized v1 blobs remain valid.
+     * volume_valid=0 means inherit physical base, 1 means explicit 0..100. */
+    uint8_t volume_valid;
+    uint8_t preset_volume;
+    uint8_t reserved[1];
     char name[CTRL_NAME_LEN];
     controller_scene_block_t block[BLOCK_COUNT];
     float synth_params[CTRL_PROFILE_SYNTH_PARAMS];

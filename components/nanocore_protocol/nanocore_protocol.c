@@ -1282,6 +1282,17 @@ esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out)
     return nanocore_midi_send_sysex(msg,sizeof(msg));
 }
 
+/* Live preset volume: 0x6D payload [0x04, 0..100].
+ * Reference: dvilelaf/nanocore-controller docs/protocol.md and
+ * nanocore_protocol.py preset_volume_payload. No save is sent here. */
+esp_err_t nanocore_protocol_set_preset_volume(uint8_t volume)
+{
+    if(!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    if(volume>100) return ESP_ERR_INVALID_ARG;
+    ESP_LOGI(TAG,"LEVEL|VOLUME_TX|value=%u",volume);
+    return send_scalar_field(0x04,volume);
+}
+
 esp_err_t nanocore_protocol_set_input_gain(int8_t db,uint16_t *seq_out)
 {
     if(!seq_out || !s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;

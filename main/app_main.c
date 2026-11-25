@@ -155,6 +155,11 @@ static bool s_levels_write_ready, s_levels_write_pending;
 static int8_t s_levels_target_db;
 static uint8_t s_levels_row, s_level_raw;
 static bool s_level_raw_known;
+static bool s_volume_write_pending;
+static uint8_t s_volume_target;
+static int64_t s_volume_deadline;
+static bool s_base_volume_known;
+static uint8_t s_base_volume;
 static int8_t s_input_gain_db;
 static uint16_t s_levels_seq;
 static int64_t s_levels_deadline;
@@ -239,6 +244,8 @@ static void sound_edit_begin(void)
         !s_synth_voice_known || s_synth_param_count>CTRL_PROFILE_SYNTH_PARAMS) return;
     controller_scene_profile_t *p=&s_sound_origin;
     memset(p,0,sizeof(*p));
+    p->volume_valid=s_level_raw_known;
+    p->preset_volume=s_level_raw;
     p->synth_mode=s_synth_mode;
     p->synth_on=s_synth_voice_on;
     p->synth_voice=s_synth_voice;
@@ -267,7 +274,8 @@ static void sound_edit_confirm(const nanocore_protocol_event_t *e)
     s_dirty=true;
     if(!s_sound_origin_valid || e->synth_mode!=s_sound_origin.synth_mode) return;
     const controller_scene_profile_t *p=&s_sound_origin;
-    bool same=e->synth_known && e->synth_on==p->synth_on &&
+    bool same=(!p->volume_valid || e->live_header_byte==p->preset_volume) &&
+        e->synth_known && e->synth_on==p->synth_on &&
         e->synth_variant==p->synth_voice && e->synth_param_count==p->synth_count &&
         sound_vector_equal(e->synth_params,p->synth_params,p->synth_count);
     for(int b=0;same && b<BLOCK_COUNT;++b) {
@@ -343,6 +351,8 @@ static void clear_block_state(void)
     /* Keep last mode as a write lock until the next authoritative read. */
     s_scene_verified_models = false;
     s_level_raw_known=false;
+    s_volume_write_pending=false;
+    s_base_volume_known=false;
     s_levels_selected=false;
     s_sound_origin_valid = false;
     s_discard_action = DISCARD_NONE;
@@ -418,12 +428,21 @@ static void service_slot_probe(void)
         s_levels_write_pending=false;
         s_levels_edit=false;
         s_level_raw_known=false;
+        s_volume_write_pending=false;
+        s_base_volume_known=false;
         return;
     }
     int64_t now=esp_timer_get_time();
     if(s_slot_probe_inflight && now>=s_slot_probe_deadline) {
         s_slot_probe_inflight=false;
         ESP_LOGW(TAG,"SLOT|VERIFY_TIMEOUT");
+    }
+    if(s_volume_write_pending && now>=s_volume_deadline) {
+        s_volume_write_pending=false;
+        s_level_raw_known=false;
+        s_levels_edit=false;
+        ESP_LOGW(TAG,"LEVEL|VOLUME_TIMEOUT|wanted=%u",s_volume_target);
+        if(s_screen==UI_SCREEN_LEVELS) show_notice("VOLUME READBACK TIMEOUT");
     }
     if(s_levels_wait && now>=s_levels_deadline) {
         s_levels_wait=false;
@@ -831,7 +850,7 @@ static void service_model_catalog(void)
 
     /* User input, preset recall and mapper capture take precedence. */
     if (s_recall_pending || s_recall_poll_inflight || scene_busy() ||
-        s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait ||
+        s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait || s_volume_write_pending ||
         s_screen==UI_SCREEN_LEVELS ||
         s_tuner_on || s_screen == UI_SCREEN_NAME_EDITOR ||
         nanocore_mapper_is_enabled() ||
@@ -1202,7 +1221,8 @@ static bool scene_values_valid(const float *p, uint8_t count)
 static bool scene_profile_valid(const controller_scene_profile_t *p)
 {
     if (p->version != CTRL_PROFILE_VERSION || p->synth_mode > 1 ||
-        p->synth_on > 1) return false;
+        p->synth_on > 1 || p->volume_valid>1 ||
+        (p->volume_valid && p->preset_volume>100)) return false;
     if (p->synth_mode) {
         const nanocore_effect_type_info_t *v = nanocore_spec_synth_voice(p->synth_voice);
         /* 0x0A controls mode; a separate voice bypass write is unverified. */
@@ -1368,6 +1388,12 @@ static bool scene_send_profile(void)
             vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
         }
     }
+    /* Apply volume last so a solo boost never precedes the scene effects. */
+    if(p->volume_valid && (!s_level_raw_known || s_level_raw!=p->preset_volume)) {
+        if(nanocore_protocol_set_preset_volume(p->preset_volume)!=ESP_OK) return false;
+        vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
+        ESP_LOGI(TAG,"SCENE|VOLUME_TX|value=%u",p->preset_volume);
+    }
     return true;
 }
 
@@ -1387,6 +1413,10 @@ static bool scene_verify(const nanocore_protocol_event_t *e)
 {
     const controller_scene_profile_t *p = &s_scene_profile;
     if (!e->synth_mode_known || e->synth_mode != (p->synth_mode != 0)) return false;
+    if(p->volume_valid && e->live_header_byte!=p->preset_volume) {
+        ESP_LOGW(TAG,"SCENE|VOLUME_MISMATCH|wanted=%u|read=%u",p->preset_volume,e->live_header_byte);
+        return false;
+    }
     if (p->synth_mode &&
         (!e->synth_known || e->synth_on != (p->synth_on != 0) ||
          e->synth_variant != p->synth_voice ||
@@ -1434,7 +1464,10 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
         scene_fail("SCENE MODE UNKNOWN");
         return;
     }
+    if(e->live_header_byte>100) { scene_fail("SCENE VOLUME UNKNOWN"); return; }
     p->version = CTRL_PROFILE_VERSION;
+    p->volume_valid=1;
+    p->preset_volume=e->live_header_byte;
     p->synth_mode = e->synth_mode;
     p->synth_on = e->synth_on;
     p->synth_voice = e->synth_variant;
@@ -1481,6 +1514,7 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
     ESP_LOGI(TAG, "SCENE|SAVED|preset=%u|scene=%c|mode=%u|name=%s",
              s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
              p->synth_mode, p->name);
+    ESP_LOGI(TAG,"SCENE|VOLUME_SAVED|value=%u",p->preset_volume);
     show_notice("SCENE SAVED TO CONTROLLER");
 }
 
@@ -1533,11 +1567,12 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
         ESP_LOGI(TAG, "SCENE|READY|preset=%u|scene=%c|mode=%u|name=%s",
                  s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
                  s_scene_profile.synth_mode, s_scene_profile.name);
+        if(s_scene_profile.volume_valid) ESP_LOGI(TAG,"SCENE|VOLUME_OK|value=%u",e->live_header_byte);
         show_notice("SCENE READY");
     } else if (phase == SCENE_SAVE) {
         scene_save_from_live(e);
     } else if (phase == SCENE_BASE_SAVE) {
-        if (!e->synth_mode_known || e->synth_mode != s_scene_target_mode) {
+        if (!e->synth_mode_known || e->synth_mode != s_scene_target_mode || e->live_header_byte>100) {
             s_screen = UI_SCREEN_NAME_EDITOR;
             scene_fail("PRESET MODE CHANGED - CHECK");
             return;
@@ -1584,6 +1619,11 @@ static void apply_current_scene(void)
     if (!s_synth_mode_known) {
         scene_fail("SCENE MODE UNKNOWN");
         return;
+    }
+    if(!s_scene_profile.volume_valid && s_base_volume_known) {
+        s_scene_profile.volume_valid=1;
+        s_scene_profile.preset_volume=s_base_volume;
+        ESP_LOGI(TAG,"SCENE|VOLUME_INHERIT|value=%u",s_base_volume);
     }
     s_scene_fault = false;
     s_scene_target_mode = s_scene_profile.synth_mode != 0;
@@ -2191,6 +2231,9 @@ static void commit_base_save(void)
         show_notice("PEDAL SAVED / MODE NVS ERROR");
         return;
     }
+    s_base_volume_known=s_level_raw_known;
+    s_base_volume=s_level_raw;
+    ESP_LOGI(TAG,"BASE|VOLUME_SAVED|value=%u",s_base_volume);
     ESP_LOGI(TAG,"BASE|SAVED|preset=%u|mode=%u",s_runtime.current_preset+1,s_base_mode);
     clear_edit_dirty();
     name_editor_close(&s_name_editor);
@@ -2227,7 +2270,7 @@ static void render_ui(void)
         .synth_selected = s_synth_selected,
         .levels_selected=s_levels_selected,
         .levels_known=s_levels_known,
-        .levels_wait=s_levels_wait,
+        .levels_wait=s_levels_wait || s_volume_write_pending || s_slot_probe_inflight,
         .levels_edit=s_levels_edit,
         .levels_row=s_levels_row,
         .input_gain_db=s_input_gain_db,
@@ -2720,7 +2763,22 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         return; /* First rotation cancels only, never edits. */
     }
     if(s_screen==UI_SCREEN_LEVELS) {
+        if(s_volume_write_pending) return;
         if(encoder==1 && !s_levels_edit) s_levels_row=(uint8_t)(delta>0?1:0);
+        else if(encoder==2 && s_levels_edit && s_levels_row==1 && s_level_raw_known &&
+                !s_levels_wait && !s_slot_probe_pending && !s_slot_probe_inflight &&
+                !s_recall_pending && !s_catalog_inflight && !s_scene_fault && s_midi_ready) {
+            int next=(int)s_level_raw+(delta>0?1:-1);
+            if(next>=0 && next<=100) {
+                if(nanocore_protocol_set_preset_volume((uint8_t)next)==ESP_OK) {
+                    mark_edit_dirty();
+                    s_volume_target=(uint8_t)next;
+                    s_volume_write_pending=true;
+                    s_volume_deadline=esp_timer_get_time()+4000000LL;
+                    slot_probe_request(false);
+                } else show_notice("VOLUME TX FAILED");
+            }
+        }
         else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known && s_levels_write_ready &&
                 !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
             int next=(int)s_input_gain_db+(delta>0?1:-1);
@@ -2734,7 +2792,7 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         render_ui();
         return;
     }
-    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait) return;
+    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait || s_volume_write_pending) return;
     if (encoder == 2 && s_screen == UI_SCREEN_PERFORMANCE &&
         !s_tuner_on &&
         !tempo_engine_tap_active()) {
@@ -2864,14 +2922,18 @@ static void handle_input(input_event_t e)
             nanocore_protocol_set_level_diagnostics(false);
             s_notice[0]='\0';
         } else if(e==INPUT_ENC1_CLICK) {
-            if(s_levels_row==1) { s_levels_edit=false; slot_probe_request(true); }
+            if(s_levels_row==1) {
+                if(s_volume_write_pending || s_slot_probe_pending || s_slot_probe_inflight) return;
+                if(!s_level_raw_known) { s_levels_edit=false; slot_probe_request(true); }
+                else s_levels_edit=!s_levels_edit;
+            }
             else if(!s_levels_known || !s_levels_write_ready) levels_read();
             else if(!s_levels_wait) s_levels_edit=!s_levels_edit;
         }
         render_ui();
         return;
     }
-    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait) {
+    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait || s_volume_write_pending) {
         if(e==INPUT_ENC2_CLICK) slot_probe_request(true);
         return;
     }
@@ -3162,6 +3224,17 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         }
 
         bool level_known=e->live_header_byte<=100;
+        bool level_changed=level_known && s_level_raw_known && s_level_raw!=e->live_header_byte;
+        if(was_recall) { s_base_volume_known=level_known; s_base_volume=e->live_header_byte; }
+        if(s_volume_write_pending && probe) {
+            s_volume_write_pending=false;
+            if(!level_known || e->live_header_byte!=s_volume_target) {
+                s_levels_edit=false;
+                ESP_LOGW(TAG,"LEVEL|VOLUME_MISMATCH|wanted=%u|read=%u",s_volume_target,e->live_header_byte);
+                queue_notice("VOLUME NOT CONFIRMED");
+            } else ESP_LOGI(TAG,"LEVEL|VOLUME_CONFIRMED|value=%u",e->live_header_byte);
+        }
+        if(level_changed && !was_recall && s_scene_phase==SCENE_IDLE) mark_edit_dirty();
         if(level_known && (!s_level_raw_known || s_level_raw!=e->live_header_byte))
             ESP_LOGI(TAG,"LEVEL|PRESET_VOLUME|slot=%u|value=%u",e->slot,e->live_header_byte);
         s_level_raw_known=level_known;
@@ -3473,7 +3546,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10C / SIGNED INPUT PACKING + MASTER CAPTURE");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10D / PRESET + SCENE VOLUME");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
