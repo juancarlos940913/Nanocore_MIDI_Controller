@@ -811,3 +811,50 @@ const nanocore_effect_type_info_t *nanocore_spec_synth_voice(uint8_t id)
 {
     return id < nanocore_spec_synth_voice_count() ? &SYNTH_VOICES[id] : NULL;
 }
+
+/* Stage 08C: observed Synth catalog membership. Keep the legacy enum,
+ * normal selector ordering, wire IDs and persistent structures unchanged.
+ * REV sequence is the order observed in the physical sweep; confirm it
+ * is the actual consecutive selector order before final UI acceptance. */
+static const uint8_t SYNTH_REV_SELECTOR_ORDER[] = {0,1,2,3,7,5,6};
+
+size_t nanocore_spec_mode_type_count(controller_block_t block, bool synth_mode)
+{
+    if (!synth_mode) return nanocore_spec_editor_type_count(block);
+    switch (block) {
+    case BLOCK_FX1:
+    case BLOCK_DELAY:
+    case BLOCK_MOD:
+    case BLOCK_EQ:
+        return nanocore_spec_editor_type_count(block);
+    case BLOCK_REVERB:
+        return sizeof(SYNTH_REV_SELECTOR_ORDER)/sizeof(SYNTH_REV_SELECTOR_ORDER[0]);
+    case BLOCK_FX2: /* No physical Pitch..last sweep yet. */
+    case BLOCK_AMP:
+    case BLOCK_CAB:
+    default:
+        return 0;
+    }
+}
+
+const nanocore_effect_type_info_t *nanocore_spec_mode_type_by_selector(
+    controller_block_t block, bool synth_mode, size_t index)
+{
+    if (index >= nanocore_spec_mode_type_count(block, synth_mode)) return NULL;
+    if (synth_mode && block == BLOCK_REVERB) {
+        return nanocore_spec_editor_type_by_raw(block, SYNTH_REV_SELECTOR_ORDER[index]);
+    }
+    return nanocore_spec_editor_type_by_selector(block, index);
+}
+
+int nanocore_spec_mode_selector_index(
+    controller_block_t block, bool synth_mode, uint8_t raw_type_id)
+{
+    size_t count = nanocore_spec_mode_type_count(block, synth_mode);
+    for (size_t i = 0; i < count; ++i) {
+        const nanocore_effect_type_info_t *type =
+            nanocore_spec_mode_type_by_selector(block, synth_mode, i);
+        if (type && type->id == raw_type_id) return (int)i;
+    }
+    return -1;
+}
