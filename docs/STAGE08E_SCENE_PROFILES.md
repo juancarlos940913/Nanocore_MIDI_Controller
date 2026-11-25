@@ -50,3 +50,11 @@ per scene; chain order remains device preset's chain. Synth base preset
 editing/SAVE outside SCENE stays read-only. Scene snapshots do not claim
 gapless switching. Verify timing on hardware; don't use live on stage
 until tested. Firmware build/physical validation pending.
+
+Mode confirmation retries up to two readbacks (no redundant mode writes);
+verification retries one read. Normal scene recalls explicitly transmit
+AMP/CAB model IDs, even if the local mirror matches, and restore their
+parameters. Physical block-10 param pushes are accepted as candidates
+through a separate event; wire behavior still requires validation.
+Save rejection leaves editing available. Scene recall failure is not
+reported READY; no persistent scene overwrite on failed readback.

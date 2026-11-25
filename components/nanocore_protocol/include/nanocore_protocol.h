@@ -27,6 +27,7 @@ typedef enum {
     NC_PROTO_EVENT_PARAM_VALUE,
     NC_PROTO_EVENT_MODEL_CATALOG,
     NC_PROTO_EVENT_SYNTH_CAPTURE,
+    NC_PROTO_EVENT_SYNTH_PARAM_VALUE,
 } nanocore_protocol_event_type_t;
 
 typedef struct {

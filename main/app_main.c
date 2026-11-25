@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -172,6 +173,7 @@ static int64_t s_scene_base_deadline;
 static uint16_t s_scene_seq;
 static int64_t s_scene_deadline;
 static bool s_scene_target_mode;
+static uint8_t s_scene_read_retries;
 static bool s_scene_fault;
 static controller_scene_profile_t s_scene_profile;
 static controller_scene_profile_t s_scene_name_scratch;
@@ -933,9 +935,13 @@ static bool scene_profile_valid(const controller_scene_profile_t *p)
 static void scene_fail(const char *notice)
 {
     ESP_LOGW(TAG, "SCENE|FAIL|phase=%u|%s", (unsigned)s_scene_phase, notice);
+    /* A rejected save must leave the editor usable so a bad type (e.g.
+     * a hidden drive in Synth) can be corrected. Recall faults lock edits
+     * until an explicit retry or another scene/mode selection. */
+    bool save_failed = s_scene_phase == SCENE_SAVE;
     s_scene_phase = SCENE_IDLE;
     s_scene_after_models = false;
-    s_scene_fault = true;
+    s_scene_fault = !save_failed;
     s_parameter_editing = false;
     show_notice(notice);
 }
@@ -964,6 +970,7 @@ static void scene_select_mode(bool synth)
     }
     if (s_synth_mode == synth && !s_scene_fault) return;
     s_scene_target_mode = synth;
+    s_scene_read_retries = 0;
     s_scene_phase = SCENE_MODE_EDIT;
     s_scene_fault = false;
     if (nanocore_protocol_set_synth_mode(synth) != ESP_OK) {
@@ -1010,7 +1017,9 @@ static bool scene_send_profile(void)
             scene_near(s_block_params[b], r->params, r->count);
         bool type_written = false;
         if (model) {
-            if (!same_type) {
+            /* 0x63 lacks live model IDs. Explicitly restore the saved scene
+             * model even when the old local mirror happens to match. */
+            {
                 rc = nanocore_protocol_set_block_model(block, r->type);
                 if (rc != ESP_OK) return false;
                 if (block == BLOCK_AMP) {
@@ -1048,6 +1057,7 @@ static bool scene_send_profile(void)
 static void scene_send_and_verify(void)
 {
     s_scene_phase = SCENE_VERIFY;
+    s_scene_read_retries = 0;
     show_notice("APPLYING SCENE");
     if (!scene_send_profile()) {
         scene_fail("SCENE EFFECT TX FAILED");
@@ -1093,6 +1103,8 @@ static void scene_request_save(void)
         show_notice("WAIT SYNC / RETRY SCENE");
         return;
     }
+    s_scene_read_retries = 0;
+    s_scene_phase = SCENE_SAVE;
     show_notice("CAPTURING SCENE");
     (void)scene_start_read(SCENE_SAVE);
 }
@@ -1158,6 +1170,11 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
     scene_phase_t phase = s_scene_phase;
     if (phase == SCENE_MODE_EDIT || phase == SCENE_MODE_RECALL) {
         if (!e->synth_mode_known || e->synth_mode != s_scene_target_mode) {
+            if (s_scene_read_retries++ < 2) {
+                ESP_LOGW(TAG, "SCENE|MODE_WAIT|retry=%u", s_scene_read_retries);
+                (void)scene_start_read(phase);
+                return;
+            }
             scene_fail("SYNTH MODE NOT CONFIRMED");
             return;
         }
@@ -1172,6 +1189,10 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
         }
     } else if (phase == SCENE_VERIFY) {
         if (!scene_verify(e)) {
+            if (s_scene_read_retries++ < 1) {
+                (void)scene_start_read(SCENE_VERIFY);
+                return;
+            }
             scene_fail("SCENE VERIFY FAILED");
             return;
         }
@@ -1228,6 +1249,7 @@ static void apply_current_scene(void)
     }
     s_scene_fault = false;
     s_scene_target_mode = s_scene_profile.synth_mode != 0;
+    s_scene_read_retries = 0;
     ESP_LOGI(TAG, "SCENE|APPLY|preset=%u|scene=%c|mode=%u",
              s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
              s_scene_profile.synth_mode);
@@ -1371,6 +1393,7 @@ static void cycle_mode(void)
     if (s_runtime.mode == CTRL_MODE_SCENE) {
         apply_current_scene();
     } else if (previous == CTRL_MODE_SCENE) {
+        s_scene_fault = false;
         // Leaving Scene must remove its temporary overrides and return to
         // the saved physical NanoCore preset.
         restore_current_preset_to_nanocore();
@@ -2595,6 +2618,9 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         if (e->synth_mode_known) {
             bool changed = s_synth_mode != e->synth_mode;
+            if (changed && !was_recall && s_scene_phase == SCENE_IDLE &&
+                s_runtime.mode == CTRL_MODE_SCENE && s_synth_mode_known)
+                s_dirty = true;
             s_synth_mode_known = true;
             s_synth_mode = e->synth_mode;
             s_synth_voice_known = e->synth_known;
@@ -2683,10 +2709,11 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
     case NC_PROTO_EVENT_BLOCK_STATE: {
         if (e->block >= BLOCK_COUNT || scene_busy()) break;
 
+        bool changed = !s_block_known[e->block] || s_block_on[e->block] != e->on;
         s_block_known[e->block] = true;
         s_block_on[e->block] = e->on;
         if (s_runtime.mode == CTRL_MODE_SCENE || s_synth_mode) {
-            if (s_runtime.mode == CTRL_MODE_SCENE) s_dirty = true;
+            if (s_runtime.mode == CTRL_MODE_SCENE && changed) s_dirty = true;
             render_ui();
             break;
         }
@@ -2819,10 +2846,23 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         break;
     }
 
+    case NC_PROTO_EVENT_SYNTH_PARAM_VALUE:
+        if (!scene_busy() && s_synth_mode && s_synth_voice_known &&
+            e->param_index < s_synth_param_count) {
+            bool changed = fabsf(s_synth_params[e->param_index] - e->param_value) > 0.00001f;
+            s_synth_params[e->param_index] = e->param_value;
+            if (changed && s_runtime.mode == CTRL_MODE_SCENE) s_dirty = true;
+            render_ui();
+        }
+        break;
+
     case NC_PROTO_EVENT_PARAM_VALUE:
         if (scene_busy()) break;
         if (e->block < BLOCK_COUNT &&
             e->param_index < NC_PROTO_MAX_PARAMS) {
+            bool changed = !s_block_profile_known[e->block] ||
+                e->param_index >= s_block_param_count[e->block] ||
+                fabsf(s_block_params[e->block][e->param_index] - e->param_value) > 0.00001f;
             s_block_profile_known[e->block] = true;
             if (s_block_param_count[e->block] <= e->param_index) {
                 s_block_param_count[e->block] =
@@ -2836,7 +2876,9 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
              * writes do not echo it. Therefore this is a genuine unsaved
              * device-side edit and must participate in the dirty guard.
              */
-            if (!s_synth_mode || s_runtime.mode == CTRL_MODE_SCENE) s_dirty = true;
+            if (s_runtime.mode == CTRL_MODE_SCENE) {
+                if (changed) s_dirty = true;
+            } else if (!s_synth_mode) s_dirty = true;
             render_ui();
         }
         break;

@@ -1121,13 +1121,14 @@ static void parse_push(const uint8_t *msg, size_t len)
         uint8_t block_id = msg[11];
         uint8_t param_index = msg[12];
 
-        if (block_id < BLOCK_COUNT &&
-            param_index < NC_PROTO_MAX_PARAMS) {
+        if ((block_id < BLOCK_COUNT && param_index < NC_PROTO_MAX_PARAMS) ||
+            (block_id == WIRE_SYNTH_BLOCK && param_index < NC_PROTO_SYNTH_MAX_PARAMS)) {
             float value = read_float32_le(&msg[14]);
             if (value >= 0.0f && value <= 1.0f) {
                 nanocore_protocol_event_t *e =
-                    scratch_event(NC_PROTO_EVENT_PARAM_VALUE);
-                e->block = (controller_block_t)block_id;
+                    scratch_event(block_id == WIRE_SYNTH_BLOCK ?
+                        NC_PROTO_EVENT_SYNTH_PARAM_VALUE : NC_PROTO_EVENT_PARAM_VALUE);
+                if (block_id < BLOCK_COUNT) e->block = (controller_block_t)block_id;
                 e->param_index = param_index;
                 e->param_value = value;
                 queue_event(e);
