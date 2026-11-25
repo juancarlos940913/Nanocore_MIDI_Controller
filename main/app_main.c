@@ -1815,11 +1815,17 @@ static bool discard_reload_local(void)
     }
     bool base_known=s_base_mode_known;
     bool base_mode=s_base_mode;
+    bool base_gain_known=s_base_gain_known;
+    int8_t base_gain_db=s_base_gain_db;
     s_preset=saved;
     scene_load_names();
     if(!s_base_mode_known && base_known) {
         s_base_mode_known=true;
         s_base_mode=base_mode;
+    }
+    if(!s_base_gain_known && base_gain_known) {
+        s_base_gain_known=true;
+        s_base_gain_db=base_gain_db;
     }
     s_preset.active_scene=s_runtime.current_scene;
     tempo_engine_set_bpm(s_preset.bpm);
@@ -3234,6 +3240,14 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
     switch (e->type) {
     case NC_PROTO_EVENT_GLOBAL_LEVELS:
+        if((s_scene_phase==SCENE_SAVE || s_scene_phase==SCENE_BASE_SAVE) &&
+           e->global_push && e->input_gain_db!=s_gain_capture_db) {
+            s_input_gain_db=e->input_gain_db;
+            s_levels_known=true;
+            mark_edit_dirty();
+            scene_fail("GAIN CHANGED - SAVE AGAIN");
+            break;
+        }
         if(s_scene_phase>=SCENE_GAIN_SAVE) {
             scene_handle_gain(e);
             break;
