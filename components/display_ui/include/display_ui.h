@@ -43,6 +43,9 @@ typedef struct {
     bool synth_voice_known;
     bool synth_voice_on;
     bool editor_read_only;
+    bool scene_busy;
+    bool scene_fault;
+    bool scene_captured;
     controller_block_t selected_block;
     size_t selected_parameter;
     bool parameter_editing;

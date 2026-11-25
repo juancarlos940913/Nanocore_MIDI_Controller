@@ -230,7 +230,9 @@ static void footer(const display_ui_state_t *s)
              s->tap_capture?"  TAP":"");
     text(12,296,buf,s->tap_capture?C_BLUE:C_MUTED,1);
 
-    if (s->synth_mode && s->screen == UI_SCREEN_PERFORMANCE) {
+    if (s->mode == CTRL_MODE_SCENE && s->screen == UI_SCREEN_PERFORMANCE) {
+        text(205,296,"ENC2: - GUITAR + SYNTH",C_MUTED,1);
+    } else if (s->synth_mode && s->screen == UI_SCREEN_PERFORMANCE) {
         text(205,296,"READ ONLY  ENC2 REFRESH",C_MUTED,1);
     } else if (s->mode == CTRL_MODE_STOMP &&
         s->screen == UI_SCREEN_PERFORMANCE) {
@@ -252,7 +254,14 @@ static void performance(const display_ui_state_t *s)
         text_center(LCD_W/2,78,sb,C_ORANGE,1);
     }
 
-    if (s->synth_mode) {
+    if (s->mode == CTRL_MODE_SCENE) {
+        const char *status = s->scene_busy ? "SCENE SYNC..." :
+            s->scene_fault ? "SCENE ERROR - ENC2 RETRY" :
+            !s->synth_mode_known ? "SOUND MODE UNKNOWN" :
+            s->scene_captured ? (s->synth_mode ? "SYNTH / SAVED" : "GUITAR / SAVED") :
+            (s->synth_mode ? "SYNTH / NEW SCENE" : "GUITAR / NEW SCENE");
+        text_center(LCD_W/2,96,status,C_CYAN,1);
+    } else if (s->synth_mode) {
         text_center(LCD_W/2,88,s->synth_mode_known?"SYNTH MODE - READ ONLY":"SYNTH MODE - SYNC?",C_CYAN,1);
     }
     const int x0=18,y0=108,w=102,h=64,gx=12,gy=12;

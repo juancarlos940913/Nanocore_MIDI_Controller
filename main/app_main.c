@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -159,6 +160,30 @@ static ui_screen_t s_screen = UI_SCREEN_PERFORMANCE;
 
 static name_editor_t s_name_editor;
 static bool s_name_target_scene;
+
+/* Main-task scene transaction. Legacy preset blobs remain unchanged. */
+typedef enum {
+    SCENE_IDLE = 0, SCENE_MODE_EDIT, SCENE_MODE_RECALL,
+    SCENE_VERIFY, SCENE_SAVE
+} scene_phase_t;
+static scene_phase_t s_scene_phase;
+static bool s_scene_after_models;
+static int64_t s_scene_base_deadline;
+static uint16_t s_scene_seq;
+static int64_t s_scene_deadline;
+static bool s_scene_target_mode;
+static bool s_scene_fault;
+static controller_scene_profile_t s_scene_profile;
+static controller_scene_profile_t s_scene_name_scratch;
+static bool s_scene_saved[CTRL_SCENE_COUNT];
+
+static bool scene_busy(void)
+{
+    return s_scene_phase != SCENE_IDLE || s_scene_after_models;
+}
+static void apply_current_scene(void);
+static void scene_select_mode(bool synth);
+static void scene_request_save(void);
 
 static void render_ui(void);
 
@@ -522,7 +547,7 @@ static void service_model_catalog(void)
     }
 
     /* User input, preset recall and mapper capture take precedence. */
-    if (s_recall_pending || s_recall_poll_inflight ||
+    if (s_recall_pending || s_recall_poll_inflight || scene_busy() ||
         s_tuner_on || s_screen == UI_SCREEN_NAME_EDITOR ||
         nanocore_mapper_is_enabled() ||
         now < s_catalog_next_us || now < s_catalog_quiet_until_us) {
@@ -752,6 +777,36 @@ static esp_err_t send_editor_type_raw(controller_block_t block,
 
 static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
 {
+    /* A full scene is saved from confirmed LIVE state, not a 16-CC
+     * approximation. Do not consume or overwrite legacy sparse overlays. */
+    if (s_runtime.mode == CTRL_MODE_SCENE) {
+        if (!s_midi_ready || !s_synth_mode_known || scene_busy() || s_scene_fault)
+            return ESP_ERR_INVALID_STATE;
+        int type_block = block_from_type_cc(cc);
+        int on_block = block_from_onoff_cc(cc);
+        esp_err_t tx;
+        if (type_block >= 0) {
+            if (nanocore_spec_mode_selector_index((controller_block_t)type_block,
+                                                   s_synth_mode, value) < 0)
+                return ESP_ERR_INVALID_ARG;
+            tx = send_editor_type_raw((controller_block_t)type_block, value);
+        } else {
+            if (s_synth_mode && (on_block == BLOCK_AMP || on_block == BLOCK_CAB))
+                return ESP_ERR_INVALID_ARG;
+            tx = send_cc(cc, value);
+        }
+        if (tx == ESP_OK) {
+            if (on_block >= 0) {
+                s_block_known[on_block] = true;
+                s_block_on[on_block] = value >= 64;
+            }
+            s_dirty = true;
+        } else {
+            show_notice("SCENE WRITE FAILED");
+        }
+        render_ui();
+        return tx;
+    }
     size_t count = 0;
     midi_assignment_t *items = edit_assignments(&count);
 
@@ -824,31 +879,369 @@ static void apply_assignments(const midi_assignment_t *items,
     }
 }
 
-static void apply_current_scene(void)
+static void scene_load_names(void)
 {
-    if (s_synth_mode) {
-        show_notice("SYNTH SCENE READ ONLY");
+    memset(s_scene_saved, 0, sizeof(s_scene_saved));
+    for (uint8_t i = 0; i < CTRL_SCENE_COUNT; ++i) {
+        esp_err_t rc = controller_storage_scene_load(
+            s_runtime.current_preset, i, &s_scene_name_scratch);
+        if (rc == ESP_OK) {
+            s_scene_saved[i] = true;
+            snprintf(s_preset.scene[i].name, CTRL_NAME_LEN, "%s",
+                     s_scene_name_scratch.name);
+        }
+    }
+}
+
+static bool scene_block_visible(bool synth, int block)
+{
+    return !synth || (block != BLOCK_AMP && block != BLOCK_CAB);
+}
+
+static bool scene_values_valid(const float *p, uint8_t count)
+{
+    for (uint8_t i = 0; i < count; ++i)
+        if (!(p[i] >= 0.0f && p[i] <= 1.0f)) return false;
+    return true;
+}
+
+static bool scene_profile_valid(const controller_scene_profile_t *p)
+{
+    if (p->version != CTRL_PROFILE_VERSION || p->synth_mode > 1 ||
+        p->synth_on > 1) return false;
+    if (p->synth_mode) {
+        const nanocore_effect_type_info_t *v = nanocore_spec_synth_voice(p->synth_voice);
+        /* 0x0A controls mode; a separate voice bypass write is unverified. */
+        if (!p->synth_on || !v || p->synth_count != v->expected_param_count ||
+            p->synth_count > CTRL_PROFILE_SYNTH_PARAMS ||
+            !scene_values_valid(p->synth_params, p->synth_count)) return false;
+    }
+    for (int b = 0; b < BLOCK_COUNT; ++b) {
+        if (!scene_block_visible(p->synth_mode, b)) continue;
+        const controller_scene_block_t *r = &p->block[b];
+        const nanocore_effect_type_info_t *t =
+            nanocore_spec_editor_type_by_raw((controller_block_t)b, r->type);
+        if (!t || r->on > 1 || r->count > CTRL_PROFILE_PARAMS ||
+            r->count != t->expected_param_count ||
+            nanocore_spec_mode_selector_index((controller_block_t)b,
+                                              p->synth_mode, r->type) < 0 ||
+            !scene_values_valid(r->params, r->count)) return false;
+    }
+    return true;
+}
+
+static void scene_fail(const char *notice)
+{
+    ESP_LOGW(TAG, "SCENE|FAIL|phase=%u|%s", (unsigned)s_scene_phase, notice);
+    s_scene_phase = SCENE_IDLE;
+    s_scene_after_models = false;
+    s_scene_fault = true;
+    s_parameter_editing = false;
+    show_notice(notice);
+}
+
+static bool scene_start_read(scene_phase_t phase)
+{
+    s_scene_phase = phase;
+    catalog_defer(CATALOG_IDLE_MS);
+    vTaskDelay(pdMS_TO_TICKS(160));
+    esp_err_t rc = nanocore_protocol_request_live_state_seq(&s_scene_seq);
+    if (rc != ESP_OK) {
+        scene_fail("SCENE LIVE READ FAILED");
+        return false;
+    }
+    s_scene_deadline = esp_timer_get_time() + 3000000LL;
+    return true;
+}
+
+static void scene_select_mode(bool synth)
+{
+    if (s_runtime.mode != CTRL_MODE_SCENE || scene_busy() ||
+        !s_midi_ready || s_recall_pending || s_recall_poll_inflight ||
+        s_catalog_inflight || !s_synth_mode_known) {
+        show_notice("WAIT LIVE SYNC");
         return;
     }
-    if (s_runtime.current_scene >= CTRL_SCENE_COUNT) {
-        s_runtime.current_scene = 0;
+    if (s_synth_mode == synth && !s_scene_fault) return;
+    s_scene_target_mode = synth;
+    s_scene_phase = SCENE_MODE_EDIT;
+    s_scene_fault = false;
+    if (nanocore_protocol_set_synth_mode(synth) != ESP_OK) {
+        scene_fail("SYNTH MODE TX FAILED");
+        return;
+    }
+    show_notice("CHANGING SOUND MODE");
+    (void)scene_start_read(SCENE_MODE_EDIT);
+}
+
+static bool scene_near(const float *a, const float *b, uint8_t count)
+{
+    for (uint8_t i = 0; i < count; ++i)
+        if (!(fabsf(a[i] - b[i]) <= 0.002f)) return false;
+    return true;
+}
+
+/* Exact float vectors, not default presets. Type writes also carry params. */
+static bool scene_send_profile(void)
+{
+    const controller_scene_profile_t *p = &s_scene_profile;
+    esp_err_t rc;
+    if (!s_midi_ready || !s_synth_mode_known ||
+        s_synth_mode != (p->synth_mode != 0)) return false;
+
+    if (p->synth_mode &&
+        (!s_synth_voice_known || s_synth_voice != p->synth_voice ||
+         s_synth_param_count != p->synth_count ||
+         !scene_near(s_synth_params, p->synth_params, p->synth_count))) {
+        rc = nanocore_protocol_set_synth_voice(p->synth_voice, p->synth_params, p->synth_count);
+        if (rc != ESP_OK) return false;
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 
+    for (int b = 0; b < BLOCK_COUNT; ++b) {
+        if (!scene_block_visible(p->synth_mode, b)) continue;
+        controller_block_t block = (controller_block_t)b;
+        const controller_scene_block_t *r = &p->block[b];
+        bool model = nanocore_spec_editor_is_model_block(block);
+        uint8_t raw = 0;
+        bool same_type = current_type_raw(block, &raw) && raw == r->type;
+        bool same_params = s_block_profile_known[b] &&
+            s_block_param_count[b] == r->count &&
+            scene_near(s_block_params[b], r->params, r->count);
+        bool type_written = false;
+        if (model) {
+            if (!same_type) {
+                rc = nanocore_protocol_set_block_model(block, r->type);
+                if (rc != ESP_OK) return false;
+                if (block == BLOCK_AMP) {
+                    s_amp_model = r->type;
+                    s_amp_model_known = true;
+                } else {
+                    s_cab_model = r->type;
+                    s_cab_model_known = true;
+                }
+                type_written = true;
+                vTaskDelay(pdMS_TO_TICKS(40));
+            }
+            if (!same_params || type_written) {
+                for (uint8_t i = 0; i < r->count; ++i) {
+                    rc = nanocore_protocol_set_block_param(block, i, r->params[i]);
+                    if (rc != ESP_OK) return false;
+                    vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
+                }
+            }
+        } else if (!same_type || !same_params) {
+            rc = nanocore_protocol_set_block_type(block, r->type, r->params, r->count);
+            if (rc != ESP_OK) return false;
+            type_written = true;
+            vTaskDelay(pdMS_TO_TICKS(40));
+        }
+        if (type_written || !s_block_known[b] || s_block_on[b] != (r->on != 0)) {
+            rc = send_cc(nanocore_block_onoff_cc(block), r->on ? 127 : 0);
+            if (rc != ESP_OK) return false;
+            vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
+        }
+    }
+    return true;
+}
+
+static void scene_send_and_verify(void)
+{
+    s_scene_phase = SCENE_VERIFY;
+    show_notice("APPLYING SCENE");
+    if (!scene_send_profile()) {
+        scene_fail("SCENE EFFECT TX FAILED");
+        return;
+    }
+    (void)scene_start_read(SCENE_VERIFY);
+}
+
+static bool scene_verify(const nanocore_protocol_event_t *e)
+{
+    const controller_scene_profile_t *p = &s_scene_profile;
+    if (!e->synth_mode_known || e->synth_mode != (p->synth_mode != 0)) return false;
+    if (p->synth_mode &&
+        (!e->synth_known || e->synth_on != (p->synth_on != 0) ||
+         e->synth_variant != p->synth_voice ||
+         e->synth_param_count != p->synth_count ||
+         !scene_near(e->synth_params, p->synth_params, p->synth_count))) {
+        ESP_LOGW(TAG, "SCENE|VERIFY_MISMATCH|SYNTH");
+        return false;
+    }
+    for (int b = 0; b < BLOCK_COUNT; ++b) {
+        if (!scene_block_visible(p->synth_mode, b)) continue;
+        const controller_scene_block_t *r = &p->block[b];
+        bool model = b == BLOCK_AMP || b == BLOCK_CAB;
+        if (!e->block_known[b] || !e->block_profile_known[b] ||
+            e->block_on[b] != (r->on != 0) ||
+            (!model && e->block_variant[b] != r->type) ||
+            e->block_param_count[b] != r->count ||
+            !scene_near(e->block_params[b], r->params, r->count)) {
+            ESP_LOGW(TAG, "SCENE|VERIFY_MISMATCH|block=%d", b);
+            return false;
+        }
+        /* 0x63 cannot report live AMP/CAB model indices: TX/local mirror
+         * is all we have. Never claim an independent model readback. */
+    }
+    return true;
+}
+
+static void scene_request_save(void)
+{
+    if (!s_midi_ready || !s_synth_mode_known || scene_busy() ||
+        s_scene_fault || s_recall_pending || s_catalog_inflight) {
+        show_notice("WAIT SYNC / RETRY SCENE");
+        return;
+    }
+    show_notice("CAPTURING SCENE");
+    (void)scene_start_read(SCENE_SAVE);
+}
+
+static void scene_save_from_live(const nanocore_protocol_event_t *e)
+{
+    controller_scene_profile_t *p = &s_scene_profile;
+    memset(p, 0, sizeof(*p));
+    if (!e->synth_mode_known || !s_name_editor.active || !s_name_target_scene) {
+        scene_fail("SCENE MODE UNKNOWN");
+        return;
+    }
+    p->version = CTRL_PROFILE_VERSION;
+    p->synth_mode = e->synth_mode;
+    p->synth_on = e->synth_on;
+    p->synth_voice = e->synth_variant;
+    p->synth_count = e->synth_param_count;
+    memcpy(p->synth_params, e->synth_params, sizeof(p->synth_params));
+    snprintf(p->name, sizeof(p->name), "%s", s_name_editor.text);
+    for (int b = 0; b < BLOCK_COUNT; ++b) {
+        if (!scene_block_visible(p->synth_mode, b)) continue;
+        if (!e->block_known[b] || !e->block_profile_known[b] ||
+            (b == BLOCK_AMP && !s_amp_model_known) ||
+            (b == BLOCK_CAB && !s_cab_model_known)) {
+            scene_fail("SCENE PROFILE INCOMPLETE");
+            return;
+        }
+        controller_scene_block_t *r = &p->block[b];
+        r->on = e->block_on[b];
+        r->type = b == BLOCK_AMP ? s_amp_model :
+                  b == BLOCK_CAB ? s_cab_model : e->block_variant[b];
+        r->count = e->block_param_count[b];
+        memcpy(r->params, e->block_params[b], sizeof(r->params));
+    }
+    if (!scene_profile_valid(p)) {
+        scene_fail("SCENE TYPE/VOICE NOT VALID");
+        return;
+    }
+    esp_err_t rc = controller_storage_scene_save(s_runtime.current_preset,
+                                                  s_runtime.current_scene, p);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "SCENE|STORAGE_ERROR|%s", esp_err_to_name(rc));
+        scene_fail("SCENE SAVE FAILED");
+        return;
+    }
+    s_scene_saved[s_runtime.current_scene] = true;
+    snprintf(s_preset.scene[s_runtime.current_scene].name, CTRL_NAME_LEN, "%s", p->name);
     s_preset.active_scene = s_runtime.current_scene;
+    s_dirty = false;
+    s_scene_phase = SCENE_IDLE;
+    s_scene_fault = false;
+    name_editor_close(&s_name_editor);
+    s_screen = UI_SCREEN_PERFORMANCE;
+    (void)persist_runtime();
+    ESP_LOGI(TAG, "SCENE|SAVED|preset=%u|scene=%c|mode=%u|name=%s",
+             s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
+             p->synth_mode, p->name);
+    show_notice("SCENE SAVED TO CONTROLLER");
+}
 
-    if (s_midi_ready) {
-        size_t count = 0;
-        const midi_assignment_t *items =
-            scene_assignments(s_runtime.current_scene, &count);
+static void scene_handle_live(const nanocore_protocol_event_t *e)
+{
+    scene_phase_t phase = s_scene_phase;
+    if (phase == SCENE_MODE_EDIT || phase == SCENE_MODE_RECALL) {
+        if (!e->synth_mode_known || e->synth_mode != s_scene_target_mode) {
+            scene_fail("SYNTH MODE NOT CONFIRMED");
+            return;
+        }
+        ESP_LOGI(TAG, "SCENE|MODE_OK|mode=%u", e->synth_mode);
+        if (phase == SCENE_MODE_EDIT) {
+            s_scene_phase = SCENE_IDLE;
+            s_scene_fault = false;
+            s_dirty = true;
+            show_notice(e->synth_mode ? "SCENE SYNTH MODE" : "SCENE GUITAR MODE");
+        } else {
+            scene_send_and_verify();
+        }
+    } else if (phase == SCENE_VERIFY) {
+        if (!scene_verify(e)) {
+            scene_fail("SCENE VERIFY FAILED");
+            return;
+        }
+        s_scene_phase = SCENE_IDLE;
+        s_scene_fault = false;
+        s_dirty = false;
+        s_preset.active_scene = s_runtime.current_scene;
+        (void)persist_runtime();
+        ESP_LOGI(TAG, "SCENE|READY|preset=%u|scene=%c|mode=%u|name=%s",
+                 s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
+                 s_scene_profile.synth_mode, s_scene_profile.name);
+        show_notice("SCENE READY");
+    } else if (phase == SCENE_SAVE) {
+        scene_save_from_live(e);
+    }
+}
 
-        ESP_LOGI(TAG, "Apply Scene %c / %s",
-                 (char)('A' + s_runtime.current_scene),
-                 s_preset.scene[s_runtime.current_scene].name);
-        apply_assignments(items, count);
+static void apply_current_scene(void)
+{
+    if (s_runtime.current_scene >= CTRL_SCENE_COUNT)
+        s_runtime.current_scene = 0;
+    if (!s_midi_ready || s_recall_pending || s_recall_poll_inflight ||
+        s_scene_phase != SCENE_IDLE || s_catalog_inflight) {
+        show_notice("WAIT LIVE SYNC");
+        return;
     }
 
-    (void)persist_runtime();
-    render_ui();
+    esp_err_t rc = controller_storage_scene_load(s_runtime.current_preset,
+                           s_runtime.current_scene, &s_scene_profile);
+    if (rc == ESP_ERR_NVS_NOT_FOUND) {
+        /* Legacy/unused scenes have no independent full snapshot.
+         * Preserve the existing guitar sparse overlay behavior. New
+         * scenes begin with the current sound until explicitly saved. */
+        if (!s_synth_mode) {
+            size_t count = 0;
+            const midi_assignment_t *items = scene_assignments(s_runtime.current_scene, &count);
+            apply_assignments(items, count);
+        }
+        s_scene_fault = false;
+        s_preset.active_scene = s_runtime.current_scene;
+        (void)persist_runtime();
+        ESP_LOGI(TAG, "SCENE|UNSAVED|preset=%u|scene=%c",
+                 s_runtime.current_preset + 1, 'A' + s_runtime.current_scene);
+        show_notice("SCENE NOT CAPTURED");
+        return;
+    }
+    if (rc != ESP_OK || !scene_profile_valid(&s_scene_profile)) {
+        scene_fail("SCENE STORAGE/PROFILE ERROR");
+        return;
+    }
+    if (!s_synth_mode_known) {
+        scene_fail("SCENE MODE UNKNOWN");
+        return;
+    }
+    s_scene_fault = false;
+    s_scene_target_mode = s_scene_profile.synth_mode != 0;
+    ESP_LOGI(TAG, "SCENE|APPLY|preset=%u|scene=%c|mode=%u",
+             s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
+             s_scene_profile.synth_mode);
+    if (s_synth_mode != s_scene_target_mode) {
+        s_scene_phase = SCENE_MODE_RECALL;
+        if (nanocore_protocol_set_synth_mode(s_scene_target_mode) != ESP_OK) {
+            scene_fail("SCENE MODE TX FAILED");
+            return;
+        }
+        show_notice("CHANGING SOUND MODE");
+        (void)scene_start_read(SCENE_MODE_RECALL);
+    } else {
+        scene_send_and_verify();
+    }
 }
 
 static void restore_current_preset_to_nanocore(void)
@@ -897,6 +1290,8 @@ static esp_err_t load_preset(uint8_t index, bool transmit)
 
     s_preset = loaded;
     s_runtime.current_preset = index;
+    scene_load_names();
+    s_scene_fault = false;
     s_runtime.current_scene =
         s_preset.active_scene < CTRL_SCENE_COUNT
             ? s_preset.active_scene : 0;
@@ -937,6 +1332,16 @@ static void change_preset(int delta)
 
 static void change_scene(int delta)
 {
+    if (scene_busy() || !s_midi_ready || s_recall_pending || s_catalog_inflight) {
+        show_notice("WAIT SCENE SYNC");
+        return;
+    }
+    if (s_dirty) {
+        show_notice("SAVE CHANGES BEFORE SCENE +/-");
+        return;
+    }
+    s_screen = UI_SCREEN_PERFORMANCE;
+    s_parameter_editing = false;
     int s = (int)s_runtime.current_scene + delta;
     while (s < 0) s += CTRL_SCENE_COUNT;
     while (s >= CTRL_SCENE_COUNT) s -= CTRL_SCENE_COUNT;
@@ -947,6 +1352,10 @@ static void change_scene(int delta)
 
 static void cycle_mode(void)
 {
+    if (scene_busy() || (s_runtime.mode == CTRL_MODE_SCENE && s_dirty)) {
+        show_notice("SAVE SCENE BEFORE MODE CHANGE");
+        return;
+    }
     s_parameter_editing = false;
     s_screen = UI_SCREEN_PERFORMANCE;
 
@@ -1068,7 +1477,45 @@ static void select_parameter(int delta)
 
 static void adjust_parameter(int delta)
 {
-    if (delta == 0 || s_synth_mode || s_synth_selected || s_selected_block >= BLOCK_COUNT) return;
+    if (delta == 0 || scene_busy() || s_scene_fault || s_selected_block >= BLOCK_COUNT) return;
+    if (s_synth_mode && s_runtime.mode != CTRL_MODE_SCENE) return;
+    if (s_runtime.mode == CTRL_MODE_SCENE &&
+        (!s_midi_ready || !s_synth_mode_known || s_recall_pending)) return;
+
+    if (s_synth_selected) {
+        if (!s_synth_voice_known) return;
+        if (s_selected_parameter == 0) {
+            show_notice("SET MODE ON PERFORMANCE ENC2");
+            return;
+        }
+        const nanocore_effect_type_info_t *voice = nanocore_spec_synth_voice(s_synth_voice);
+        if (!voice) return;
+        esp_err_t rc;
+        if (s_selected_parameter == 1) {
+            int next = ((int)s_synth_voice + delta) % (int)nanocore_spec_synth_voice_count();
+            if (next < 0) next += (int)nanocore_spec_synth_voice_count();
+            const nanocore_effect_type_info_t *v = nanocore_spec_synth_voice((uint8_t)next);
+            float defaults[NC_PROTO_SYNTH_MAX_PARAMS] = {0};
+            if (!v || !nanocore_spec_editor_defaults(v, defaults, NC_PROTO_SYNTH_MAX_PARAMS)) return;
+            rc = nanocore_protocol_set_synth_voice(v->id, defaults, v->expected_param_count);
+            if (rc == ESP_OK) {
+                s_synth_voice = v->id;
+                s_synth_param_count = v->expected_param_count;
+                memcpy(s_synth_params, defaults, sizeof(s_synth_params));
+            }
+        } else {
+            size_t i = s_selected_parameter - 2;
+            if (i >= voice->expected_param_count || i >= s_synth_param_count) return;
+            float next = nanocore_spec_adjust_normalized(&voice->params[i], s_synth_params[i], delta);
+            rc = nanocore_protocol_set_synth_param((uint8_t)i, next);
+            if (rc == ESP_OK) s_synth_params[i] = next;
+        }
+        if (rc == ESP_OK) {
+            s_dirty = true;
+            render_ui();
+        } else show_notice("SYNTH WRITE FAILED");
+        return;
+    }
 
     /* 0=ON/OFF, 1=TYPE/MODEL, 2..=live type-local parameters. */
     if (s_selected_parameter == 0) {
@@ -1086,10 +1533,10 @@ static void adjust_parameter(int delta)
 
     if (s_selected_parameter == 1) {
         int current = current_type_selector(s_selected_block);
-        if (current < 0) current = 0;
+        if (current < 0) current = delta > 0 ? -1 : 0;
 
         const int count =
-            (int)nanocore_spec_editor_type_count(s_selected_block);
+            (int)nanocore_spec_mode_type_count(s_selected_block, s_synth_mode);
         if (count <= 0) return;
 
         int next = current + delta;
@@ -1097,8 +1544,8 @@ static void adjust_parameter(int delta)
         while (next >= count) next -= count;
 
         const nanocore_effect_type_info_t *info =
-            nanocore_spec_editor_type_by_selector(
-                s_selected_block, (size_t)next);
+            nanocore_spec_mode_type_by_selector(
+                s_selected_block, s_synth_mode, (size_t)next);
         if (!info) return;
 
         (void)set_working_cc(
@@ -1247,26 +1694,7 @@ static void commit_name_and_save(void)
     if (!s_name_editor.active) return;
 
     if (s_name_target_scene) {
-        strncpy(s_preset.scene[s_runtime.current_scene].name,
-                s_name_editor.text,
-                CTRL_NAME_LEN - 1);
-        s_preset.scene[s_runtime.current_scene].name[CTRL_NAME_LEN - 1] = '\0';
-
-        s_preset.active_scene = s_runtime.current_scene;
-
-        esp_err_t rc = controller_storage_save_preset(
-            s_runtime.current_preset, &s_preset);
-        if (rc != ESP_OK) {
-            ESP_LOGE(TAG, "Scene/NVS save failed: %s", esp_err_to_name(rc));
-            show_notice("SCENE SAVE FAILED");
-            return;
-        }
-
-        s_dirty = false;
-        name_editor_close(&s_name_editor);
-        s_screen = UI_SCREEN_PERFORMANCE;
-        (void)persist_runtime();
-        show_notice("SCENE SAVED TO CONTROLLER");
+        scene_request_save();
         return;
     }
 
@@ -1343,7 +1771,11 @@ static void render_ui(void)
         .synth_selected = s_synth_selected,
         .synth_voice_known = s_synth_voice_known,
         .synth_voice_on = s_synth_voice_on,
-        .editor_read_only = s_synth_mode,
+        .editor_read_only = (s_synth_mode && s_runtime.mode != CTRL_MODE_SCENE) ||
+                            scene_busy() || s_scene_fault,
+        .scene_busy = scene_busy(),
+        .scene_fault = s_scene_fault,
+        .scene_captured = s_scene_saved[s_runtime.current_scene],
         .selected_parameter = s_selected_parameter,
         .parameter_editing = s_parameter_editing,
         .notice = s_notice,
@@ -1816,7 +2248,13 @@ static void handle_name_editor_event(input_event_t e)
 
 static void handle_encoder_delta(uint8_t encoder, int delta)
 {
-    if (delta == 0 || s_synmap_enabled) return;
+    if (delta == 0 || s_synmap_enabled || scene_busy()) return;
+    if (encoder == 2 && s_screen == UI_SCREEN_PERFORMANCE &&
+        s_runtime.mode == CTRL_MODE_SCENE && !s_tuner_on &&
+        !tempo_engine_tap_active()) {
+        scene_select_mode(delta > 0);
+        return;
+    }
 
     if (s_screen == UI_SCREEN_NAME_EDITOR) {
         if (encoder == 1) {
@@ -1871,6 +2309,10 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
  * No controller writes are allowed while this temporary mode is active. */
 static void handle_input(input_event_t e)
 {
+    if (scene_busy()) {
+        show_notice("WAIT SCENE SYNC");
+        return;
+    }
     if (s_synmap_enabled) {
         if (e == INPUT_CHORD_MAPPER) {
             if (s_synmap_inflight) {
@@ -1948,9 +2390,11 @@ static void handle_input(input_event_t e)
         return;
     }
 
-    /* Preview cannot write to the device or scene/preset mirrors. */
-    if (s_synth_mode && e != INPUT_ENC1_CLICK && e != INPUT_ENC2_CLICK &&
-        e != INPUT_CHORD_TUNER &&
+    /* Synth editing enabled in SCENE only; base Synth SAVE remains
+     * a separate acceptance task. Controller-mode cycling is allowed. */
+    if (s_synth_mode && s_runtime.mode != CTRL_MODE_SCENE &&
+        e != INPUT_ENC1_CLICK && e != INPUT_ENC2_CLICK &&
+        e != INPUT_CHORD_TUNER && e != INPUT_FS_MODE_SHORT &&
         !(s_runtime.mode == CTRL_MODE_PRESET &&
           (e == INPUT_FS_PRESET_UP || e == INPUT_FS_PRESET_DOWN))) {
         show_notice("SYNTH READ ONLY");
@@ -1960,8 +2404,8 @@ static void handle_input(input_event_t e)
     switch (e) {
     case INPUT_ENC1_CLICK:
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
-            if (s_synth_mode) {
-                show_notice("SYNTH READ ONLY");
+            if ((s_synth_mode && s_runtime.mode != CTRL_MODE_SCENE) || s_scene_fault) {
+                show_notice("READ ONLY / RETRY SCENE");
                 return;
             }
             s_parameter_editing = !s_parameter_editing;
@@ -1977,6 +2421,12 @@ static void handle_input(input_event_t e)
         } else if (s_screen == UI_SCREEN_PERFORMANCE && s_midi_ready &&
                    !s_recall_pending && !s_recall_poll_inflight &&
                    !s_catalog_inflight) {
+            /* Retry a failed recall by reapplying the selected snapshot. */
+            if (s_runtime.mode == CTRL_MODE_SCENE && s_scene_fault && s_synth_mode_known &&
+                s_scene_saved[s_runtime.current_scene]) {
+                apply_current_scene();
+                break;
+            }
             /* Explicit physical mode/voice refresh, no periodic polling. */
             if (nanocore_protocol_request_live_state() == ESP_OK)
                 show_notice("LIVE REFRESH");
@@ -2098,7 +2548,11 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                       ? CATALOG_IDLE_MS : CATALOG_EVENT_GAP_MS);
 
     switch (e->type) {
-    case NC_PROTO_EVENT_LIVE_STATE:
+    case NC_PROTO_EVENT_LIVE_STATE: {
+        bool was_recall = s_recall_pending;
+        if (s_scene_phase != SCENE_IDLE &&
+            (e->live_seq != s_scene_seq || e->slot != s_runtime.current_preset))
+            break;
         s_recall_poll_inflight = false;
 
         if (e->slot >= CTRL_PRESET_COUNT) {
@@ -2204,10 +2658,16 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         render_ui();
 
-        if (s_runtime.mode == CTRL_MODE_SCENE) {
-            // Only overlay a Scene after the requested physical preset
-            // has definitely finished recalling.
-            apply_current_scene();
+        if (s_scene_phase != SCENE_IDLE) {
+            scene_handle_live(e);
+            break;
+        }
+
+        if (was_recall && s_runtime.mode == CTRL_MODE_SCENE) {
+            /* Wait for saved model IDs before applying the new scene;
+             * later 0x41 replies must not overwrite scene model mirrors. */
+            s_scene_after_models = true;
+            s_scene_base_deadline = esp_timer_get_time() + 5000000LL;
         }
 
         // Mapper polls must not trigger continuous 0x41/name traffic.
@@ -2218,13 +2678,15 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                 s_runtime.current_preset);
         }
         break;
+    }
 
     case NC_PROTO_EVENT_BLOCK_STATE: {
-        if (e->block >= BLOCK_COUNT) break;
+        if (e->block >= BLOCK_COUNT || scene_busy()) break;
 
         s_block_known[e->block] = true;
         s_block_on[e->block] = e->on;
-        if (s_synth_mode) {
+        if (s_runtime.mode == CTRL_MODE_SCENE || s_synth_mode) {
+            if (s_runtime.mode == CTRL_MODE_SCENE) s_dirty = true;
             render_ui();
             break;
         }
@@ -2246,6 +2708,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
     }
 
     case NC_PROTO_EVENT_ACTIVE_SLOT:
+        if (scene_busy()) break;
         /*
          * Current NanoCore firmware is known to emit unreliable 0x01 values
          * around Program Change (including values outside 0..63). During a
@@ -2309,7 +2772,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         break;
 
     case NC_PROTO_EVENT_PRESET_MODELS: {
-        if (e->slot != s_runtime.current_preset) break;
+        if (e->slot != s_runtime.current_preset || s_scene_phase != SCENE_IDLE) break;
 
         if (e->amp_model_known) {
             s_amp_model = e->amp_model;
@@ -2348,11 +2811,16 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             show_notice(notice);
         }
 
+        if (s_scene_after_models) {
+            s_scene_after_models = false;
+            apply_current_scene();
+        }
         render_ui();
         break;
     }
 
     case NC_PROTO_EVENT_PARAM_VALUE:
+        if (scene_busy()) break;
         if (e->block < BLOCK_COUNT &&
             e->param_index < NC_PROTO_MAX_PARAMS) {
             s_block_profile_known[e->block] = true;
@@ -2368,7 +2836,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
              * writes do not echo it. Therefore this is a genuine unsaved
              * device-side edit and must participate in the dirty guard.
              */
-            if (!s_synth_mode) s_dirty = true;
+            if (!s_synth_mode || s_runtime.mode == CTRL_MODE_SCENE) s_dirty = true;
             render_ui();
         }
         break;
@@ -2381,7 +2849,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08D / SYNTH READ ONLY UI");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08E / INDEPENDENT SYNTH GUITAR SCENES");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -2393,6 +2861,7 @@ void app_main(void)
     ESP_ERROR_CHECK(controller_storage_load_preset(
         s_runtime.current_preset,
         &s_preset));
+    scene_load_names();
 
     if (s_runtime.current_scene >= CTRL_SCENE_COUNT) {
         s_runtime.current_scene = 0;
@@ -2416,6 +2885,12 @@ void app_main(void)
 
     while (1) {
         catalog_reset_if_needed();
+        if (scene_busy() &&
+            (!s_midi_ready ||
+             (s_scene_after_models && esp_timer_get_time() >= s_scene_base_deadline) ||
+             (s_scene_phase != SCENE_IDLE && esp_timer_get_time() >= s_scene_deadline))) {
+            scene_fail("SCENE SYNC TIMEOUT");
+        }
         if (s_synmap_enabled && !s_midi_ready) {
             s_synmap_enabled = false;
             s_synmap_inflight = false;
