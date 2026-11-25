@@ -1,5 +1,5 @@
 /*
- * Nanocore MIDI Controller - Stage 06.5 / Assisted Mapper
+ * Nanocore MIDI Controller - Stage 07 / Full Dynamic Editor
  *
  * ESP32-S3 N16R8 + ST7796S 3.5" + 2 encoders + 5 footswitches + 2 LEDs.
  *
@@ -41,7 +41,7 @@
 #include "status_leds.h"
 #include "tempo_engine.h"
 
-static const char *TAG = "NC_STAGE05";
+static const char *TAG = "NC_STAGE07";
 
 static const uint8_t MIDI_SERVICE_UUID[16] = BLE_MIDI_SERVICE_UUID128;
 static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
@@ -72,6 +72,11 @@ static bool s_block_profile_known[BLOCK_COUNT];
 static uint8_t s_block_variant[BLOCK_COUNT];
 static uint8_t s_block_param_count[BLOCK_COUNT];
 static float s_block_params[BLOCK_COUNT][NC_PROTO_MAX_PARAMS];
+
+static bool s_amp_model_known;
+static bool s_cab_model_known;
+static uint8_t s_amp_model;
+static uint8_t s_cab_model;
 
 static char s_notice[64];
 static int64_t s_notice_until_us;
@@ -124,12 +129,24 @@ static void clear_block_state(void)
     memset(s_block_variant, 0, sizeof(s_block_variant));
     memset(s_block_param_count, 0, sizeof(s_block_param_count));
     memset(s_block_params, 0, sizeof(s_block_params));
+    s_amp_model_known = false;
+    s_cab_model_known = false;
+    s_amp_model = 0;
+    s_cab_model = 0;
 }
 
 static int block_from_onoff_cc(uint8_t cc)
 {
     for (int i = 0; i < BLOCK_COUNT; ++i) {
         if (nanocore_block_onoff_cc((controller_block_t)i) == cc) return i;
+    }
+    return -1;
+}
+
+static int block_from_type_cc(uint8_t cc)
+{
+    for (int i = 0; i < BLOCK_COUNT; ++i) {
+        if (nanocore_block_type_cc((controller_block_t)i) == cc) return i;
     }
     return -1;
 }
@@ -265,27 +282,85 @@ static esp_err_t send_cc(uint8_t cc, uint8_t value)
     return rc;
 }
 
-static const nanocore_effect_type_info_t *current_fx1_info(void)
+static const nanocore_effect_type_info_t *current_type_info(
+    controller_block_t block)
 {
-    if (!s_block_profile_known[BLOCK_FX1]) return NULL;
-    return nanocore_spec_fx1_type(s_block_variant[BLOCK_FX1]);
+    if (block == BLOCK_AMP || block == BLOCK_CAB) return NULL;
+    if (block >= BLOCK_COUNT || !s_block_profile_known[block]) return NULL;
+    return nanocore_spec_block_type(block, s_block_variant[block]);
+}
+
+static const nanocore_param_info_t *current_param_spec(
+    controller_block_t block, uint8_t *count)
+{
+    if (count) *count = 0;
+
+    if (block == BLOCK_AMP || block == BLOCK_CAB) {
+        return nanocore_spec_common_params(block, count);
+    }
+
+    const nanocore_effect_type_info_t *info =
+        current_type_info(block);
+    if (!info || !info->params) return NULL;
+
+    if (count) *count = info->expected_param_count;
+    return info->params;
+}
+
+static bool current_selector_index(controller_block_t block, int *index)
+{
+    if (!index) return false;
+
+    if (block == BLOCK_AMP) {
+        if (!s_amp_model_known) return false;
+        *index = s_amp_model;
+        return true;
+    }
+
+    if (block == BLOCK_CAB) {
+        if (!s_cab_model_known) return false;
+        *index = s_cab_model;
+        return true;
+    }
+
+    if (block >= BLOCK_COUNT || !s_block_profile_known[block]) return false;
+
+    int i = nanocore_spec_block_selector_index(
+        block, s_block_variant[block]);
+    if (i < 0) return false;
+
+    *index = i;
+    return true;
+}
+
+static const char *selector_name(controller_block_t block, size_t index)
+{
+    if (block == BLOCK_AMP)
+        return nanocore_spec_amp_model_name((uint8_t)index);
+    if (block == BLOCK_CAB)
+        return nanocore_spec_cab_model_name((uint8_t)index);
+
+    const nanocore_effect_type_info_t *info =
+        nanocore_spec_block_selector(block, index);
+    return info ? info->name : NULL;
 }
 
 static size_t editor_parameter_count(void)
 {
-    if (s_selected_block == BLOCK_FX1) {
-        const nanocore_effect_type_info_t *info = current_fx1_info();
-        return 2 + (info ? info->expected_param_count : 0);
-    }
-
-    return nanocore_parameter_count(s_selected_block);
+    uint8_t count = 0;
+    (void)current_param_spec(s_selected_block, &count);
+    return 2 + count; /* ON/OFF + TYPE/MODEL + live params */
 }
 
-static esp_err_t set_fx1_profile_param(uint8_t param_index, float normalized)
+static esp_err_t set_profile_param(controller_block_t block,
+                                   uint8_t param_index,
+                                   float normalized)
 {
-    const nanocore_effect_type_info_t *info = current_fx1_info();
-    if (!info ||
-        param_index >= info->expected_param_count ||
+    uint8_t count = 0;
+    const nanocore_param_info_t *params =
+        current_param_spec(block, &count);
+
+    if (!params || param_index >= count ||
         param_index >= NC_PROTO_MAX_PARAMS) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -294,55 +369,80 @@ static esp_err_t set_fx1_profile_param(uint8_t param_index, float normalized)
     if (normalized > 1.0f) normalized = 1.0f;
 
     esp_err_t rc = nanocore_protocol_set_block_param(
-        BLOCK_FX1, param_index, normalized);
+        block, param_index, normalized);
 
     if (rc == ESP_OK) {
-        s_block_param_count[BLOCK_FX1] = info->expected_param_count;
-        s_block_params[BLOCK_FX1][param_index] = normalized;
+        s_block_profile_known[block] = true;
+        if (s_block_param_count[block] < count)
+            s_block_param_count[block] = count;
+        s_block_params[block][param_index] = normalized;
         s_dirty = true;
 
-        const nanocore_param_info_t *p = &info->params[param_index];
-        float real = nanocore_spec_normalized_to_real(p, normalized);
+        float real = nanocore_spec_normalized_to_real(
+            &params[param_index], normalized);
 
         ESP_LOGI(TAG,
-                 "FX1 %s %s -> norm=%.6f real=%.3f%s",
-                 info->name,
-                 p->name,
+                 "%s param %u %s -> norm=%.6f real=%.3f%s",
+                 nanocore_block_name(block),
+                 param_index,
+                 params[param_index].name,
                  (double)normalized,
                  (double)real,
-                 p->unit ? p->unit : "");
+                 params[param_index].unit ? params[param_index].unit : "");
     }
 
     return rc;
 }
 
-static esp_err_t send_fx1_type_raw(uint8_t raw_type)
+static esp_err_t send_type_or_model_raw(controller_block_t block,
+                                        uint8_t raw_type)
 {
-    const nanocore_effect_type_info_t *info =
-        nanocore_spec_fx1_type(raw_type);
+    if (block == BLOCK_AMP) {
+        esp_err_t rc = nanocore_protocol_set_amp_model(raw_type);
+        if (rc == ESP_OK) {
+            s_amp_model_known = true;
+            s_amp_model = raw_type;
+            s_dirty = true;
+        }
+        return rc;
+    }
 
-    if (!info || !info->default_normalized) {
+    if (block == BLOCK_CAB) {
+        esp_err_t rc = nanocore_protocol_set_cab_model(raw_type);
+        if (rc == ESP_OK) {
+            s_cab_model_known = true;
+            s_cab_model = raw_type;
+            s_dirty = true;
+        }
+        return rc;
+    }
+
+    const nanocore_effect_type_info_t *info =
+        nanocore_spec_block_type(block, raw_type);
+    if (!info) return ESP_ERR_INVALID_ARG;
+
+    float defaults[NC_PROTO_MAX_PARAMS] = {0};
+    if (!nanocore_spec_fill_type_defaults(
+            block, raw_type, defaults, NC_PROTO_MAX_PARAMS)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     esp_err_t rc = nanocore_protocol_set_block_type(
-        BLOCK_FX1,
-        raw_type,
-        info->default_normalized,
-        info->expected_param_count);
+        block, raw_type, defaults, info->expected_param_count);
 
     if (rc == ESP_OK) {
-        s_block_profile_known[BLOCK_FX1] = true;
-        s_block_variant[BLOCK_FX1] = raw_type;
-        s_block_param_count[BLOCK_FX1] = info->expected_param_count;
-        memset(s_block_params[BLOCK_FX1], 0,
-               sizeof(s_block_params[BLOCK_FX1]));
-        memcpy(s_block_params[BLOCK_FX1],
-               info->default_normalized,
+        s_block_profile_known[block] = true;
+        s_block_variant[block] = raw_type;
+        s_block_param_count[block] = info->expected_param_count;
+        memset(s_block_params[block], 0,
+               sizeof(s_block_params[block]));
+        memcpy(s_block_params[block], defaults,
                (size_t)info->expected_param_count * sizeof(float));
+        s_dirty = true;
 
         ESP_LOGI(TAG,
-                 "FX1 TYPE -> %s (raw=%u params=%u)",
+                 "%s TYPE -> %s (raw=%u params=%u)",
+                 nanocore_block_name(block),
                  info->name, raw_type, info->expected_param_count);
     }
 
@@ -370,15 +470,11 @@ static esp_err_t set_working_cc(uint8_t cc, uint8_t value)
 
     if (s_midi_ready) {
         esp_err_t tx;
+        int type_block = block_from_type_cc(cc);
 
-        if (cc == nanocore_block_type_cc(BLOCK_FX1) &&
-            value < nanocore_spec_fx1_selector_count()) {
-            /*
-             * CC40 is retained only as the controller/NVS mirror of the raw
-             * type id. Current NanoCore extended FX1 types are selected by
-             * the captured ToneCommand 0x6D SysEx mechanism.
-             */
-            tx = send_fx1_type_raw(value);
+        if (type_block >= 0) {
+            tx = send_type_or_model_raw(
+                (controller_block_t)type_block, value);
         } else {
             tx = send_cc(cc, value);
         }
@@ -404,13 +500,11 @@ static void apply_assignments(const midi_assignment_t *items,
     for (size_t i = 0; i < count; ++i) {
         if (!items[i].used) continue;
 
-        esp_err_t tx;
-        if (items[i].cc == nanocore_block_type_cc(BLOCK_FX1) &&
-            items[i].value < nanocore_spec_fx1_selector_count()) {
-            tx = send_fx1_type_raw(items[i].value);
-        } else {
-            tx = send_cc(items[i].cc, items[i].value);
-        }
+        int type_block = block_from_type_cc(items[i].cc);
+        esp_err_t tx = type_block >= 0
+            ? send_type_or_model_raw(
+                (controller_block_t)type_block, items[i].value)
+            : send_cc(items[i].cc, items[i].value);
 
         if (tx == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
@@ -646,62 +740,24 @@ static void toggle_block(controller_block_t block)
 
 static uint16_t current_parameter_value(bool *known)
 {
-    const nc_parameter_t *p = nanocore_parameter(
-        s_selected_block,
-        s_selected_parameter);
+    if (known) *known = false;
 
-    if (!p) {
-        if (known) *known = false;
-        return 0;
-    }
+    if (s_selected_block >= BLOCK_COUNT) return 0;
 
-    if (p->kind == NC_PARAM_TEMPO_BPM) {
-        if (known) *known = true;
-        return s_preset.bpm;
-    }
-
-    if (p->kind == NC_PARAM_TEMPO_SUBDIV) {
-        if (known) *known = true;
-        return s_preset.delay_subdivision;
-    }
-
-    if (p->kind == NC_PARAM_MIDI &&
-        s_selected_block == BLOCK_FX1 &&
-        p->cc == nanocore_block_type_cc(BLOCK_FX1)) {
-        uint8_t raw_type = 0;
-        bool raw_known = false;
-
-        if (s_block_profile_known[BLOCK_FX1]) {
-            raw_type = s_block_variant[BLOCK_FX1];
-            raw_known = true;
-        } else {
-            raw_known = effective_cc(p->cc, &raw_type);
-        }
-
-        if (raw_known) {
-            int selector =
-                nanocore_spec_fx1_selector_index(raw_type);
-            if (selector >= 0) {
-                if (known) *known = true;
-                return (uint16_t)selector;
-            }
-        }
-
-        if (known) *known = false;
-        return 0;
-    }
-
-    if (p->kind == NC_PARAM_MIDI &&
-        p->cc == nanocore_block_onoff_cc(s_selected_block) &&
-        s_block_known[s_selected_block]) {
+    if (s_selected_parameter == 0) {
+        if (!s_block_known[s_selected_block]) return 0;
         if (known) *known = true;
         return s_block_on[s_selected_block] ? 127 : 0;
     }
 
-    uint8_t value = 0;
-    bool k = effective_cc(p->cc, &value);
-    if (known) *known = k;
-    return value;
+    if (s_selected_parameter == 1) {
+        int index = 0;
+        if (!current_selector_index(s_selected_block, &index)) return 0;
+        if (known) *known = true;
+        return (uint16_t)index;
+    }
+
+    return 0;
 }
 
 static void select_parameter(int delta)
@@ -718,119 +774,77 @@ static void select_parameter(int delta)
 
 static void adjust_parameter(int delta)
 {
-    if (delta == 0) return;
+    if (delta == 0 || s_selected_block >= BLOCK_COUNT) return;
 
-    if (s_selected_block == BLOCK_FX1) {
-        /* 0=ON/OFF, 1=TYPE, 2.. = selected type's real parameters. */
-        if (s_selected_parameter == 0) {
-            uint8_t current =
-                (s_block_known[BLOCK_FX1] && s_block_on[BLOCK_FX1])
-                    ? 127 : 0;
-            uint8_t next = delta > 0 ? 127 : 0;
-            if (next != current) {
-                (void)set_working_cc(
-                    nanocore_block_onoff_cc(BLOCK_FX1), next);
-            }
-            return;
-        }
+    controller_block_t block = s_selected_block;
 
-        if (s_selected_parameter == 1) {
-            bool known = false;
-            int current = (int)current_parameter_value(&known);
-            if (!known) current = 0;
+    if (s_selected_parameter == 0) {
+        uint8_t current =
+            (s_block_known[block] && s_block_on[block]) ? 127 : 0;
+        uint8_t next = delta > 0 ? 127 : 0;
 
-            const int count =
-                (int)nanocore_spec_fx1_selector_count();
-            int next = current + delta;
-            while (next < 0) next += count;
-            while (next >= count) next -= count;
-
-            const nanocore_effect_type_info_t *info =
-                nanocore_spec_fx1_selector((size_t)next);
-            if (!info) return;
-
+        if (next != current) {
             (void)set_working_cc(
-                nanocore_block_type_cc(BLOCK_FX1),
-                info->id);
-            return;
+                nanocore_block_onoff_cc(block), next);
         }
-
-        const nanocore_effect_type_info_t *info =
-            current_fx1_info();
-        if (!info || !info->params) return;
-
-        uint8_t param_index =
-            (uint8_t)(s_selected_parameter - 2);
-        if (param_index >= info->expected_param_count) return;
-
-        float current = info->default_normalized[param_index];
-        if (s_block_profile_known[BLOCK_FX1] &&
-            param_index < s_block_param_count[BLOCK_FX1]) {
-            current = s_block_params[BLOCK_FX1][param_index];
-        }
-
-        /*
-         * NanoCore profile parameters are normalized 0..1. One encoder
-         * detent = one percent of normalized travel; coalesced fast turns
-         * still apply the whole delta in one SysEx write.
-         */
-        float next = current + ((float)delta * 0.01f);
-        if (next < 0.0f) next = 0.0f;
-        if (next > 1.0f) next = 1.0f;
-
-        if (set_fx1_profile_param(param_index, next) != ESP_OK) {
-            ESP_LOGW(TAG,
-                     "FX1 parameter write failed type=%u param=%u",
-                     s_block_variant[BLOCK_FX1], param_index);
-        }
-        render_ui();
         return;
     }
 
-    const nc_parameter_t *p = nanocore_parameter(
-        s_selected_block,
-        s_selected_parameter);
+    if (s_selected_parameter == 1) {
+        int current = 0;
+        if (!current_selector_index(block, &current)) current = 0;
 
-    if (!p) return;
+        const int count =
+            (int)nanocore_spec_block_selector_count(block);
+        if (count <= 0) return;
 
-    if (p->kind == NC_PARAM_TEMPO_BPM) {
-        int bpm = (int)s_preset.bpm + delta;
-        if (bpm < (int)p->min_value) bpm = p->min_value;
-        if (bpm > (int)p->max_value) bpm = p->max_value;
+        int next = current + delta;
+        while (next < 0) next += count;
+        while (next >= count) next -= count;
 
-        s_preset.bpm = (uint16_t)bpm;
-        tempo_engine_set_bpm(s_preset.bpm);
-        status_leds_set_bpm(s_preset.bpm);
-        s_dirty = true;
-        update_delay_from_tempo();
+        uint8_t raw = 0;
+        if (block == BLOCK_AMP || block == BLOCK_CAB) {
+            raw = (uint8_t)next;
+        } else {
+            const nanocore_effect_type_info_t *info =
+                nanocore_spec_block_selector(block,(size_t)next);
+            if (!info) return;
+            raw = info->id;
+        }
+
+        (void)set_working_cc(
+            nanocore_block_type_cc(block), raw);
         return;
     }
 
-    if (p->kind == NC_PARAM_TEMPO_SUBDIV) {
-        int sub = (int)s_preset.delay_subdivision + delta;
-        while (sub < 0) sub += DELAY_SUBDIV_COUNT;
-        while (sub >= DELAY_SUBDIV_COUNT) sub -= DELAY_SUBDIV_COUNT;
+    uint8_t param_count = 0;
+    const nanocore_param_info_t *params =
+        current_param_spec(block, &param_count);
+    if (!params) return;
 
-        s_preset.delay_subdivision = (delay_subdivision_t)sub;
-        s_dirty = true;
-        update_delay_from_tempo();
-        return;
-    }
+    uint8_t param_index =
+        (uint8_t)(s_selected_parameter - 2);
+    if (param_index >= param_count ||
+        param_index >= NC_PROTO_MAX_PARAMS) return;
 
-    bool known = false;
-    uint16_t value = current_parameter_value(&known);
-
-    if (p->cc >= 20 && p->cc <= 28) {
-        value = delta > 0 ? 127 : 0;
+    float current = 0.0f;
+    if (s_block_profile_known[block] &&
+        param_index < s_block_param_count[block]) {
+        current = s_block_params[block][param_index];
     } else {
-        if (!known) value = p->min_value;
-        int next = (int)value + delta;
-        if (next < (int)p->min_value) next = p->min_value;
-        if (next > (int)p->max_value) next = p->max_value;
-        value = (uint16_t)next;
+        return; /* Never jump from a guessed zero: wait for 0x63 authority. */
     }
 
-    (void)set_working_cc(p->cc, (uint8_t)value);
+    float next = nanocore_spec_adjust_normalized(
+        &params[param_index], current, delta);
+
+    if (set_profile_param(block,param_index,next) != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "%s parameter write failed param=%u",
+                 nanocore_block_name(block), param_index);
+    }
+
+    render_ui();
 }
 
 static void open_block_editor(void)
@@ -840,16 +854,20 @@ static void open_block_editor(void)
     s_screen = UI_SCREEN_BLOCK_EDITOR;
 
     /*
-     * Refresh the authoritative live profile once when opening FX1. This
-     * prevents stale/blank values if a physical knob was moved after preset
-     * recall but before entering the editor.
+     * Every Stage 07 editor is driven by the live 0x63 snapshot. AMP/CAB
+     * additionally need the authoritative saved model id from 0x41.
      */
-    if (s_selected_block == BLOCK_FX1 && s_midi_ready &&
-        !s_recall_pending && !s_recall_poll_inflight) {
+    if (s_midi_ready && !s_recall_pending && !s_recall_poll_inflight) {
         esp_err_t rc = nanocore_protocol_request_live_state();
         if (rc != ESP_OK) {
-            ESP_LOGW(TAG, "FX1 editor live refresh failed: %s",
+            ESP_LOGW(TAG, "Editor live refresh failed: %s",
                      esp_err_to_name(rc));
+        }
+
+        if (s_selected_block == BLOCK_AMP ||
+            s_selected_block == BLOCK_CAB) {
+            (void)nanocore_protocol_request_preset_models(
+                s_runtime.current_preset);
         }
     }
 
@@ -995,96 +1013,90 @@ static void render_ui(void)
     memcpy(u.block_on, s_block_on, sizeof(u.block_on));
 
     char parameter_text[72] = {0};
+    controller_block_t block = s_selected_block;
 
-    if (s_selected_block == BLOCK_FX1) {
-        const nanocore_effect_type_info_t *info = current_fx1_info();
+    uint8_t param_count = 0;
+    const nanocore_param_info_t *params =
+        current_param_spec(block, &param_count);
 
-        u.editor_override = true;
-        u.editor_parameter_count =
-            2 + (info ? info->expected_param_count : 0);
-        u.editor_parameter_labels[0] = "ON/OFF";
-        u.editor_parameter_labels[1] = "TYPE";
+    u.editor_override = true;
+    u.editor_parameter_count = 2 + param_count;
+    u.editor_parameter_labels[0] = "ON/OFF";
+    u.editor_parameter_labels[1] =
+        (block == BLOCK_AMP || block == BLOCK_CAB)
+            ? "MODEL" : "TYPE";
 
-        if (info && info->params) {
-            for (uint8_t i = 0;
-                 i < info->expected_param_count &&
-                 (size_t)(i + 2) < UI_MAX_EDITOR_PARAMETERS;
-                 ++i) {
-                u.editor_parameter_labels[i + 2] =
-                    info->params[i].name;
-            }
+    for (uint8_t i=0;
+         i<param_count && (size_t)(i+2)<UI_MAX_EDITOR_PARAMETERS;
+         ++i) {
+        u.editor_parameter_labels[i+2] = params[i].name;
+    }
+
+    if (s_selected_parameter < u.editor_parameter_count) {
+        u.selected_parameter_label =
+            u.editor_parameter_labels[s_selected_parameter];
+    }
+
+    if (s_selected_parameter == 0) {
+        u.parameter_known = s_block_known[block];
+        u.parameter_value = s_block_on[block] ? 127 : 0;
+
+        if (u.parameter_known) {
+            snprintf(parameter_text,sizeof(parameter_text),"%s",
+                     s_block_on[block] ? "ON" : "OFF");
+            u.parameter_text = parameter_text;
         }
+    } else if (s_selected_parameter == 1) {
+        int selector = 0;
+        u.parameter_known =
+            current_selector_index(block,&selector);
 
-        if (s_selected_parameter < u.editor_parameter_count) {
-            u.selected_parameter_label =
-                u.editor_parameter_labels[s_selected_parameter];
+        if (u.parameter_known) {
+            u.parameter_value = (uint16_t)selector;
+            const char *name =
+                selector_name(block,(size_t)selector);
+            if (name) u.parameter_text = name;
         }
+    } else if (params) {
+        uint8_t param_index =
+            (uint8_t)(s_selected_parameter - 2);
 
-        if (s_selected_parameter == 0) {
-            u.parameter_known = s_block_known[BLOCK_FX1];
-            u.parameter_value =
-                s_block_on[BLOCK_FX1] ? 127 : 0;
+        if (s_block_profile_known[block] &&
+            param_index < s_block_param_count[block] &&
+            param_index < param_count) {
 
-            if (u.parameter_known) {
-                snprintf(parameter_text,sizeof(parameter_text),"%s",
-                         s_block_on[BLOCK_FX1] ? "ON" : "OFF");
-                u.parameter_text = parameter_text;
-            }
-        } else if (s_selected_parameter == 1) {
-            bool known = false;
-            u.parameter_value = current_parameter_value(&known);
-            u.parameter_known = known;
+            const nanocore_param_info_t *p =
+                &params[param_index];
+            float normalized =
+                s_block_params[block][param_index];
 
-            if (known) {
-                const nanocore_effect_type_info_t *selected_type =
-                    nanocore_spec_fx1_selector(
-                        (size_t)u.parameter_value);
-                if (selected_type) {
-                    u.parameter_text = selected_type->name;
-                }
-            }
-        } else if (info && info->params) {
-            uint8_t param_index =
-                (uint8_t)(s_selected_parameter - 2);
+            const char *discrete =
+                nanocore_spec_discrete_label(p,normalized);
 
-            if (s_block_profile_known[BLOCK_FX1] &&
-                param_index < s_block_param_count[BLOCK_FX1] &&
-                param_index < info->expected_param_count) {
+            u.parameter_known = true;
 
-                const nanocore_param_info_t *p =
-                    &info->params[param_index];
-                float normalized =
-                    s_block_params[BLOCK_FX1][param_index];
+            if (discrete) {
+                snprintf(parameter_text,sizeof(parameter_text),
+                         "%s",discrete);
+            } else {
                 float real =
-                    nanocore_spec_normalized_to_real(
-                        p, normalized);
+                    nanocore_spec_normalized_to_real(p,normalized);
 
-                u.parameter_known = true;
-
-                if (p->unit && strcmp(p->unit, ":1") == 0) {
+                if (p->unit && strcmp(p->unit,":1")==0) {
                     snprintf(parameter_text,sizeof(parameter_text),
-                             "%.*f:1",
-                             p->decimals,(double)real);
+                             "%.*f:1",p->decimals,(double)real);
                 } else if (p->unit && p->unit[0]) {
                     snprintf(parameter_text,sizeof(parameter_text),
                              "%.*f %s",
                              p->decimals,(double)real,p->unit);
                 } else {
                     snprintf(parameter_text,sizeof(parameter_text),
-                             "%.*f",
-                             p->decimals,(double)real);
+                             "%.*f",p->decimals,(double)real);
                 }
-
-                u.parameter_text = parameter_text;
-            } else {
-                u.parameter_known = false;
             }
+
+            u.parameter_text = parameter_text;
         }
-    } else {
-        bool known = false;
-        u.parameter_value = current_parameter_value(&known);
-        u.parameter_known = known;
-        u.parameter_text = NULL;
     }
 
     display_ui_render(&u);
@@ -1739,6 +1751,16 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                  amp_name ? amp_name : "UNKNOWN", e->amp_model,
                  cab_name ? cab_name : "UNKNOWN", e->cab_model);
 
+        if (e->amp_model_known) {
+            s_amp_model_known = true;
+            s_amp_model = e->amp_model;
+        }
+        if (e->cab_model_known) {
+            s_cab_model_known = true;
+            s_cab_model = e->cab_model;
+        }
+        render_ui();
+
         controller_block_t target = nanocore_mapper_target();
         if (nanocore_mapper_is_enabled() &&
             target == BLOCK_AMP && e->amp_model_known) {
@@ -1764,7 +1786,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 06.8 / AMP-CAB MODEL READ");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07 / FULL DYNAMIC EDITOR");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
