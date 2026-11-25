@@ -134,6 +134,7 @@ static void clear_block_state(void)
     s_cab_model_known = false;
     s_amp_model = 0;
     s_cab_model = 0;
+    s_editor_models_after_live = false;
 }
 
 static int block_from_onoff_cc(uint8_t cc)
