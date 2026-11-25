@@ -864,8 +864,11 @@ static void open_block_editor(void)
                      esp_err_to_name(rc));
         }
 
-        if (s_selected_block == BLOCK_AMP ||
-            s_selected_block == BLOCK_CAB) {
+        bool need_model_read =
+            (s_selected_block == BLOCK_AMP && !s_amp_model_known) ||
+            (s_selected_block == BLOCK_CAB && !s_cab_model_known);
+
+        if (need_model_read) {
             (void)nanocore_protocol_request_preset_models(
                 s_runtime.current_preset);
         }
