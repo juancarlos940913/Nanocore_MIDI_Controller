@@ -582,7 +582,7 @@ float nanocore_spec_adjust_normalized(
     if (param && param->options && param->option_count > 1) {
         int idx = (int)lroundf(current *
                               (float)(param->option_count - 1));
-        idx += delta > 0 ? 1 : -1;
+        idx += delta;
         if (idx < 0) idx = 0;
         if (idx >= param->option_count) idx = param->option_count - 1;
         return (float)idx / (float)(param->option_count - 1);
