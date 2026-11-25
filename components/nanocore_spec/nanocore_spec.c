@@ -164,18 +164,18 @@ static const float FX1_DEF_BASS_WAH[] = {
 };
 
 static const nanocore_effect_type_info_t FX1_TYPES[] = {
-    { 0,  "Gate",              2, FX1_GATE_PARAMS,          FX1_DEF_GATE },
-    { 1,  "Auto Gate",         2, FX1_AUTO_GATE_PARAMS,     FX1_DEF_AUTO_GATE },
-    { 2,  "Gate + Compressor", 7, FX1_GATE_COMP_PARAMS,     FX1_DEF_GATE_COMP },
-    { 3,  "Compressor",        6, FX1_COMP_PARAMS,          FX1_DEF_COMP },
-    { 4,  "Env Wah",           4, FX1_ENV_WAH_PARAMS,       FX1_DEF_ENV_WAH },
-    { 5,  "Wah",               5, FX1_WAH_PARAMS,           FX1_DEF_WAH },
-    { 6,  "Motion Wah",        4, FX1_MOTION_WAH_PARAMS,    FX1_DEF_MOTION_WAH },
-    { 7,  "Peak Comp",         5, FX1_PEAK_COMP_PARAMS,     FX1_DEF_PEAK_COMP },
-    { 8,  "Parallel Comp",     5, FX1_PARALLEL_COMP_PARAMS, FX1_DEF_PARALLEL_COMP },
-    { 9,  "Classic Wah",       5, FX1_CLASSIC_WAH_PARAMS,   FX1_DEF_CLASSIC_WAH },
-    { 10, "Retro Wah",         5, FX1_RETRO_WAH_PARAMS,     FX1_DEF_RETRO_WAH },
-    { 11, "Bass Wah",          5, FX1_BASS_WAH_PARAMS,      FX1_DEF_BASS_WAH },
+    { 0, "Gate", 2, FX1_GATE_PARAMS, FX1_DEF_GATE, NULL },
+    { 1, "Auto Gate", 2, FX1_AUTO_GATE_PARAMS, FX1_DEF_AUTO_GATE, NULL },
+    { 2, "Gate + Compressor", 7, FX1_GATE_COMP_PARAMS, FX1_DEF_GATE_COMP, NULL },
+    { 3, "Compressor", 6, FX1_COMP_PARAMS, FX1_DEF_COMP, NULL },
+    { 4, "Env Wah", 4, FX1_ENV_WAH_PARAMS, FX1_DEF_ENV_WAH, NULL },
+    { 5, "Wah", 5, FX1_WAH_PARAMS, FX1_DEF_WAH, NULL },
+    { 6, "Motion Wah", 4, FX1_MOTION_WAH_PARAMS, FX1_DEF_MOTION_WAH, NULL },
+    { 7, "Peak Comp", 5, FX1_PEAK_COMP_PARAMS, FX1_DEF_PEAK_COMP, NULL },
+    { 8, "Parallel Comp", 5, FX1_PARALLEL_COMP_PARAMS, FX1_DEF_PARALLEL_COMP, NULL },
+    { 9, "Classic Wah", 5, FX1_CLASSIC_WAH_PARAMS, FX1_DEF_CLASSIC_WAH, NULL },
+    { 10, "Retro Wah", 5, FX1_RETRO_WAH_PARAMS, FX1_DEF_RETRO_WAH, NULL },
+    { 11, "Bass Wah", 5, FX1_BASS_WAH_PARAMS, FX1_DEF_BASS_WAH, NULL },
 };
 
 static const uint8_t FX1_SELECTOR_ORDER[] = {
