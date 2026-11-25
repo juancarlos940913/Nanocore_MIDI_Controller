@@ -74,6 +74,8 @@ typedef struct {
     bool cab_model_known;
     uint8_t amp_model;
     uint8_t cab_model;
+    uint16_t preset_window_offset;
+    uint16_t preset_window_total;
 
     uint8_t param_index;
     float param_value;
@@ -107,11 +109,13 @@ esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
  * indices. Unlike live opcode 0x63, these values are the real 0..29 model ids.
  */
 esp_err_t nanocore_protocol_request_preset_models(uint8_t slot);
+esp_err_t nanocore_protocol_request_preset_models_window(uint8_t slot, uint16_t offset);
 
 /* Request a single read-only model catalog record. The echoed sequence,
  * block and slot identify its reply; no model data or presets are written. */
 /* Read-only AMP/FX2 storage information (0x30). Diagnostic/priming probe. */
 esp_err_t nanocore_protocol_request_amp_storage_info(void);
+esp_err_t nanocore_protocol_request_cab_storage_info(void);
 
 esp_err_t nanocore_protocol_request_model_catalog(
     controller_block_t block, uint8_t model_id, uint16_t *seq_out);

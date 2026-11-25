@@ -67,7 +67,7 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CATALOG_START_MS       2000
 #define CATALOG_IDLE_MS         950
 #define CATALOG_EVENT_GAP_MS    300
-#define CATALOG_GAP_MS          150
+#define CATALOG_GAP_MS           35
 #define CATALOG_TIMEOUT_MS      900
 #define CATALOG_AMP_TIMEOUT_MS 2500
 #define CATALOG_AMP_INFO_GAP_MS 3000
@@ -109,6 +109,9 @@ static bool s_synmap_inflight;
 static uint16_t s_synmap_seq;
 static int64_t s_synmap_sent_us;
 static bool s_catalog_amp_info_sent;
+static bool s_catalog_cab_info_sent;
+static int s_pending_scene_delta;
+static uint8_t s_models_read_retries;
 static uint16_t s_catalog_seq;
 static uint8_t s_catalog_cursor;
 static uint8_t s_catalog_retry;
@@ -419,6 +422,63 @@ static bool catalog_link_current(void)
     return current;
 }
 
+/* Persist only a complete, confirmed sweep. Cache is explicitly marked
+ * provisional until this connection re-reads each model. */
+typedef struct {
+    uint32_t version;
+    char names[2][NC_PROTO_MODEL_COUNT][NC_PROTO_MODEL_NAME_LEN + 1];
+    uint8_t state[2][NC_PROTO_MODEL_COUNT];
+} catalog_cache_t;
+static catalog_cache_t s_catalog_disk;
+
+static void catalog_load_cache(void)
+{
+    nvs_handle_t h;
+    if (nvs_open_from_partition("scene_data","nc_scene1",NVS_READONLY,&h)!=ESP_OK)
+        return;
+    size_t len=sizeof(s_catalog_disk);
+    esp_err_t rc=nvs_get_blob(h,"model_names",&s_catalog_disk,&len);
+    nvs_close(h);
+    if(rc!=ESP_OK || len!=sizeof(s_catalog_disk) || s_catalog_disk.version!=1) return;
+    portENTER_CRITICAL(&s_catalog_lock);
+    if(s_catalog_link_active && s_catalog_link_epoch==s_catalog_cache_epoch) {
+        for(unsigned g=0;g<2;++g) {
+            for(unsigned i=0;i<NC_PROTO_MODEL_COUNT;++i) {
+                uint8_t st=s_catalog_disk.state[g][i];
+                if(st!=1 && st!=2) continue;
+                memcpy(s_catalog_names[g][i],s_catalog_disk.names[g][i],
+                       sizeof(s_catalog_names[g][i]));
+                s_catalog_names[g][i][NC_PROTO_MODEL_NAME_LEN]='\0';
+                s_catalog_state[g][i]=(uint8_t)(st+2);
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_catalog_lock);
+    ESP_LOGI(TAG,"CATALOG|CACHE_LOADED|provisional");
+}
+
+static void catalog_store_cache(void)
+{
+    if(s_catalog_read_count != CATALOG_TOTAL) return;
+    portENTER_CRITICAL(&s_catalog_lock);
+    bool valid=s_catalog_link_active && s_catalog_link_epoch==s_catalog_cache_epoch;
+    if(valid) {
+        s_catalog_disk.version=1;
+        memcpy(s_catalog_disk.names,s_catalog_names,sizeof(s_catalog_disk.names));
+        memcpy(s_catalog_disk.state,s_catalog_state,sizeof(s_catalog_disk.state));
+    }
+    portEXIT_CRITICAL(&s_catalog_lock);
+    if(!valid) return;
+    nvs_handle_t h;
+    esp_err_t rc=nvs_open_from_partition("scene_data","nc_scene1",NVS_READWRITE,&h);
+    if(rc==ESP_OK) {
+        rc=nvs_set_blob(h,"model_names",&s_catalog_disk,sizeof(s_catalog_disk));
+        if(rc==ESP_OK) rc=nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG,"CATALOG|CACHE_SAVED|%s",esp_err_to_name(rc));
+}
+
 static void catalog_reset_if_needed(void)
 {
     bool changed = false;
@@ -436,6 +496,8 @@ static void catalog_reset_if_needed(void)
 
     s_catalog_inflight = false;
     s_catalog_amp_info_sent = false;
+    s_catalog_cab_info_sent = false;
+    s_pending_scene_delta = 0;
     s_catalog_cursor = 0;
     s_catalog_retry = 0;
     s_catalog_failures = 0;
@@ -445,6 +507,7 @@ static void catalog_reset_if_needed(void)
     s_catalog_quiet_until_us = 0;
     s_catalog_next_us = esp_timer_get_time() + CATALOG_START_MS * 1000LL;
     if (active) {
+        catalog_load_cache();
         ESP_LOGI(TAG, "CATALOG|START|AMP=30|CAB=30");
     }
 }
@@ -481,6 +544,10 @@ static void format_model_name(controller_block_t block, uint8_t id,
         snprintf(out, out_len, "%s", name);
     } else if (state == 2) {
         snprintf(out, out_len, "SLOT %02u EMPTY", id);
+    } else if (state == 3 && name[0]) {
+        snprintf(out, out_len, "%s ~", name);
+    } else if (state == 4) {
+        snprintf(out, out_len, "SLOT %02u EMPTY ~", id);
     } else {
         const char *factory = block == BLOCK_AMP
             ? nanocore_spec_amp_model_name(id)
@@ -529,6 +596,7 @@ static void catalog_advance(bool success)
                  s_catalog_read_count, (unsigned)CATALOG_TOTAL,
                  s_catalog_empty_count,
                  (unsigned)(CATALOG_TOTAL - s_catalog_read_count));
+        catalog_store_cache();
     }
 }
 
@@ -582,6 +650,13 @@ static void service_model_catalog(void)
         return;
     }
 
+    if (!s_catalog_cab_info_sent && catalog_current_block() == BLOCK_CAB) {
+        s_catalog_cab_info_sent=true;
+        esp_err_t info_rc=nanocore_protocol_request_cab_storage_info();
+        ESP_LOGI(TAG,"CATALOG|CAB_INFO_TX|op=0x50|%s",esp_err_to_name(info_rc));
+        s_catalog_next_us=esp_timer_get_time()+300000LL;
+        return;
+    }
     esp_err_t rc = nanocore_protocol_request_model_catalog(
         catalog_current_block(), catalog_current_id(), &s_catalog_seq);
     if (rc == ESP_OK) {
@@ -1366,6 +1441,7 @@ static esp_err_t load_preset(uint8_t index, bool transmit)
     s_runtime.current_preset = index;
     scene_load_names();
     s_scene_fault = false;
+    s_pending_scene_delta=0;
     s_runtime.current_scene =
         s_preset.active_scene < CTRL_SCENE_COUNT
             ? s_preset.active_scene : 0;
@@ -1406,6 +1482,11 @@ static void change_preset(int delta)
 
 static void change_scene(int delta)
 {
+    if (!scene_busy() && s_midi_ready && !s_recall_pending &&
+        s_catalog_inflight && !s_dirty) {
+        s_pending_scene_delta=(s_pending_scene_delta+delta)%CTRL_SCENE_COUNT;
+        return;
+    }
     if (scene_busy() || !s_midi_ready || s_recall_pending || s_catalog_inflight) {
         show_notice("WAIT SCENE SYNC");
         return;
@@ -1431,6 +1512,7 @@ static void cycle_mode(void)
         show_notice("SAVE CHANGES / WAIT SYNC");
         return;
     }
+    s_pending_scene_delta=0;
     s_parameter_editing = false;
     s_screen = UI_SCREEN_PERFORMANCE;
 
@@ -2752,6 +2834,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
          */
         if (s_editor_models_after_live && !s_name_after_live) {
             s_editor_models_after_live = false;
+            s_models_read_retries=0;
             (void)nanocore_protocol_request_preset_models(
                 s_runtime.current_preset);
         }
@@ -2892,6 +2975,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
              * separate footer read that supplies AMP/CAB model ids.
              */
             if (s_midi_ready) {
+                s_models_read_retries=0;
                 (void)nanocore_protocol_request_preset_models(
                     s_runtime.current_preset);
             }
@@ -2900,6 +2984,21 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
     case NC_PROTO_EVENT_PRESET_MODELS: {
         if (e->slot != s_runtime.current_preset || s_scene_phase != SCENE_IDLE) break;
+
+        /* Variable-size saved presets (including Synth) can place the
+         * footer outside the legacy fixed window. Two bounded reads. */
+        if (!e->amp_model_known && !e->cab_model_known &&
+            s_models_read_retries < 2) {
+            uint16_t tail=e->preset_window_total>59 ? e->preset_window_total-59 : 1;
+            uint16_t next=s_models_read_retries==0 ? tail : 180;
+            if(next==e->preset_window_offset || next==220) next=180;
+            if(next!=e->preset_window_offset && next<=1024) {
+                ++s_models_read_retries;
+                ESP_LOGI(TAG,"MODEL|WINDOW_RETRY|offset=%u",next);
+                if(nanocore_protocol_request_preset_models_window(e->slot,next)==ESP_OK)
+                    break;
+            }
+        }
 
         if (e->amp_model_known && !s_amp_model_known) {
             s_amp_model = e->amp_model;
@@ -2940,6 +3039,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 
         if (s_scene_after_models) {
             s_scene_after_models = false;
+            /* Full scene has its own model IDs even if saved-preset
+             * footer is missing. No timeout just for an unknown base ID. */
             apply_current_scene();
         }
         render_ui();
@@ -3079,6 +3180,12 @@ void app_main(void)
         }
 
         service_recall_sync();
+        if (s_pending_scene_delta && !s_catalog_inflight && !scene_busy()) {
+            int delta=s_pending_scene_delta;
+            s_pending_scene_delta=0;
+            if (s_runtime.mode==CTRL_MODE_SCENE && s_midi_ready && !s_recall_pending)
+                change_scene(delta);
+        }
         service_model_catalog();
         if (!scene_busy() && !s_recall_pending && !s_catalog_inflight && !s_synmap_enabled) {
             bool known;

@@ -37,6 +37,7 @@
 #define OP_AMP_CATALOG         0x36
 #define OP_READ_PRESET         0x41
 #define OP_SAVE_PRESET         0x46
+#define OP_CAB_STORAGE_INFO    0x50
 #define OP_CAB_CATALOG         0x56
 #define OP_LIVE_STATE          0x63
 #define OP_PING                0x68
@@ -548,7 +549,10 @@ static void parse_models_payload(const uint8_t *payload, size_t len)
 
             nanocore_protocol_event_t *e =
                 scratch_event(NC_PROTO_EVENT_PRESET_MODELS);
+            if (amp >= 30 || cab >= 30) continue;
             e->slot = slot;
+            e->preset_window_offset = offset;
+            e->preset_window_total = (uint16_t)(payload[3] | ((uint16_t)payload[4] << 8));
             e->amp_model_known = amp < 30;
             e->cab_model_known = cab < 30;
             e->amp_model = amp;
@@ -565,6 +569,11 @@ static void parse_models_payload(const uint8_t *payload, size_t len)
     ESP_LOGW(TAG,
              "AMP/CAB footer not found slot=%u offset=%u data=%u",
              slot, offset, (unsigned)data_len);
+    nanocore_protocol_event_t *e=scratch_event(NC_PROTO_EVENT_PRESET_MODELS);
+    e->slot=slot;
+    e->preset_window_offset=offset;
+    e->preset_window_total=(uint16_t)(payload[3] | ((uint16_t)payload[4]<<8));
+    queue_event(e);
 }
 
 /* The user's Stage 08A captures show a separate mode byte immediately
@@ -943,8 +952,8 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
 {
     bool amp = msg[9] == OP_AMP_CATALOG;
     if (amp) {
-        ESP_LOGI(TAG, "CATALOG|AMP_RX|wire_len=%u", (unsigned)len);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, len > 96 ? 96 : len, ESP_LOG_INFO);
+        ESP_LOGD(TAG, "CATALOG|AMP_RX|wire_len=%u", (unsigned)len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, len > 96 ? 96 : len, ESP_LOG_DEBUG);
     }
     uint8_t raw[96] = {0};
     size_t raw_len = unpack7(&msg[5], len - 6, raw, sizeof(raw));
@@ -955,7 +964,7 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
     uint8_t status = raw[5];
     uint16_t body_len = (uint16_t)(raw[6] | ((uint16_t)raw[7] << 8));
     if (amp) {
-        ESP_LOGI(TAG, "CATALOG|AMP_DECODE|op=0x%02X|seq=%u|status=0x%02X|body=%u|raw=%u",
+        ESP_LOGD(TAG, "CATALOG|AMP_DECODE|op=0x%02X|seq=%u|status=0x%02X|body=%u|raw=%u",
                  opcode, seq, status, body_len, (unsigned)raw_len);
     }
     if ((opcode != OP_AMP_CATALOG && opcode != OP_CAB_CATALOG) ||
@@ -1281,6 +1290,19 @@ esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
     return send_read_preset_window(slot, 220, 59);
 }
 
+esp_err_t nanocore_protocol_request_preset_models_window(uint8_t slot, uint16_t offset)
+{
+    if (!s_connected || slot>=CTRL_PRESET_COUNT || offset==0 || offset>1024)
+        return ESP_ERR_INVALID_ARG;
+    return send_read_preset_window(slot,offset,59);
+}
+
+esp_err_t nanocore_protocol_request_cab_storage_info(void)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    return send_short_command(OP_CAB_STORAGE_INFO);
+}
+
 esp_err_t nanocore_protocol_request_amp_storage_info(void)
 {
     if (!s_connected || !nanocore_midi_is_ready()) {
@@ -1310,8 +1332,8 @@ esp_err_t nanocore_protocol_request_model_catalog(
     msg[5 + packed] = 0xF7;
     *seq_out = seq;
     if (block == BLOCK_AMP) {
-        ESP_LOGI(TAG, "CATALOG|AMP_TX|slot=%u|seq=%u", model_id, seq);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, 6 + packed, ESP_LOG_INFO);
+        ESP_LOGD(TAG, "CATALOG|AMP_TX|slot=%u|seq=%u", model_id, seq);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, 6 + packed, ESP_LOG_DEBUG);
     }
     return nanocore_midi_send_sysex(msg, 6 + packed);
 }
@@ -1436,16 +1458,18 @@ void nanocore_protocol_on_sysex(const uint8_t *msg, size_t len)
     // or 0x41 BLE reassembly in progress.
     if (msg[9] == OP_PING) return;
 
-    if (msg[9] == OP_AMP_STORAGE_INFO) {
-        uint8_t raw[96] = {0};
-        size_t n = unpack7(&msg[5], len - 6, raw, sizeof(raw));
-        ESP_LOGI(TAG, "CATALOG|AMP_INFO_RX|wire_len=%u|decoded=%u",
-                 (unsigned)len, (unsigned)n);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg, len > 96 ? 96 : len, ESP_LOG_INFO);
-        if (n >= 8) {
-            ESP_LOGI(TAG, "CATALOG|AMP_INFO_HEADER|seq=%u|status=0x%02X|body=%u",
-                     (unsigned)(raw[1] | ((uint16_t)raw[2] << 8)), raw[5],
-                     (unsigned)(raw[6] | ((uint16_t)raw[7] << 8)));
+    /* re-nanocore docs/protocol.txt identifies 0x30/0x50 as summary
+     * reads, not proven bulk name pages. Keep them outside live reassembly.
+     * 0x6D acknowledgements are currently not consumed by application;
+     * do not let them replace a fragmented authoritative 0x63 reply. */
+    if (msg[9] == OP_SET_FIELD) return;
+    if (msg[9] == OP_AMP_STORAGE_INFO || msg[9] == OP_CAB_STORAGE_INFO) {
+        uint8_t raw[96]={0};
+        size_t n=unpack7(&msg[5],len-6,raw,sizeof(raw));
+        if(n>=8 && raw[0]==2) {
+            ESP_LOGI(TAG,"CATALOG|SUMMARY_RX|op=0x%02X|status=0x%02X|body=%u",
+                     msg[9],raw[5],(unsigned)(raw[6]|((uint16_t)raw[7]<<8)));
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG,raw,n,ESP_LOG_INFO);
         }
         return;
     }
