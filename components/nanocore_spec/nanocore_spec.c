@@ -225,6 +225,11 @@ float nanocore_spec_normalized_to_real(
                powf(param->max_value / param->min_value, normalized);
     }
 
+    if (param->curve == NC_PARAM_QUADRATIC) {
+        return param->min_value + (param->max_value - param->min_value) *
+               normalized * normalized;
+    }
+
     if (param->curve == NC_PARAM_CUBIC) {
         const float n2 = normalized * normalized;
         return param->min_value +
@@ -262,6 +267,12 @@ float nanocore_spec_real_to_normalized(
         param->max_value > param->min_value) {
         return logf(real_value / param->min_value) /
                logf(param->max_value / param->min_value);
+    }
+
+    if (param->curve == NC_PARAM_QUADRATIC) {
+        const float span = param->max_value - param->min_value;
+        if (span <= 0.0f) return 0.0f;
+        return sqrtf((real_value - param->min_value) / span);
     }
 
     if (param->curve == NC_PARAM_CUBIC) {

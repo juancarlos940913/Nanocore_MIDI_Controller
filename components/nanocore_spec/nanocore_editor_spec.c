@@ -697,3 +697,117 @@ float nanocore_spec_adjust_normalized(
     if(next>1.0f) next=1.0f;
     return next;
 }
+
+/* Stage 08B: normalized vectors captured on the user's NanoCore fw 1.2.
+ * Names, units and range/curve metadata follow the external wire-traffic
+ * mapping and still require display comparison on this device. */
+static const char *const SYNTH_WAVES[] = {"Sine","Saw","Square","Triangle","Pulse"};
+static const float SYNTH_0_DEF[] = {0.250000f,0.080000f,0.500000f,0.250000f,0.680000f,1.000000f};
+static const nanocore_param_info_t SYNTH_0_PARAMS[] = {
+    P_ENUM("Wave", SYNTH_WAVES, 5, 1),
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=4.547200f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Detune","ct",0.0f,20.0f,1,5.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,68.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_1_DEF[] = {0.450000f,0.720000f,0.500000f,0.550000f,1.000000f};
+static const nanocore_param_info_t SYNTH_1_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=82.595000f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,72.000000f),
+    P_LINEAR("Ensemble","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,55.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_2_DEF[] = {1.000000f,0.500000f,1.000000f};
+static const nanocore_param_info_t SYNTH_2_PARAMS[] = {
+    P_LINEAR("Tone","",0.0f,100.0f,0,100.000000f),
+    P_LINEAR("Decay","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_3_DEF[] = {0.550000f,0.700000f,0.200000f,0.600000f,1.000000f};
+static const nanocore_param_info_t SYNTH_3_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=122.395000f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,70.000000f),
+    P_LINEAR("Vowel","",0.0f,100.0f,0,20.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,60.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_4_DEF[] = {0.240000f,0.500000f,0.600000f,0.700000f,1.000000f};
+static const nanocore_param_info_t SYNTH_4_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=24.924800f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Bite","",0.0f,100.0f,0,60.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,70.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_5_DEF[] = {0.040000f,0.250000f,0.600000f,0.850000f,1.000000f};
+static const nanocore_param_info_t SYNTH_5_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=2.636800f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,25.000000f),
+    P_LINEAR("Harmonics","",0.0f,100.0f,0,60.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,85.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_6_DEF[] = {0.310000f,0.450000f,0.350000f,0.700000f,1.000000f};
+static const nanocore_param_info_t SYNTH_6_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=40.247800f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,45.000000f),
+    P_LINEAR("Breath","",0.0f,100.0f,0,35.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,70.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_7_DEF[] = {1.000000f,0.500000f,1.000000f};
+static const nanocore_param_info_t SYNTH_7_PARAMS[] = {
+    P_LINEAR("Tone","",0.0f,100.0f,0,100.000000f),
+    P_LINEAR("Decay","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_8_DEF[] = {0.000000f,0.300000f,0.700000f,0.400000f,1.000000f};
+static const nanocore_param_info_t SYNTH_8_PARAMS[] = {
+    { .name="Attack", .unit="ms", .min_value=2.0f, .mid_value=101.5f,
+      .max_value=400.0f, .decimals=0, .curve=NC_PARAM_QUADRATIC,
+      .default_value=2.000000f, .value_kind=NC_PARAM_VALUE_NUMERIC },
+    P_LINEAR("Release","",0.0f,100.0f,0,30.000000f),
+    P_LINEAR("Sub Level","",0.0f,100.0f,0,70.000000f),
+    P_LINEAR("Tone","",0.0f,100.0f,0,40.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const float SYNTH_9_DEF[] = {1.000000f,0.500000f,1.000000f};
+static const nanocore_param_info_t SYNTH_9_PARAMS[] = {
+    P_LINEAR("Tone","",0.0f,100.0f,0,100.000000f),
+    P_LINEAR("Decay","",0.0f,100.0f,0,50.000000f),
+    P_LINEAR("Mix","",0.0f,100.0f,0,100.000000f),
+};
+static const nanocore_effect_type_info_t SYNTH_VOICES[] = {
+    TYPE(0, "Analog Synth", SYNTH_0_PARAMS, SYNTH_0_DEF),
+    TYPE(1, "Strings", SYNTH_1_PARAMS, SYNTH_1_DEF),
+    TYPE(2, "Pad", SYNTH_2_PARAMS, SYNTH_2_DEF),
+    TYPE(3, "Choir", SYNTH_3_PARAMS, SYNTH_3_DEF),
+    TYPE(4, "Brass", SYNTH_4_PARAMS, SYNTH_4_DEF),
+    TYPE(5, "Organ", SYNTH_5_PARAMS, SYNTH_5_DEF),
+    TYPE(6, "Flute", SYNTH_6_PARAMS, SYNTH_6_DEF),
+    TYPE(7, "Lead", SYNTH_7_PARAMS, SYNTH_7_DEF),
+    TYPE(8, "Bass", SYNTH_8_PARAMS, SYNTH_8_DEF),
+    TYPE(9, "Pluck", SYNTH_9_PARAMS, SYNTH_9_DEF),
+};
+size_t nanocore_spec_synth_voice_count(void)
+{
+    return sizeof(SYNTH_VOICES)/sizeof(SYNTH_VOICES[0]);
+}
+const nanocore_effect_type_info_t *nanocore_spec_synth_voice(uint8_t id)
+{
+    return id < nanocore_spec_synth_voice_count() ? &SYNTH_VOICES[id] : NULL;
+}

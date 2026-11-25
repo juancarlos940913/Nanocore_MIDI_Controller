@@ -20,6 +20,7 @@ typedef enum {
     NC_PARAM_THREE_POINT = 1,
     NC_PARAM_EXPONENTIAL = 2,
     NC_PARAM_CUBIC = 3,
+    NC_PARAM_QUADRATIC = 4,
 } nanocore_param_curve_t;
 
 typedef enum {
@@ -116,6 +117,10 @@ const nanocore_effect_type_info_t *nanocore_spec_editor_type_by_selector(
 int nanocore_spec_editor_selector_index(
     controller_block_t block,
     uint8_t raw_type_id);
+
+/* Stage 08B Synth voice specs are separate from the eight normal blocks. */
+size_t nanocore_spec_synth_voice_count(void);
+const nanocore_effect_type_info_t *nanocore_spec_synth_voice(uint8_t voice_id);
 
 /* AMP/CAB use the same type-info shape, but their params are common to every
  * model and the model id comes from 0x41/local live state instead of 0x63. */

@@ -553,6 +553,35 @@ static void parse_models_payload(const uint8_t *payload, size_t len)
              slot, offset, (unsigned)data_len);
 }
 
+/* The user's Stage 08A captures show a separate mode byte immediately
+ * before the voice record. Keep it independent from voice enable.
+ * Require a complete normal walk, validated chain and the exact observed
+ * terminal voice record; unknown layouts must not become an ON state. */
+static bool decode_synth_tail(nanocore_protocol_event_t *e,
+                              const uint8_t *p, size_t len, size_t pos)
+{
+    static const uint8_t counts[10] = {6,5,3,5,5,5,5,3,5,3};
+    if (!e->chain_order_known || pos > len || len - pos < 18) return false;
+    const size_t at = pos + 15;
+    const uint8_t mode = p[at - 1], on = p[at];
+    const uint8_t voice = p[at + 1], count = p[at + 2];
+    if (mode > 1 || on > 1 || voice >= 10 ||
+        count != counts[voice] || count > NC_PROTO_SYNTH_MAX_PARAMS ||
+        len - at != 3u + 4u * count) return false;
+    for (uint8_t i = 0; i < count; ++i) {
+        float value = read_float32_le(&p[at + 3 + 4u * i]);
+        if (!(value >= 0.0f && value <= 1.0f)) return false;
+        e->synth_params[i] = value;
+    }
+    e->synth_mode_known = true;
+    e->synth_mode = mode != 0;
+    e->synth_known = true;
+    e->synth_on = on != 0;
+    e->synth_variant = voice;
+    e->synth_param_count = count;
+    return true;
+}
+
 static void parse_live_payload(const uint8_t *p, size_t len)
 {
     if (!p || len < 6 || p[0] != 0x03) {
@@ -634,8 +663,12 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         }
     }
 
-    /* Optional chain footer: 0x08 + permutation of block ids 0..7. */
-    if (pos + 9 <= len && p[pos] == 0x08) {
+    /* Optional chain footer: only after all eight blocks were parsed. */
+    bool complete = true;
+    for (int b = 0; b < BLOCK_COUNT; ++b) {
+        if (!e->block_profile_known[b]) complete = false;
+    }
+    if (complete && pos + 9 <= len && p[pos] == 0x08) {
         bool seen[BLOCK_COUNT] = {0};
         bool valid = true;
 
@@ -652,13 +685,12 @@ static void parse_live_payload(const uint8_t *p, size_t len)
         e->chain_order_known = valid;
     }
 
-    /*
-     * Do not infer Synth Mode from the trailing bytes of the normal 0x63
-     * profile. The earlier Stage 06 heuristic produced a false SYNTH=ON in
-     * every normal preset. Dedicated Synth discovery will be implemented
-     * from a real Synth-mode capture later.
-     */
-
+    if (decode_synth_tail(e, p, len, pos)) {
+        ESP_LOGI(TAG, "SYNTH|LIVE|mode=%u|voice_on=%u|voice=%u|count=%u",
+                 e->synth_mode, e->synth_on, e->synth_variant, e->synth_param_count);
+    } else {
+        ESP_LOGI(TAG, "SYNTH|LIVE|mode=UNKNOWN");
+    }
 
     queue_event(e);
 
@@ -750,6 +782,8 @@ static void log_synth_capture(uint16_t seq, const uint8_t *p, size_t len)
             uint8_t count = p[at + 2];
             ESP_LOGI(TAG, "SYNMAP|CANDIDATE|off=%u|on=%u|voice=%u|count=%u",
                      (unsigned)at, p[at], p[at + 1], count);
+            ESP_LOGI(TAG, "SYNMAP|MODE_BYTE|off=%u|value=%u",
+                     (unsigned)(at - 1), p[at - 1]);
             for (uint8_t i = 0; i < count; ++i) {
                 ESP_LOGI(TAG, "SYNMAP|VOICE_PARAM|p%u=%.6f", i,
                          (double)read_float32_le(&p[at + 3 + 4u * i]));

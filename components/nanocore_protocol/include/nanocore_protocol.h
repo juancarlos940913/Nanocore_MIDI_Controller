@@ -55,8 +55,11 @@ typedef struct {
 
     /*
      * Firmware 1.2 Synth Mode is exposed separately (protocol block id 10).
-     * Stage 06 only observes/maps it; normal 8-block UI behavior is unchanged.
+     * Mode flag and voice enable are separate. Stage 08B reads both;
+     * no Synth writes or mode-aware editor UI are enabled yet.
      */
+    bool synth_mode_known;
+    bool synth_mode;
     bool synth_known;
     bool synth_on;
     uint8_t synth_variant;

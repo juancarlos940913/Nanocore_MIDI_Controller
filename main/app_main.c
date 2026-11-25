@@ -2238,7 +2238,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08A / SYNTH READ-ONLY DISCOVERY");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08B / SYNTH VOICE SPEC AND MODE READ");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
