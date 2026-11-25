@@ -89,6 +89,7 @@ static int64_t s_notice_until_us;
 static bool s_recall_pending;
 static bool s_recall_poll_inflight;
 static bool s_name_after_live;
+static bool s_editor_models_after_live;
 static uint8_t s_recall_target;
 static uint8_t s_recall_poll_count;
 static int64_t s_recall_started_us;
@@ -858,19 +859,20 @@ static void open_block_editor(void)
      * additionally need the authoritative saved model id from 0x41.
      */
     if (s_midi_ready && !s_recall_pending && !s_recall_poll_inflight) {
+        s_editor_models_after_live =
+            (s_selected_block == BLOCK_AMP && !s_amp_model_known) ||
+            (s_selected_block == BLOCK_CAB && !s_cab_model_known);
+
         esp_err_t rc = nanocore_protocol_request_live_state();
         if (rc != ESP_OK) {
             ESP_LOGW(TAG, "Editor live refresh failed: %s",
                      esp_err_to_name(rc));
-        }
 
-        bool need_model_read =
-            (s_selected_block == BLOCK_AMP && !s_amp_model_known) ||
-            (s_selected_block == BLOCK_CAB && !s_cab_model_known);
-
-        if (need_model_read) {
-            (void)nanocore_protocol_request_preset_models(
-                s_runtime.current_preset);
+            if (s_editor_models_after_live) {
+                s_editor_models_after_live = false;
+                (void)nanocore_protocol_request_preset_models(
+                    s_runtime.current_preset);
+            }
         }
     }
 
@@ -1333,6 +1335,7 @@ static void ble_event_handler(void *handler_args,
         s_ble_connected = false;
         s_midi_ready = false;
         s_tuner_on = false;
+        s_editor_models_after_live = false;
         s_conn_handle = BLE_CONN_HANDLE_INVALID;
         s_midi_char_handle = 0;
         s_target_found = false;
@@ -1649,6 +1652,12 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         nanocore_mapper_on_live_state(e);
 
         render_ui();
+
+        if (s_editor_models_after_live) {
+            s_editor_models_after_live = false;
+            (void)nanocore_protocol_request_preset_models(
+                s_runtime.current_preset);
+        }
 
         if (s_runtime.mode == CTRL_MODE_SCENE) {
             // Only overlay a Scene after the requested physical preset
