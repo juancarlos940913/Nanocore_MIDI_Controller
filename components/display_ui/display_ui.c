@@ -281,13 +281,8 @@ static void footer(const display_ui_state_t *s)
              s->tap_capture?"  TAP":"");
     text(12,296,buf,s->tap_capture?C_BLUE:C_MUTED,1);
 
-    if (s->mode == CTRL_MODE_SCENE && s->screen == UI_SCREEN_PERFORMANCE) {
+    if (s->screen == UI_SCREEN_PERFORMANCE) {
         text(205,296,"ENC2: - GUITAR + SYNTH",C_MUTED,1);
-    } else if (s->synth_mode && s->screen == UI_SCREEN_PERFORMANCE) {
-        text(205,296,"READ ONLY  ENC2 REFRESH",C_MUTED,1);
-    } else if (s->mode == CTRL_MODE_STOMP &&
-        s->screen == UI_SCREEN_PERFORMANCE) {
-        text(215,296,"TL FX2  TR DLY  B1 MOD  B2 REV",C_MUTED,1);
     } else {
         text(300,296,"ENC1 SELECT  ENC2 BACK",C_MUTED,1);
     }
@@ -312,8 +307,10 @@ static void performance(const display_ui_state_t *s)
             s->scene_captured ? (s->synth_mode ? "SYNTH / SAVED" : "GUITAR / SAVED") :
             (s->synth_mode ? "SYNTH / NEW SCENE" : "GUITAR / NEW SCENE");
         text_center(LCD_W/2,96,status,C_CYAN,1);
-    } else if (s->synth_mode) {
-        text_center(LCD_W/2,88,s->synth_mode_known?"SYNTH MODE - READ ONLY":"SYNTH MODE - SYNC?",C_CYAN,1);
+    } else {
+        const char *sound = !s->synth_mode_known ? "SOUND MODE - SYNC?" :
+            s->synth_mode ? "SYNTH MODE" : "GUITAR MODE";
+        text_center(LCD_W/2,88,sound,C_CYAN,1);
     }
     const int x0=18,y0=108,w=102,h=64,gx=12,gy=12;
     /* Visible order is independent of the legacy block enum. */

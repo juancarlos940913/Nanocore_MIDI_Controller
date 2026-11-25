@@ -261,3 +261,36 @@ esp_err_t controller_storage_scene_save(uint8_t preset, uint8_t scene,
     nvs_close(h);
     return rc;
 }
+
+esp_err_t controller_storage_base_mode_load(uint8_t preset, bool *synth)
+{
+    if (!synth || preset >= CTRL_PRESET_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t h;
+    esp_err_t rc=nvs_open_from_partition(SCENE_PARTITION,SCENE_NAMESPACE,NVS_READONLY,&h);
+    if (rc!=ESP_OK) return rc;
+    char key[12];
+    snprintf(key,sizeof(key),"p%02u_mode",(unsigned)preset);
+    uint8_t v=0;
+    rc=nvs_get_u8(h,key,&v);
+    nvs_close(h);
+    if (rc!=ESP_OK) return rc;
+    if (v>1) return ESP_ERR_INVALID_ARG;
+    *synth=v!=0;
+    return ESP_OK;
+}
+
+esp_err_t controller_storage_base_mode_save(uint8_t preset, bool synth)
+{
+    if (preset >= CTRL_PRESET_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t h;
+    esp_err_t rc=nvs_open_from_partition(SCENE_PARTITION,SCENE_NAMESPACE,NVS_READWRITE,&h);
+    if (rc!=ESP_OK) return rc;
+    char key[12];
+    snprintf(key,sizeof(key),"p%02u_mode",(unsigned)preset);
+    rc=nvs_set_u8(h,key,synth?1:0);
+    if (rc==ESP_OK) rc=nvs_commit(h);
+    nvs_close(h);
+    return rc;
+}
