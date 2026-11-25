@@ -97,6 +97,10 @@ esp_err_t nanocore_protocol_set_block_param(
     uint8_t param_index,
     float normalized_value);
 
+/* AMP/CAB models use dedicated scalar fields in ToneCommand's 0x6D editor. */
+esp_err_t nanocore_protocol_set_amp_model(uint8_t model_id);
+esp_err_t nanocore_protocol_set_cab_model(uint8_t model_id);
+
 /*
  * Rename active preset (8-char device limit) and persist its live state
  * into the same active slot. Returns only after the device ACKs opcode 0x46.
