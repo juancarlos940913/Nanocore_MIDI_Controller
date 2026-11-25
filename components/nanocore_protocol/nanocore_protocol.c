@@ -47,6 +47,8 @@
 #define SEG_MORE               0x10
 #define SEG_LAST               0x11
 #define CATALOG_RECORD_LEN       30
+#define CATALOG_AMP_RECORD_LEN   31
+#define CATALOG_RECORD_MAX       CATALOG_AMP_RECORD_LEN
 #define CATALOG_NAME_OFFSET      14
 
 #define PROTO_EVENT_QUEUE      16
@@ -93,7 +95,8 @@ static struct {
     uint16_t seq;
     uint16_t opcode;
     uint16_t received;
-    uint8_t data[CATALOG_RECORD_LEN];
+    uint16_t total;
+    uint8_t data[CATALOG_RECORD_MAX];
 } s_catalog_reply;
 
 static float read_float32_le(const uint8_t *p)
@@ -714,11 +717,23 @@ static void dispatch_complete_reply(uint16_t opcode,
 /* USB captures document a normal status-0 response; BLE may deliver the
  * same record through the 0x10/0x11 segmented envelope. Decode both without
  * touching the normal live/preset reassembly buffer. */
+/* CAB is 30 bytes. AMP may have one extra trailing byte (31 bytes
+ * confirmed on the user's firmware 1.2). The name offset and width
+ * are identical; the unknown trailer is not part of the name. */
+static bool catalog_record_length_valid(uint16_t opcode, size_t len)
+{
+    if (opcode == OP_CAB_CATALOG) return len == CATALOG_RECORD_LEN;
+    if (opcode == OP_AMP_CATALOG) {
+        return len == CATALOG_RECORD_LEN || len == CATALOG_AMP_RECORD_LEN;
+    }
+    return false;
+}
+
 static void emit_catalog_reply(uint16_t opcode, uint16_t seq, uint8_t status,
                                const uint8_t *payload, size_t len)
 {
     if (status == 0) {
-        if (len != CATALOG_RECORD_LEN ||
+        if (!catalog_record_length_valid(opcode, len) ||
             payload[0] >= NC_PROTO_MODEL_COUNT ||
             payload[1] > 1) {
             ESP_LOGW(TAG, "Invalid catalog record op=0x%02X len=%u",
@@ -793,8 +808,10 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
     uint16_t total = (uint16_t)(body[0] | ((uint16_t)body[1] << 8));
     uint16_t offset = (uint16_t)(body[2] | ((uint16_t)body[3] << 8));
     size_t data_len = body_len - 4;
-    if (total != CATALOG_RECORD_LEN || data_len == 0 ||
+    if (!catalog_record_length_valid(opcode, total) || data_len == 0 ||
         (size_t)offset + data_len > total) {
+        ESP_LOGW(TAG, "CATALOG|BAD_SEGMENT_LENGTH|op=0x%02X|total=%u|off=%u|n=%u",
+                 opcode, total, offset, (unsigned)data_len);
         s_catalog_reply.active = false;
         return;
     }
@@ -803,10 +820,12 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
         s_catalog_reply.active = true;
         s_catalog_reply.seq = seq;
         s_catalog_reply.opcode = opcode;
+        s_catalog_reply.total = total;
         s_catalog_reply.received = 0;
     }
     if (!s_catalog_reply.active || s_catalog_reply.seq != seq ||
         s_catalog_reply.opcode != opcode ||
+        s_catalog_reply.total != total ||
         s_catalog_reply.received != offset) {
         if (amp) ESP_LOGW(TAG, "CATALOG|AMP_BAD_SEGMENT|off=%u|received=%u",
                           offset, s_catalog_reply.received);
@@ -816,9 +835,12 @@ static void handle_catalog_reply(const uint8_t *msg, size_t len)
     memcpy(&s_catalog_reply.data[offset], &body[4], data_len);
     s_catalog_reply.received += (uint16_t)data_len;
     if (status == SEG_LAST) {
-        if (s_catalog_reply.received == CATALOG_RECORD_LEN) {
+        if (s_catalog_reply.received == s_catalog_reply.total) {
             emit_catalog_reply(opcode, seq, 0, s_catalog_reply.data,
-                               CATALOG_RECORD_LEN);
+                               s_catalog_reply.total);
+        } else {
+            ESP_LOGW(TAG, "CATALOG|INCOMPLETE|op=0x%02X|received=%u|total=%u",
+                     opcode, s_catalog_reply.received, s_catalog_reply.total);
         }
         s_catalog_reply.active = false;
     }

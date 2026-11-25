@@ -81,3 +81,20 @@ unchanged parser. Logs AMP_TX, AMP_RX, AMP_DECODE, AMP_INFO_TX and
 AMP_INFO_RX (when received) expose the actual wire frames and response
 headers. No claim that 0x30 is required until tested; the probe and
 increased timeout are experimental. No writing of profiles or IRs.
+
+## Stage 07.1B — accept the physically captured 31-byte AMP record
+
+The Stage 07.1A serial log confirms 0x30 replies with a 20-byte payload
+and 0x36 replies with status 0x11, body length 35 and total record
+length 31 (4-byte segment header + 31-byte record). All six observed
+AMP replies were rejected by the previous 30-byte length gate, causing
+misleading timeouts. Independent 7-bit decoding of the actual capture
+produced slot 0 BogXTC1, slot 1 BogXTC2, and slot 2 ENGP1 twice each.
+The first 30 bytes have the known record layout: name at bytes 14..29.
+Byte 30 was 0x01 in all six samples; its meaning is not yet known.
+Accept AMP records of 30 or 31 bytes, CAB records of exactly 30 bytes,
+and reassemble against each validated declared total in a 31-byte buffer.
+Keep the name limited to 16 bytes and never interpret the extra byte
+as part of the name. Keep the 0x30 probe, bounded retries and AMP trace
+until full catalog acceptance is confirmed. No changes to model writes,
+CAB layout, NVS, SAVE or the normal editor.
