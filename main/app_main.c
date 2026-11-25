@@ -1966,8 +1966,12 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
     if (e->type == NC_PROTO_EVENT_SYNTH_CAPTURE) {
         if (s_synmap_enabled && s_synmap_inflight &&
             e->catalog_seq == s_synmap_seq) {
+            bool printed = nanocore_protocol_print_synth_capture(s_synmap_seq);
             s_synmap_inflight = false;
-            show_notice("SYNTH CAPTURE OK");
+            ESP_LOGI(TAG, "SYNMAP|MAIN_STACK_FREE|bytes=%u",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            if (!printed) ESP_LOGW(TAG, "SYNMAP|MAILBOX_MISSING|seq=%u", s_synmap_seq);
+            show_notice(printed ? "SYNTH CAPTURE OK" : "CAPTURE LOST");
         }
         return;
     }
@@ -2238,7 +2242,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08B / SYNTH VOICE SPEC AND MODE READ");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08B.1 / SYNTH CAPTURE STACK FIX");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 

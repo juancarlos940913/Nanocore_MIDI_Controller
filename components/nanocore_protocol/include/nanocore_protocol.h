@@ -92,6 +92,8 @@ esp_err_t nanocore_protocol_request_live_state(void);
 /* Stage 08A: raw, read-only 0x63 capture, isolated from the normal editor.
  * Completion is NC_PROTO_EVENT_SYNTH_CAPTURE with catalog_seq as request id. */
 esp_err_t nanocore_protocol_request_synth_capture(uint16_t *seq_out);
+/* Main-task only: copy and print the completed capture outside sys_evt. */
+bool nanocore_protocol_print_synth_capture(uint16_t seq);
 esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
 
 /*

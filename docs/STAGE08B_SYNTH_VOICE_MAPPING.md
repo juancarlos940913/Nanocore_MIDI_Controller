@@ -46,3 +46,20 @@ Wait catalog DONE, use PRESET performance screen, same disposable preset.
 
 The discovery path remains read-only; no Synth mode toggle, write,
 UI filtering, or persistent data changes in this commit.
+
+## Stage 08B.1 — sys_evt stack overflow
+
+Physical log at 451a5fa: FX1 raw IDs 0,1,2,3,7,8,4,5,6 all captured
+successfully; nine complete snapshots, mode byte 1 at varying offsets.
+Immediately after seq 116 SYNMAP END, FreeRTOS detected stack overflow
+in sys_evt and rebooted. Exact deepest call is unknown (corrupted trace).
+Move expensive hex/float formatting and printing into app_main. BLE RX
+copies completed capture into a static, sequence-keyed mailbox and sends
+the existing completion event. Main task prints from its own static buffer,
+then logs SYNMAP|MAIN_STACK_FREE. No reassembly pointers cross tasks.
+Set sys_evt stack to 6144 and main to 8192 in sdkconfig.defaults; existing
+local sdkconfig may override defaults, so update both keys explicitly
+before reconfigure. Do not erase NVS. Repeat missing FX1 9,10,11 only,
+then FX2 and DELAY. This is a mitigation to validate on hardware, not a
+claim that the exact overflow call has been proven. Normal parser, editor,
+voice table and catalog unchanged.

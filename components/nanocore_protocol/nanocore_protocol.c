@@ -90,6 +90,18 @@ typedef struct {
 
 static reassembly_t s_reassembly;
 
+/* Dedicated capture mailbox. RX copies the complete payload while holding
+ * the lock; only the main task formats/logs it from its own static copy.
+ * Never retain pointers into the mutable BLE reassembly buffer. */
+static portMUX_TYPE s_capture_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    bool ready;
+    uint16_t seq;
+    size_t len;
+    uint8_t data[REASSEMBLY_MAX];
+} s_capture_mailbox;
+static uint8_t s_capture_print_buffer[REASSEMBLY_MAX];
+
 /* Catalog records are short, and must never replace the in-progress
  * 0x63/0x41 reassembly if a user action arrives during the background read. */
 static struct {
@@ -795,7 +807,34 @@ static void log_synth_capture(uint16_t seq, const uint8_t *p, size_t len)
         ESP_LOGW(TAG, "SYNMAP|BLOCK_WALK_INCOMPLETE|off=%u", (unsigned)pos);
     }
     ESP_LOGI(TAG, "SYNMAP|END|seq=%u", seq);
+}
 
+/* Called only by app_main after receiving the sequence-matched event. */
+bool nanocore_protocol_print_synth_capture(uint16_t seq)
+{
+    size_t len = 0;
+    bool ready = false;
+    portENTER_CRITICAL(&s_capture_lock);
+    if (s_capture_mailbox.ready && s_capture_mailbox.seq == seq) {
+        len = s_capture_mailbox.len;
+        memcpy(s_capture_print_buffer, s_capture_mailbox.data, len);
+        s_capture_mailbox.ready = false;
+        ready = true;
+    }
+    portEXIT_CRITICAL(&s_capture_lock);
+    if (ready) log_synth_capture(seq, s_capture_print_buffer, len);
+    return ready;
+}
+
+static void queue_synth_capture(uint16_t seq, const uint8_t *payload, size_t len)
+{
+    if (len > REASSEMBLY_MAX) return;
+    portENTER_CRITICAL(&s_capture_lock);
+    memcpy(s_capture_mailbox.data, payload, len);
+    s_capture_mailbox.len = len;
+    s_capture_mailbox.seq = seq;
+    s_capture_mailbox.ready = true;
+    portEXIT_CRITICAL(&s_capture_lock);
     nanocore_protocol_event_t *e =
         scratch_event(NC_PROTO_EVENT_SYNTH_CAPTURE);
     e->catalog_seq = seq;
@@ -812,7 +851,7 @@ static void dispatch_complete_reply(uint16_t opcode, uint16_t seq,
         if (capture) s_synth_capture_seq = 0;
         portEXIT_CRITICAL(&s_seq_lock);
         if (capture) {
-            log_synth_capture(seq, payload, len);
+            queue_synth_capture(seq, payload, len);
             return;
         }
         parse_live_payload(payload, len);
@@ -1132,6 +1171,9 @@ void nanocore_protocol_set_connected(bool connected)
     portENTER_CRITICAL(&s_seq_lock);
     s_synth_capture_seq = 0;
     portEXIT_CRITICAL(&s_seq_lock);
+    portENTER_CRITICAL(&s_capture_lock);
+    s_capture_mailbox.ready = false;
+    portEXIT_CRITICAL(&s_capture_lock);
     memset(&s_reassembly, 0, sizeof(s_reassembly));
     memset(&s_catalog_reply, 0, sizeof(s_catalog_reply));
 
