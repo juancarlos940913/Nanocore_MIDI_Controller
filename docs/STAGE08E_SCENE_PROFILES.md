@@ -58,3 +58,12 @@ parameters. Physical block-10 param pushes are accepted as candidates
 through a separate event; wire behavior still requires validation.
 Save rejection leaves editing available. Scene recall failure is not
 reported READY; no persistent scene overwrite on failed readback.
+
+## Stage 08E.1 — GCC format-truncation build fix
+
+ESP-IDF v5.5.5 / GCC 14.2 rejected the unbounded `%s` scene name
+copy in scene_save_from_live (app_main.c:1154). Explicitly bound all
+three new scene name copies to CTRL_NAME_LEN-1 with `%.*s`, preserving
+NUL termination and the existing 24-byte layout. No change to protocol,
+scene storage, partition table, or warning flags. Rebuild and repeat
+Stage 08E acceptance tests.

@@ -889,8 +889,8 @@ static void scene_load_names(void)
             s_runtime.current_preset, i, &s_scene_name_scratch);
         if (rc == ESP_OK) {
             s_scene_saved[i] = true;
-            snprintf(s_preset.scene[i].name, CTRL_NAME_LEN, "%s",
-                     s_scene_name_scratch.name);
+            snprintf(s_preset.scene[i].name, CTRL_NAME_LEN, "%.*s",
+                     CTRL_NAME_LEN - 1, s_scene_name_scratch.name);
         }
     }
 }
@@ -1123,7 +1123,8 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
     p->synth_voice = e->synth_variant;
     p->synth_count = e->synth_param_count;
     memcpy(p->synth_params, e->synth_params, sizeof(p->synth_params));
-    snprintf(p->name, sizeof(p->name), "%s", s_name_editor.text);
+    snprintf(p->name, sizeof(p->name), "%.*s",
+             CTRL_NAME_LEN - 1, s_name_editor.text);
     for (int b = 0; b < BLOCK_COUNT; ++b) {
         if (!scene_block_visible(p->synth_mode, b)) continue;
         if (!e->block_known[b] || !e->block_profile_known[b] ||
@@ -1151,7 +1152,8 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
         return;
     }
     s_scene_saved[s_runtime.current_scene] = true;
-    snprintf(s_preset.scene[s_runtime.current_scene].name, CTRL_NAME_LEN, "%s", p->name);
+    snprintf(s_preset.scene[s_runtime.current_scene].name, CTRL_NAME_LEN,
+             "%.*s", CTRL_NAME_LEN - 1, p->name);
     s_preset.active_scene = s_runtime.current_scene;
     s_dirty = false;
     s_scene_phase = SCENE_IDLE;
