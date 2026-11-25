@@ -151,6 +151,8 @@ static bool s_synth_mode_known;
 static bool s_synth_mode;
 static bool s_synth_selected;
 static bool s_levels_selected, s_levels_known, s_levels_wait, s_levels_edit;
+static bool s_levels_write_ready, s_levels_write_pending;
+static int8_t s_levels_target_db;
 static uint8_t s_levels_row, s_level_raw;
 static bool s_level_raw_known;
 static int8_t s_input_gain_db;
@@ -412,6 +414,9 @@ static void service_slot_probe(void)
         s_slot_probe_inflight=false;
         s_levels_wait=false;
         s_levels_known=false;
+        s_levels_write_ready=false;
+        s_levels_write_pending=false;
+        s_levels_edit=false;
         s_level_raw_known=false;
         return;
     }
@@ -423,13 +428,15 @@ static void service_slot_probe(void)
     if(s_levels_wait && now>=s_levels_deadline) {
         s_levels_wait=false;
         s_levels_known=false;
+        s_levels_write_ready=false;
+        s_levels_write_pending=false;
         s_levels_edit=false;
         if(s_screen==UI_SCREEN_LEVELS) show_notice("LEVEL READBACK TIMEOUT");
     }
     if(!s_slot_probe_pending || s_slot_probe_inflight || now<s_slot_probe_due ||
        scene_busy() || s_recall_pending || s_recall_poll_inflight ||
        s_catalog_inflight || s_synmap_enabled || s_levels_wait ||
-       s_screen==UI_SCREEN_NAME_EDITOR || nanocore_mapper_is_enabled()) return;
+       nanocore_mapper_is_enabled()) return;
     s_slot_probe_pending=false;
     if(nanocore_protocol_request_live_state_seq(&s_slot_probe_seq)==ESP_OK) {
         s_slot_probe_inflight=true;
@@ -447,6 +454,8 @@ static void levels_read(void)
         return;
     }
     s_levels_known=false;
+    s_levels_write_ready=false;
+    s_levels_write_pending=false;
     s_levels_edit=false;
     if(nanocore_protocol_request_global_levels(&s_levels_seq)==ESP_OK) {
         s_levels_wait=true;
@@ -2712,18 +2721,20 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
     }
     if(s_screen==UI_SCREEN_LEVELS) {
         if(encoder==1 && !s_levels_edit) s_levels_row=(uint8_t)(delta>0?1:0);
-        else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known &&
+        else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known && s_levels_write_ready &&
                 !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
             int next=(int)s_input_gain_db+(delta>0?1:-1);
             if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
                 s_levels_wait=true;
+                s_levels_write_pending=true;
+                s_levels_target_db=(int8_t)next;
                 s_levels_deadline=esp_timer_get_time()+2500000LL;
             }
         }
         render_ui();
         return;
     }
-    if(s_slot_probe_inflight) return;
+    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait) return;
     if (encoder == 2 && s_screen == UI_SCREEN_PERFORMANCE &&
         !s_tuner_on &&
         !tempo_engine_tap_active()) {
@@ -2853,13 +2864,13 @@ static void handle_input(input_event_t e)
             nanocore_protocol_set_level_diagnostics(false);
             s_notice[0]='\0';
         } else if(e==INPUT_ENC1_CLICK) {
-            if(s_levels_row==1 || !s_levels_known) levels_read();
+            if(s_levels_row==1 || !s_levels_known || !s_levels_write_ready) levels_read();
             else if(!s_levels_wait) s_levels_edit=!s_levels_edit;
         }
         render_ui();
         return;
     }
-    if(s_slot_probe_inflight || s_levels_wait) {
+    if(s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait) {
         if(e==INPUT_ENC2_CLICK) slot_probe_request(true);
         return;
     }
@@ -3066,8 +3077,15 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         if(!e->global_push && s_levels_wait && e->global_seq==s_levels_seq) {
             s_levels_wait=false;
             s_levels_known=true;
+            s_levels_write_ready=true;
             s_input_gain_db=e->input_gain_db;
-            ESP_LOGI(TAG,"LEVEL|CONFIRMED|input_db=%d",(int)s_input_gain_db);
+            if(s_levels_write_pending && s_input_gain_db!=s_levels_target_db) {
+                s_levels_edit=false;
+                s_levels_write_ready=false;
+                ESP_LOGW(TAG,"LEVEL|WRITE_MISMATCH|wanted=%d|read=%d",(int)s_levels_target_db,(int)s_input_gain_db);
+                queue_notice("INPUT GAIN NOT CONFIRMED");
+            } else ESP_LOGI(TAG,"LEVEL|CONFIRMED|input_db=%d",(int)s_input_gain_db);
+            s_levels_write_pending=false;
         } else if(e->global_push && !s_levels_wait) {
             s_levels_known=true;
             s_input_gain_db=e->input_gain_db;
@@ -3089,6 +3107,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                     break;
                 }
                 nanocore_protocol_set_level_diagnostics(false);
+                if(s_name_editor.active) name_editor_close(&s_name_editor);
                 clear_block_state();
                 was_recall=true;
                 s_name_after_live=true;
@@ -3543,7 +3562,8 @@ void app_main(void)
             discard_cancel();
             render_ui();
         }
-        if (s_pending_scene_delta && !s_catalog_inflight && !scene_busy()) {
+        if (s_pending_scene_delta && !s_catalog_inflight && !scene_busy() &&
+            !s_slot_probe_pending && !s_slot_probe_inflight && !s_levels_wait) {
             int delta=s_pending_scene_delta;
             s_pending_scene_delta=0;
             if (s_runtime.mode==CTRL_MODE_SCENE && s_midi_ready && !s_recall_pending)
