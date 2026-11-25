@@ -203,6 +203,56 @@ static esp_err_t flush_screen(void)
     return ESP_OK;
 }
 
+static bool s_battery_known;
+static uint8_t s_battery_percent;
+
+static void draw_battery(void)
+{
+    fill_rect(344,0,82,42,C_PANEL2);
+    uint16_t c = !s_battery_known ? C_MUTED :
+        s_battery_percent <= 15 ? C_RED :
+        s_battery_percent <= 30 ? C_YELLOW : C_GREEN;
+    rect(346,12,28,14,c,1);
+    fill_rect(374,16,3,6,c);
+    if (s_battery_known) {
+        int w = (24 * (int)s_battery_percent + 50) / 100;
+        if (w) fill_rect(348,14,w,10,c);
+    }
+    char value[8];
+    if (s_battery_known)
+        snprintf(value,sizeof(value),"%u%%",(unsigned)s_battery_percent);
+    else
+        snprintf(value,sizeof(value),"--");
+    text(380,15,value,c,1);
+}
+
+void display_ui_update_battery(bool known, uint8_t percent)
+{
+    if (!s_ready) return;
+    if(xSemaphoreTake(s_mutex,pdMS_TO_TICKS(100))!=pdTRUE)return;
+    if (percent > 100) percent = 100;
+    if (s_battery_known == known && s_battery_percent == percent) {
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+    s_battery_known = known;
+    s_battery_percent = percent;
+    draw_battery();
+    /* Refresh only 82x32 pixels, respecting DMA staging capacity. */
+    while (xSemaphoreTake(s_done,0)==pdTRUE){}
+    for (int y=4;y<36;y+=4) {
+        for (int r=0;r<4;++r)
+            for (int x=344;x<426;++x)
+                s_dma[r*82+x-344]=swap16(s_fb[(size_t)(y+r)*LCD_W+x]);
+        esp_err_t rc=esp_lcd_panel_draw_bitmap(s_panel,344,y,426,y+4,s_dma);
+        if (rc!=ESP_OK || xSemaphoreTake(s_done,pdMS_TO_TICKS(300))!=pdTRUE) {
+            ESP_LOGW(TAG,"Battery LCD partial flush failed");
+            break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 static void header(const display_ui_state_t *s)
 {
     fill_rect(0,0,LCD_W,42,C_PANEL2);
@@ -218,6 +268,7 @@ static void header(const display_ui_state_t *s)
     text(448,14,s->midi_ready?"M":"-",link,1);
 
     if(s->dirty) text(460,14,"*",C_ORANGE,1);
+    draw_battery();
 }
 
 static void footer(const display_ui_state_t *s)

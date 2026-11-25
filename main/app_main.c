@@ -30,6 +30,7 @@
 #include "esp_ble_midi_svc.h"
 
 #include "board.h"
+#include "battery_manager.h"
 #include "controller_storage.h"
 #include "controller_types.h"
 #include "display_ui.h"
@@ -2916,6 +2917,7 @@ void app_main(void)
     // Bring up the display before background input/LED tasks so a fault in
     // those subsystems cannot hide boot diagnostics or leave the TFT dark.
     ESP_ERROR_CHECK(display_ui_init());
+    (void)battery_manager_init(); /* Optional hardware: failure must not stop controller. */
     render_ui();
 
     ESP_ERROR_CHECK(status_leds_init(s_runtime.mode, s_preset.bpm));
@@ -2977,6 +2979,12 @@ void app_main(void)
 
         service_recall_sync();
         service_model_catalog();
+        if (!scene_busy() && !s_recall_pending && !s_catalog_inflight && !s_synmap_enabled) {
+            bool known;
+            uint8_t percent;
+            if (battery_manager_poll(&known, &percent))
+                display_ui_update_battery(known, percent);
+        }
         nanocore_mapper_service(
             s_midi_ready,
             s_recall_pending || s_recall_poll_inflight);

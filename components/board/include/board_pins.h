@@ -25,6 +25,9 @@
 // to be safe or driven through a transistor.
 #define BOARD_LCD_BL            -1
 
+// Battery: 1S Li-ion, 100k/100k divider + 100nF at ADC input.
+#define BOARD_BATTERY_ADC_GPIO    1
+
 // Encoders
 #define BOARD_ENC1_A             4
 #define BOARD_ENC1_B             5

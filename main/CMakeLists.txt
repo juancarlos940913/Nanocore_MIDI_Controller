@@ -18,4 +18,5 @@ idf_component_register(
         status_leds
         nanocore_map
         name_editor
+        battery_manager
 )

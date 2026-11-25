@@ -73,6 +73,8 @@ typedef struct {
 esp_err_t display_ui_init(void);
 bool display_ui_is_ready(void);
 void display_ui_render(const display_ui_state_t *state);
+/* Partial redraw, serialized with normal framebuffer updates. */
+void display_ui_update_battery(bool known, uint8_t percent);
 
 #ifdef __cplusplus
 }
