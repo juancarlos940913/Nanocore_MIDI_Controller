@@ -324,7 +324,7 @@ static void performance(const display_ui_state_t *s)
         controller_block_t b = s->synth_mode ? synth_order[i] : (controller_block_t)i;
         int row=i/4,col=i%4;
         int x=x0+col*(w+gx), y=y0+row*(h+gy);
-        bool sel=voice ? s->synth_selected : (!s->synth_selected && b==s->selected_block);
+        bool sel=!s->levels_selected && (voice ? s->synth_selected : (!s->synth_selected && b==s->selected_block));
 
         uint16_t state_color = C_MUTED;
         const char *state_text = "?";
@@ -347,6 +347,32 @@ static void performance(const display_ui_state_t *s)
                     C_WHITE,2);
         text_center(x+w/2,y+43,state_text,state_color,1);
     }
+    fill_rect(18,260,444,19,s->levels_selected?C_PANEL2:C_PANEL);
+    rect(18,260,444,19,s->levels_selected?C_CYAN:C_MUTED,s->levels_selected?2:1);
+    text_center(LCD_W/2,266,"LEVELS  -  INPUT / OUTPUT",s->levels_selected?C_CYAN:C_MUTED,1);
+}
+
+static void levels_screen(const display_ui_state_t *s)
+{
+    text_center(LCD_W/2,58,"LEVELS",C_WHITE,2);
+    text_center(LCD_W/2,84,"GLOBAL INPUT - NOT A SCENE EFFECT",C_MUTED,1);
+    char buf[48];
+    fill_rect(18,108,444,54,s->levels_row==0?C_PANEL2:C_PANEL);
+    rect(18,108,444,54,s->levels_row==0?C_CYAN:C_MUTED,2);
+    text(30,119,"INPUT GAIN",C_WHITE,2);
+    if(s->levels_known) snprintf(buf,sizeof(buf),"%d dB",(int)s->input_gain_db);
+    else snprintf(buf,sizeof(buf),"UNKNOWN");
+    text(300,119,buf,s->levels_known?C_GREEN:C_YELLOW,2);
+    text(30,145,s->levels_wait?"WAIT READBACK":s->levels_edit?"ENC2 ADJUST 1 dB":"ENC1 CLICK TO EDIT / READ",C_MUTED,1);
+    fill_rect(18,173,444,70,s->levels_row==1?C_PANEL2:C_PANEL);
+    rect(18,173,444,70,s->levels_row==1?C_CYAN:C_MUTED,2);
+    text(30,185,"ANALOG OUTPUT",C_WHITE,2);
+    text(306,185,"LOCKED",C_YELLOW,2);
+    if(s->level_raw_known) snprintf(buf,sizeof(buf),"LIVE HEADER RAW: %u (UNVERIFIED)",(unsigned)s->level_raw);
+    else snprintf(buf,sizeof(buf),"OUTPUT MAPPING NOT VERIFIED");
+    text(30,211,buf,C_MUTED,1);
+    text(30,226,"ENC1 CLICK TO CAPTURE LEVELS",C_MUTED,1);
+    text_center(LCD_W/2,264,"TURN AMP DOWN BEFORE ADJUSTING",C_ORANGE,1);
 }
 
 static void block_editor(const display_ui_state_t *s)
@@ -584,6 +610,7 @@ void display_ui_render(const display_ui_state_t *s)
     case UI_SCREEN_BLOCK_EDITOR:block_editor(s);break;
     case UI_SCREEN_NAME_EDITOR:name_editor_screen(s);break;
     case UI_SCREEN_TUNER:tuner_screen(s);break;
+    case UI_SCREEN_LEVELS:levels_screen(s);break;
     default:performance(s);break;
     }
 

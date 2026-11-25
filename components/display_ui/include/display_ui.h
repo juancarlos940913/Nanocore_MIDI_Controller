@@ -19,6 +19,7 @@ typedef enum {
     UI_SCREEN_BLOCK_EDITOR,
     UI_SCREEN_NAME_EDITOR,
     UI_SCREEN_TUNER,
+    UI_SCREEN_LEVELS,
 } ui_screen_t;
 
 typedef struct {
@@ -40,6 +41,12 @@ typedef struct {
     bool synth_mode_known;
     bool synth_mode;
     bool synth_selected;
+    bool levels_selected;
+    bool levels_known, levels_wait, levels_edit;
+    uint8_t levels_row;
+    int8_t input_gain_db;
+    bool level_raw_known;
+    uint8_t level_raw;
     bool synth_voice_known;
     bool synth_voice_on;
     bool editor_read_only;

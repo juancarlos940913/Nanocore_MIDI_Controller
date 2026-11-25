@@ -150,6 +150,15 @@ static controller_block_t s_selected_block = BLOCK_FX1;
 static bool s_synth_mode_known;
 static bool s_synth_mode;
 static bool s_synth_selected;
+static bool s_levels_selected, s_levels_known, s_levels_wait, s_levels_edit;
+static uint8_t s_levels_row, s_level_raw;
+static bool s_level_raw_known;
+static int8_t s_input_gain_db;
+static uint16_t s_levels_seq;
+static int64_t s_levels_deadline;
+static bool s_slot_probe_pending, s_slot_probe_inflight;
+static uint16_t s_slot_probe_seq;
+static int64_t s_slot_probe_due, s_slot_probe_deadline;
 static bool s_synth_voice_known;
 static bool s_synth_voice_on;
 static uint8_t s_synth_voice;
@@ -331,6 +340,8 @@ static void clear_block_state(void)
 {
     /* Keep last mode as a write lock until the next authoritative read. */
     s_scene_verified_models = false;
+    s_level_raw_known=false;
+    s_levels_selected=false;
     s_sound_origin_valid = false;
     s_discard_action = DISCARD_NONE;
     s_synth_mode_known = false;
@@ -369,6 +380,8 @@ static int block_from_type_cc(uint8_t cc)
 
 static void schedule_recall_sync(uint8_t target)
 {
+    s_slot_probe_pending=false;
+    s_slot_probe_inflight=false;
     s_recall_pending = true;
     s_recall_poll_inflight = false;
     s_name_after_live = true;
@@ -379,6 +392,67 @@ static void schedule_recall_sync(uint8_t target)
         s_recall_started_us + (RECALL_FIRST_SYNC_MS * 1000LL);
 
     ESP_LOGI(TAG, "Recall sync armed: target slot=%u", target);
+}
+
+/* 0x01 hints never mutate the active preset. Coalesce them and only
+ * adopt the slot from a fresh matching, complete 0x63 response. */
+static void slot_probe_request(bool immediate)
+{
+    if(!s_midi_ready || s_recall_pending || scene_busy()) return;
+    if(!s_slot_probe_pending) {
+        s_slot_probe_pending=true;
+        s_slot_probe_due=esp_timer_get_time()+(immediate?0:150000LL);
+    } else if(immediate) s_slot_probe_due=esp_timer_get_time();
+}
+
+static void service_slot_probe(void)
+{
+    if(!s_midi_ready) {
+        s_slot_probe_pending=false;
+        s_slot_probe_inflight=false;
+        s_levels_wait=false;
+        s_levels_known=false;
+        s_level_raw_known=false;
+        return;
+    }
+    int64_t now=esp_timer_get_time();
+    if(s_slot_probe_inflight && now>=s_slot_probe_deadline) {
+        s_slot_probe_inflight=false;
+        ESP_LOGW(TAG,"SLOT|VERIFY_TIMEOUT");
+    }
+    if(s_levels_wait && now>=s_levels_deadline) {
+        s_levels_wait=false;
+        s_levels_known=false;
+        s_levels_edit=false;
+        if(s_screen==UI_SCREEN_LEVELS) show_notice("LEVEL READBACK TIMEOUT");
+    }
+    if(!s_slot_probe_pending || s_slot_probe_inflight || now<s_slot_probe_due ||
+       scene_busy() || s_recall_pending || s_recall_poll_inflight ||
+       s_catalog_inflight || s_synmap_enabled || s_levels_wait ||
+       s_screen==UI_SCREEN_NAME_EDITOR || nanocore_mapper_is_enabled()) return;
+    s_slot_probe_pending=false;
+    if(nanocore_protocol_request_live_state_seq(&s_slot_probe_seq)==ESP_OK) {
+        s_slot_probe_inflight=true;
+        s_slot_probe_deadline=now+3000000LL;
+        ESP_LOGI(TAG,"SLOT|VERIFY_TX|seq=%u",s_slot_probe_seq);
+    }
+}
+
+static void levels_read(void)
+{
+    if(!s_midi_ready || scene_busy() || s_recall_pending ||
+       s_recall_poll_inflight || s_slot_probe_inflight || s_catalog_inflight ||
+       s_levels_wait) {
+        show_notice("WAIT LIVE SYNC");
+        return;
+    }
+    s_levels_known=false;
+    s_levels_edit=false;
+    if(nanocore_protocol_request_global_levels(&s_levels_seq)==ESP_OK) {
+        s_levels_wait=true;
+        s_levels_deadline=esp_timer_get_time()+2500000LL;
+        slot_probe_request(true);
+    } else show_notice("LEVEL READ FAILED");
 }
 
 static void service_recall_sync(void)
@@ -393,6 +467,7 @@ static void service_recall_sync(void)
                  "Recall sync timeout: target=%u polls=%u",
                  s_recall_target, s_recall_poll_count);
         s_recall_pending = false;
+        s_recall_poll_inflight = false;
         show_notice("NANOCORE PRESET SYNC TIMEOUT");
         return;
     }
@@ -747,6 +822,8 @@ static void service_model_catalog(void)
 
     /* User input, preset recall and mapper capture take precedence. */
     if (s_recall_pending || s_recall_poll_inflight || scene_busy() ||
+        s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait ||
+        s_screen==UI_SCREEN_LEVELS ||
         s_tuner_on || s_screen == UI_SCREEN_NAME_EDITOR ||
         nanocore_mapper_is_enabled() ||
         now < s_catalog_next_us || now < s_catalog_quiet_until_us) {
@@ -2139,6 +2216,14 @@ static void render_ui(void)
         .synth_mode_known = s_synth_mode_known,
         .synth_mode = s_synth_mode,
         .synth_selected = s_synth_selected,
+        .levels_selected=s_levels_selected,
+        .levels_known=s_levels_known,
+        .levels_wait=s_levels_wait,
+        .levels_edit=s_levels_edit,
+        .levels_row=s_levels_row,
+        .input_gain_db=s_input_gain_db,
+        .level_raw_known=s_level_raw_known,
+        .level_raw=s_level_raw,
         .synth_voice_known = s_synth_voice_known,
         .synth_voice_on = s_synth_voice_on,
         .editor_read_only = scene_busy() || s_scene_fault ||
@@ -2157,6 +2242,7 @@ static void render_ui(void)
 
     char parameter_text[72] = {0};
 
+    if(s_screen==UI_SCREEN_LEVELS) { display_ui_render(&u); return; }
     if (s_synth_selected) {
         const nanocore_effect_type_info_t *voice =
             s_synth_voice_known ? nanocore_spec_synth_voice(s_synth_voice) : NULL;
@@ -2624,6 +2710,20 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         render_ui();
         return; /* First rotation cancels only, never edits. */
     }
+    if(s_screen==UI_SCREEN_LEVELS) {
+        if(encoder==1 && !s_levels_edit) s_levels_row=(uint8_t)(delta>0?1:0);
+        else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known &&
+                !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
+            int next=(int)s_input_gain_db+(delta>0?1:-1);
+            if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
+                s_levels_wait=true;
+                s_levels_deadline=esp_timer_get_time()+2500000LL;
+            }
+        }
+        render_ui();
+        return;
+    }
+    if(s_slot_probe_inflight) return;
     if (encoder == 2 && s_screen == UI_SCREEN_PERFORMANCE &&
         !s_tuner_on &&
         !tempo_engine_tap_active()) {
@@ -2649,26 +2749,21 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
                 select_parameter(delta);
             }
         } else {
-            if (s_synth_mode) {
-                int index = 0;
-                if (!s_synth_selected) {
-                    for (int i = 1; i < 7; ++i) {
-                        if (s_synth_visible[i] == s_selected_block) {
-                            index = i;
-                            break;
-                        }
-                    }
+            int count=s_synth_mode?7:BLOCK_COUNT;
+            int index=s_levels_selected?count:(int)s_selected_block;
+            if(s_synth_mode && !s_levels_selected) {
+                index=0;
+                if(!s_synth_selected) {
+                    for(int i=1;i<7;++i)
+                        if(s_synth_visible[i]==s_selected_block){index=i;break;}
                 }
-                index = (index + delta) % 7;
-                if (index < 0) index += 7;
-                s_synth_selected = index == 0;
-                s_selected_block = s_synth_visible[index];
-            } else {
-                int block = (int)s_selected_block + delta;
-                while (block < 0) block += BLOCK_COUNT;
-                while (block >= BLOCK_COUNT) block -= BLOCK_COUNT;
-                s_synth_selected = false;
-                s_selected_block = (controller_block_t)block;
+            }
+            index=(index+delta)%(count+1);
+            if(index<0) index+=count+1;
+            s_levels_selected=index==count;
+            if(!s_levels_selected) {
+                s_synth_selected=s_synth_mode && index==0;
+                s_selected_block=s_synth_mode?s_synth_visible[index]:(controller_block_t)index;
             }
             render_ui();
         }
@@ -2751,6 +2846,23 @@ static void handle_input(input_event_t e)
         return;
     }
 
+    if(s_screen==UI_SCREEN_LEVELS) {
+        if(e==INPUT_ENC2_CLICK) {
+            s_levels_edit=false;
+            s_screen=UI_SCREEN_PERFORMANCE;
+            nanocore_protocol_set_level_diagnostics(false);
+            s_notice[0]='\0';
+        } else if(e==INPUT_ENC1_CLICK) {
+            if(s_levels_row==1 || !s_levels_known) levels_read();
+            else if(!s_levels_wait) s_levels_edit=!s_levels_edit;
+        }
+        render_ui();
+        return;
+    }
+    if(s_slot_probe_inflight || s_levels_wait) {
+        if(e==INPUT_ENC2_CLICK) slot_probe_request(true);
+        return;
+    }
     if (s_screen == UI_SCREEN_NAME_EDITOR) {
         handle_name_editor_event(e);
         return;
@@ -2797,6 +2909,15 @@ static void handle_input(input_event_t e)
 
     switch (e) {
     case INPUT_ENC1_CLICK:
+        if(s_screen==UI_SCREEN_PERFORMANCE && s_levels_selected) {
+            s_screen=UI_SCREEN_LEVELS;
+            s_levels_row=0;
+            s_levels_edit=false;
+            nanocore_protocol_set_level_diagnostics(true);
+            levels_read();
+            render_ui();
+            break;
+        }
         if (s_screen == UI_SCREEN_BLOCK_EDITOR) {
             if (s_scene_fault || (s_synth_mode && !s_synth_mode_known)) {
                 show_notice("READ ONLY / RETRY SCENE");
@@ -2821,9 +2942,8 @@ static void handle_input(input_event_t e)
                 apply_current_scene();
                 break;
             }
-            /* Explicit physical mode/voice refresh, no periodic polling. */
-            if (nanocore_protocol_request_live_state() == ESP_OK)
-                show_notice("LIVE REFRESH");
+            /* Fresh matched read can recover a stale UI without PC. */
+            slot_probe_request(true);
         }
         break;
 
@@ -2942,8 +3062,42 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                       ? CATALOG_IDLE_MS : CATALOG_EVENT_GAP_MS);
 
     switch (e->type) {
+    case NC_PROTO_EVENT_GLOBAL_LEVELS:
+        if(!e->global_push && s_levels_wait && e->global_seq==s_levels_seq) {
+            s_levels_wait=false;
+            s_levels_known=true;
+            s_input_gain_db=e->input_gain_db;
+            ESP_LOGI(TAG,"LEVEL|CONFIRMED|input_db=%d",(int)s_input_gain_db);
+        } else if(e->global_push && !s_levels_wait) {
+            s_levels_known=true;
+            s_input_gain_db=e->input_gain_db;
+        }
+        if(s_screen==UI_SCREEN_LEVELS) render_ui();
+        break;
     case NC_PROTO_EVENT_LIVE_STATE: {
         bool was_recall = s_recall_pending;
+        bool probe=s_slot_probe_inflight && e->live_seq==s_slot_probe_seq;
+        if(probe) {
+            s_slot_probe_inflight=false;
+            if(scene_busy() || s_recall_pending || e->slot>=CTRL_PRESET_COUNT ||
+               !e->chain_order_known || !e->synth_mode_known) break;
+            if(e->slot!=s_runtime.current_preset) {
+                uint8_t previous=s_runtime.current_preset;
+                bool had_dirty=s_dirty;
+                if(load_preset(e->slot,false)!=ESP_OK) {
+                    show_notice("PRESET READ FAILED");
+                    break;
+                }
+                nanocore_protocol_set_level_diagnostics(false);
+                clear_block_state();
+                was_recall=true;
+                s_name_after_live=true;
+                ESP_LOGI(TAG,"SLOT|CONFIRMED|from=%u|to=%u",previous,e->slot);
+                queue_notice(had_dirty?"NANOCORE CHANGED - LOCAL EDIT LOST":"NANOCORE PRESET CHANGED");
+            } else {
+                ESP_LOGI(TAG,"SLOT|UNCHANGED|slot=%u",e->slot);
+            }
+        }
         if (s_scene_phase != SCENE_IDLE &&
             (e->live_seq != s_scene_seq || e->slot != s_runtime.current_preset))
             break;
@@ -2987,6 +3141,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             break;
         }
 
+        s_level_raw_known=true;
+        s_level_raw=e->live_header_byte;
         if (e->synth_mode_known) {
             bool changed = s_synth_mode != e->synth_mode;
             if (changed && !was_recall && s_scene_phase == SCENE_IDLE && s_synth_mode_known) {
@@ -3003,6 +3159,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             memcpy(s_synth_params, e->synth_params, sizeof(s_synth_params));
             if (changed) {
                 s_synth_selected = s_synth_mode;
+                s_levels_selected=false;
                 s_selected_block = BLOCK_FX1;
                 s_selected_parameter = 0;
                 s_parameter_editing = false;
@@ -3141,34 +3298,8 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
     }
 
     case NC_PROTO_EVENT_ACTIVE_SLOT:
-        if (scene_busy()) break;
-        /*
-         * Current NanoCore firmware is known to emit unreliable 0x01 values
-         * around Program Change (including values outside 0..63). During a
-         * controller-originated recall, 0x63 is the only slot authority.
-         */
-        if (s_recall_pending) {
-            ESP_LOGI(TAG,
-                     "Slot push %u ignored during recall target=%u",
-                     e->slot, s_recall_target);
-            break;
-        }
-
-        if (e->slot < CTRL_PRESET_COUNT &&
-            e->slot != s_runtime.current_preset) {
-            bool had_dirty = s_dirty;
-            ESP_LOGI(TAG, "Physical NanoCore preset -> %u", e->slot);
-            (void)load_preset(e->slot, false);
-            clear_block_state();
-
-            // The push is a candidate; use the exact same 0x63 confirmation
-            // path before accepting live state/name.
-            schedule_recall_sync(e->slot);
-
-            show_notice(had_dirty
-                ? "NANOCORE CHANGED - LOCAL EDIT LOST"
-                : "NANOCORE PRESET CHANGED");
-        }
+        if(!scene_busy() && !s_recall_pending && !s_recall_poll_inflight)
+            slot_probe_request(false);
         break;
 
     case NC_PROTO_EVENT_PRESET_NAME:
@@ -3319,7 +3450,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 09.2 / CONFIRMED DISCARD + MODE ROUNDTRIP");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10A / VERIFIED SLOT + GLOBAL INPUT");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -3407,6 +3538,7 @@ void app_main(void)
         }
 
         service_recall_sync();
+        service_slot_probe();
         if(s_discard_action!=DISCARD_NONE && !s_midi_ready) {
             discard_cancel();
             render_ui();

@@ -40,6 +40,9 @@
 #define OP_CAB_STORAGE_INFO    0x50
 #define OP_CAB_CATALOG         0x56
 #define OP_LIVE_STATE          0x63
+#define OP_GLOBAL_READ         0x65
+#define OP_GLOBAL_SET          0x66
+#define OP_GLOBAL_PUSH         0x07
 #define OP_PING                0x68
 #define OP_SET_FIELD           0x6D
 #define FIELD_AMP_MODEL        0x06
@@ -62,6 +65,7 @@
 #define SAVE_RETRIES            3
 
 static const char *TAG = "NC_PROTO";
+static bool s_level_diagnostics;
 
 static QueueHandle_t s_events;
 static SemaphoreHandle_t s_save_ack;
@@ -617,6 +621,8 @@ static void parse_live_payload(const uint8_t *p, size_t len, uint16_t seq)
         scratch_event(NC_PROTO_EVENT_LIVE_STATE);
     e->slot = p[1];
     e->live_seq = seq;
+    e->live_header_byte = p[2];
+    if (s_level_diagnostics) ESP_LOGI(TAG,"LEVEL|LIVE_HEADER|seq=%u|slot=%u|raw=%u",seq,p[1],p[2]);
 
     size_t pos = 3;
 
@@ -1083,33 +1089,71 @@ static void handle_segmented_reply(const uint8_t *msg, size_t len)
     }
 }
 
+/* 0x65/66: separate short reply path, never disturb 0x63 reassembly.
+ * Documented USB response logical payload: 01 wireless loopback
+ * signed7 input dB USB-volume BT-volume MIDI-channel. BLE single final
+ * segment adds total/offset. Reject unrecognized layouts. */
+static void emit_global(uint16_t seq,bool push,uint8_t gain,uint8_t usb,uint8_t bt)
+{
+    if(gain>127 || usb>100 || bt>100) return;
+    nanocore_protocol_event_t *e=scratch_event(NC_PROTO_EVENT_GLOBAL_LEVELS);
+    e->global_seq=seq;
+    e->global_push=push;
+    e->input_gain_db=(int8_t)(gain>=64 ? (int)gain-128 : gain);
+    e->usb_volume=usb;
+    e->bt_volume=bt;
+    queue_event(e);
+    ESP_LOGI(TAG,"LEVEL|GLOBAL|seq=%u|push=%u|input_db=%d|usb=%u|bt=%u",
+             seq,push,(int)e->input_gain_db,usb,bt);
+}
+
+static void parse_global_reply(const uint8_t *msg,size_t len)
+{
+    uint8_t raw[96]={0};
+    size_t n=unpack7(&msg[5],len-6,raw,sizeof(raw));
+    if(n<8 || raw[0]!=2) return;
+    uint16_t seq=(uint16_t)(raw[1]|((uint16_t)raw[2]<<8));
+    size_t count=(size_t)(raw[6]|((uint16_t)raw[7]<<8));
+    if(n!=8+count) return;
+    const uint8_t *body=&raw[8];
+    if(s_level_diagnostics) {
+        ESP_LOGI(TAG,"LEVEL|GLOBAL_RAW|op=0x%02X|status=%u|body=%u",msg[9],raw[5],(unsigned)count);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG,raw,n,ESP_LOG_INFO);
+    }
+    if(raw[5]==SEG_LAST) {
+        if(count!=11 || body[0]!=7 || body[1]!=0 || body[2]!=0 || body[3]!=0) return;
+        body+=4;
+        count-=4;
+    } else if(raw[5]!=0) return;
+    if(count!=7 || body[0]!=1 || body[1]>1 || body[2]>1 || body[6]>16) return;
+    emit_global(seq,false,body[3],body[4],body[5]);
+}
+
+void nanocore_protocol_set_level_diagnostics(bool enabled)
+{
+    s_level_diagnostics=enabled;
+}
+
 static void parse_push(const uint8_t *msg, size_t len)
 {
     if (len < 13) return;
 
     const uint8_t opcode = msg[9];
 
-    if (opcode == OP_ACTIVE_SLOT && len > 11) {
-        uint8_t raw_slot = msg[11] & 0x7F;
-
-        /*
-         * Firmware revisions observed in the field can emit opcode 0x01
-         * around Program Change with values such as 0x53/0x54/0x64 that
-         * are NOT preset slots. Never surface values outside the real
-         * 0..63 preset range as slot-change events.
-         */
-        if (raw_slot >= CTRL_PRESET_COUNT) {
-            ESP_LOGW(TAG,
-                     "Untrusted slot push raw=0x%02X (%u) ignored",
-                     raw_slot, raw_slot);
-            return;
-        }
-
-        nanocore_protocol_event_t *e =
-            scratch_event(NC_PROTO_EVENT_ACTIVE_SLOT);
-        e->slot = raw_slot;
+    if(s_level_diagnostics) {
+        ESP_LOGI(TAG,"LEVEL|PUSH|op=0x%02X|len=%u",opcode,(unsigned)len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG,msg,len>48?48:len,ESP_LOG_INFO);
+    }
+    if (opcode == OP_GLOBAL_PUSH && len == 20 && msg[11] == 1) {
+        emit_global(0,true,msg[15],msg[16],msg[17]);
+    } else if (opcode == OP_ACTIVE_SLOT && len == 13) {
+        /* 0x01 is ambiguous: volume/other controls can share this shape.
+         * Never interpret its value as an authoritative slot. */
+        uint8_t raw_slot=msg[11]&0x7f;
+        nanocore_protocol_event_t *e=scratch_event(NC_PROTO_EVENT_ACTIVE_SLOT);
+        e->slot=raw_slot;
         queue_event(e);
-        ESP_LOGI(TAG, "Active slot push -> %u", e->slot);
+        ESP_LOGI(TAG,"SLOT|HINT|raw=%u",raw_slot);
     } else if (opcode == OP_BLOCK_STATE && len > 12) {
         uint8_t block_id = msg[11];
         if (block_id < BLOCK_COUNT) {
@@ -1212,6 +1256,28 @@ esp_err_t nanocore_protocol_request_live_state(void)
 {
     uint16_t seq;
     return nanocore_protocol_request_live_state_seq(&seq);
+}
+
+esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out)
+{
+    if(!seq_out || !s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    uint8_t seq=next_seq();
+    uint8_t msg[]={0xF0,NC_MFR,NC_TAG_N,NC_TAG_C,NC_DIR_HOST,
+        0,2,seq,0,OP_GLOBAL_READ,0,0,0,0xF7};
+    *seq_out=seq;
+    return nanocore_midi_send_sysex(msg,sizeof(msg));
+}
+
+esp_err_t nanocore_protocol_set_input_gain(int8_t db,uint16_t *seq_out)
+{
+    if(!seq_out || !s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    if(db < -20 || db > 20) return ESP_ERR_INVALID_ARG;
+    uint8_t seq=next_seq();
+    uint8_t msg[]={0xF0,NC_MFR,NC_TAG_N,NC_TAG_C,NC_DIR_HOST,
+        0,2,seq,0,OP_GLOBAL_SET,0,2,0,0,4,(uint8_t)(db<0?db+128:db),0xF7};
+    *seq_out=seq;
+    ESP_LOGI(TAG,"LEVEL|INPUT_TX|db=%d|seq=%u",(int)db,seq);
+    return nanocore_midi_send_sysex(msg,sizeof(msg));
 }
 
 esp_err_t nanocore_protocol_set_synth_mode(bool enabled)
@@ -1457,6 +1523,10 @@ void nanocore_protocol_on_sysex(const uint8_t *msg, size_t len)
     // also prevents a one-segment 0x68 reply from disturbing a larger 0x63
     // or 0x41 BLE reassembly in progress.
     if (msg[9] == OP_PING) return;
+    if (msg[9] == OP_GLOBAL_READ || msg[9] == OP_GLOBAL_SET) {
+        parse_global_reply(msg,len);
+        return;
+    }
 
     /* re-nanocore docs/protocol.txt identifies 0x30/0x50 as summary
      * reads, not proven bulk name pages. Keep them outside live reassembly.

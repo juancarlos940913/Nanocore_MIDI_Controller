@@ -28,12 +28,18 @@ typedef enum {
     NC_PROTO_EVENT_MODEL_CATALOG,
     NC_PROTO_EVENT_SYNTH_CAPTURE,
     NC_PROTO_EVENT_SYNTH_PARAM_VALUE,
+    NC_PROTO_EVENT_GLOBAL_LEVELS,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
     nanocore_protocol_event_type_t type;
     uint8_t slot;
     uint16_t live_seq; /* matched 0x63 reply sequence */
+    uint8_t live_header_byte; /* raw, not a verified volume */
+    int8_t input_gain_db;
+    uint8_t usb_volume, bt_volume;
+    uint16_t global_seq;
+    bool global_push;
     controller_block_t block;
     bool on;
 
@@ -92,6 +98,9 @@ void nanocore_protocol_set_connected(bool connected);
 
 /* Known-safe ToneCommand protocol operations captured from real hardware. */
 esp_err_t nanocore_protocol_request_live_state(void);
+esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out);
+esp_err_t nanocore_protocol_set_input_gain(int8_t db, uint16_t *seq_out);
+void nanocore_protocol_set_level_diagnostics(bool enabled);
 esp_err_t nanocore_protocol_request_live_state_seq(uint16_t *seq_out);
 esp_err_t nanocore_protocol_set_synth_mode(bool enabled);
 esp_err_t nanocore_protocol_set_synth_voice(uint8_t voice, const float *params, uint8_t count);
