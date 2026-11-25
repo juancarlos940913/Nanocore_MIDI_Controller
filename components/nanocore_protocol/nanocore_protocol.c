@@ -622,7 +622,11 @@ static void parse_live_payload(const uint8_t *p, size_t len, uint16_t seq)
     e->slot = p[1];
     e->live_seq = seq;
     e->live_header_byte = p[2];
-    if (s_level_diagnostics) ESP_LOGI(TAG,"LEVEL|LIVE_HEADER|seq=%u|slot=%u|raw=%u",seq,p[1],p[2]);
+    if (s_level_diagnostics) {
+        ESP_LOGI(TAG,"LEVEL|LIVE_HEADER|seq=%u|slot=%u|raw=%u",seq,p[1],p[2]);
+        ESP_LOGI(TAG,"LEVEL|LIVE_FULL|seq=%u|len=%u",seq,(unsigned)len);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG,p,len,ESP_LOG_INFO);
+    }
 
     size_t pos = 3;
 
@@ -1095,11 +1099,17 @@ static void handle_segmented_reply(const uint8_t *msg, size_t len)
  * segment adds total/offset. Reject unrecognized layouts. */
 static void emit_global(uint16_t seq,bool push,uint8_t gain,uint8_t usb,uint8_t bt)
 {
-    if(gain>127 || usb>100 || bt>100) return;
+    /* Both reply and push must be fully unpacked before signed decoding.
+     * FW1.2 panel trace: packed 02 01 7f -> raw 01 ff (-1 dB). */
+    int db=(gain&0x80)?(int)gain-256:(int)gain;
+    if(db < -20 || db > 20 || usb>100 || bt>100) {
+        ESP_LOGW(TAG,"LEVEL|GLOBAL_INVALID|gain_raw=0x%02X",gain);
+        return;
+    }
     nanocore_protocol_event_t *e=scratch_event(NC_PROTO_EVENT_GLOBAL_LEVELS);
     e->global_seq=seq;
     e->global_push=push;
-    e->input_gain_db=(int8_t)(gain>=64 ? (int)gain-128 : gain);
+    e->input_gain_db=(int8_t)db;
     e->usb_volume=usb;
     e->bt_volume=bt;
     queue_event(e);
@@ -1145,7 +1155,11 @@ static void parse_push(const uint8_t *msg, size_t len)
         ESP_LOG_BUFFER_HEX_LEVEL(TAG,msg,len>48?48:len,ESP_LOG_INFO);
     }
     if (opcode == OP_GLOBAL_PUSH && len == 20 && msg[11] == 1) {
-        emit_global(0,true,msg[15],msg[16],msg[17]);
+        uint8_t raw[12]={0};
+        size_t n=unpack7(&msg[5],len-6,raw,sizeof(raw));
+        if(n==sizeof(raw) && raw[0]==2 && raw[3]==OP_GLOBAL_PUSH &&
+           raw[5]==1 && raw[6]<=1 && raw[7]<=1 && raw[11]<=16)
+            emit_global(0,true,raw[8],raw[9],raw[10]);
     } else if (opcode == OP_ACTIVE_SLOT && len == 13) {
         /* 0x01 is ambiguous: volume/other controls can share this shape.
          * Never interpret its value as an authoritative slot. */
@@ -1271,14 +1285,19 @@ esp_err_t nanocore_protocol_request_global_levels(uint16_t *seq_out)
 esp_err_t nanocore_protocol_set_input_gain(int8_t db,uint16_t *seq_out)
 {
     if(!seq_out || !s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
-    /* FW1.2 physical trace: requested signed7 -1 (127) became +20 dB.
-     * Only the nonnegative range has been verified. Never encode negative. */
-    if(db < 0 || db > 20) return ESP_ERR_INVALID_ARG;
+    if(db < -20 || db > 20) return ESP_ERR_INVALID_ARG;
+    /* Signed int8 converted to uint8 preserves the actual high bit.
+     * Reuse the same pack7 as the verified effect parameter writer. */
+    const uint8_t logical[]={0x04,(uint8_t)db};
+    uint8_t packed[3]={0};
+    if(pack7(logical,sizeof(logical),packed,sizeof(packed))!=sizeof(packed))
+        return ESP_FAIL;
     uint8_t seq=next_seq();
     uint8_t msg[]={0xF0,NC_MFR,NC_TAG_N,NC_TAG_C,NC_DIR_HOST,
-        0,2,seq,0,OP_GLOBAL_SET,0,2,0,0,4,(uint8_t)db,0xF7};
+        0,2,seq,0,OP_GLOBAL_SET,0,2,0,packed[0],packed[1],packed[2],0xF7};
     *seq_out=seq;
-    ESP_LOGI(TAG,"LEVEL|INPUT_TX|db=%d|seq=%u",(int)db,seq);
+    ESP_LOGI(TAG,"LEVEL|INPUT_TX|db=%d|seq=%u|packed=%02X %02X %02X",
+             (int)db,seq,packed[0],packed[1],packed[2]);
     return nanocore_midi_send_sysex(msg,sizeof(msg));
 }
 

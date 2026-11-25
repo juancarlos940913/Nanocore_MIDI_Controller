@@ -2724,11 +2724,7 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known && s_levels_write_ready &&
                 !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
             int next=(int)s_input_gain_db+(delta>0?1:-1);
-            if(s_input_gain_db<0 || s_input_gain_db>20 || next<0) {
-                show_notice("NEGATIVE GAIN NOT VERIFIED");
-                return;
-            }
-            if(next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
+            if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
                 s_levels_wait=true;
                 s_levels_write_pending=true;
                 s_levels_target_db=(int8_t)next;
@@ -3477,7 +3473,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10B / PRESET VOLUME READ + INPUT GUARD");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10C / SIGNED INPUT PACKING + MASTER CAPTURE");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 

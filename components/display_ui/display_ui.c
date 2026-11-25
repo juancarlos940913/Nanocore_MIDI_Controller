@@ -363,7 +363,7 @@ static void levels_screen(const display_ui_state_t *s)
     if(s->levels_known) snprintf(buf,sizeof(buf),"%d dB",(int)s->input_gain_db);
     else snprintf(buf,sizeof(buf),"UNKNOWN");
     text(300,119,buf,s->levels_known?C_GREEN:C_YELLOW,2);
-    text(30,145,s->levels_wait?"WAIT READBACK":s->levels_edit?"ENC2: 0 TO +20 dB (1 dB STEPS)":"ENC1 EDIT / READ (0 TO +20 dB)",C_MUTED,1);
+    text(30,145,s->levels_wait?"WAIT READBACK":s->levels_edit?"ENC2: -20 TO +20 dB (1 dB STEPS)":"ENC1 EDIT / READ (-20 TO +20 dB)",C_MUTED,1);
     fill_rect(18,173,444,70,s->levels_row==1?C_PANEL2:C_PANEL);
     rect(18,173,444,70,s->levels_row==1?C_CYAN:C_MUTED,2);
     text(30,185,"PRESET VOLUME",C_WHITE,2);
