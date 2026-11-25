@@ -14,6 +14,7 @@
 
 #include "nanocore_protocol.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -75,6 +76,7 @@ static nanocore_protocol_event_t s_event_scratch;
 static volatile bool s_connected;
 static uint8_t s_seq;
 static portMUX_TYPE s_seq_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t s_synth_capture_seq;
 static volatile uint8_t s_wait_save_slot = 0xFF;
 
 typedef struct {
@@ -685,11 +687,100 @@ static void parse_live_payload(const uint8_t *p, size_t len)
              e->synth_param_count);
 }
 
-static void dispatch_complete_reply(uint16_t opcode,
+/* Candidate inspection only: never updates normal block state or guesses
+ * that Synth is enabled. Preserve the whole payload even if this walk fails. */
+static void log_synth_capture(uint16_t seq, const uint8_t *p, size_t len)
+{
+    ESP_LOGI(TAG, "SYNMAP|BEGIN|seq=%u|len=%u|slot=%u",
+             seq, (unsigned)len, len > 1 ? p[1] : 255);
+    for (size_t off = 0; off < len; off += 16) {
+        char line[16 * 3 + 1] = {0};
+        size_t n = len - off < 16 ? len - off : 16;
+        for (size_t i = 0; i < n; ++i) {
+            snprintf(&line[i * 3], sizeof(line) - i * 3,
+                     "%02X ", p[off + i]);
+        }
+        ESP_LOGI(TAG, "SYNMAP|HEX|%04u|%s", (unsigned)off, line);
+    }
+
+    static const char *const names[] = {
+        "FX1", "FX2", "AMP", "CAB", "DELAY", "MOD", "REV", "EQ"
+    };
+    size_t pos = 3;
+    bool complete = len >= 3 && p[0] == 0x03;
+    for (unsigned b = 0; complete && b < 8; ++b) {
+        if (pos + 3 > len || p[pos + 2] > NC_PROTO_MAX_PARAMS ||
+            pos + 3 + 4u * p[pos + 2] > len) {
+            complete = false;
+            break;
+        }
+        uint8_t count = p[pos + 2];
+        ESP_LOGI(TAG, "SYNMAP|BLOCK|%s|off=%u|on=%u|raw=%u|count=%u",
+                 names[b], (unsigned)pos, p[pos], p[pos + 1], count);
+        pos += 3;
+        for (uint8_t i = 0; i < count; ++i, pos += 4) {
+            ESP_LOGI(TAG, "SYNMAP|PARAM|%s|p%u=%.6f",
+                     names[b], i, (double)read_float32_le(&p[pos]));
+        }
+    }
+
+    if (complete) {
+        ESP_LOGI(TAG, "SYNMAP|TAIL|off=%u|remaining=%u",
+                 (unsigned)pos, (unsigned)(len - pos));
+        /* External captures suggest a header 15 bytes after EQ. Only log
+         * the candidate if the preceding 8-id chain footer is a permutation
+         * and the voice/count pair is plausible. This is not a mode flag. */
+        bool chain = pos + 9 <= len && p[pos] == 8;
+        unsigned seen = 0;
+        if (chain) {
+            for (size_t i = 1; i <= 8; ++i) {
+                uint8_t id = p[pos + i];
+                if (id >= 8 || (seen & (1u << id))) {
+                    chain = false;
+                    break;
+                }
+                seen |= 1u << id;
+            }
+        }
+        size_t at = pos + 15;
+        static const uint8_t counts[10] = {6,5,3,5,5,5,5,3,5,3};
+        if (chain && at + 3 <= len && p[at] <= 1 &&
+            p[at + 1] < 10 && p[at + 2] == counts[p[at + 1]] &&
+            at + 3 + 4u * p[at + 2] <= len) {
+            uint8_t count = p[at + 2];
+            ESP_LOGI(TAG, "SYNMAP|CANDIDATE|off=%u|on=%u|voice=%u|count=%u",
+                     (unsigned)at, p[at], p[at + 1], count);
+            for (uint8_t i = 0; i < count; ++i) {
+                ESP_LOGI(TAG, "SYNMAP|VOICE_PARAM|p%u=%.6f", i,
+                         (double)read_float32_le(&p[at + 3 + 4u * i]));
+            }
+        } else {
+            ESP_LOGI(TAG, "SYNMAP|CANDIDATE|not_matched");
+        }
+    } else {
+        ESP_LOGW(TAG, "SYNMAP|BLOCK_WALK_INCOMPLETE|off=%u", (unsigned)pos);
+    }
+    ESP_LOGI(TAG, "SYNMAP|END|seq=%u", seq);
+
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_SYNTH_CAPTURE);
+    e->catalog_seq = seq;
+    queue_event(e);
+}
+
+static void dispatch_complete_reply(uint16_t opcode, uint16_t seq,
                                     const uint8_t *payload,
                                     size_t len)
 {
     if (opcode == OP_LIVE_STATE) {
+        portENTER_CRITICAL(&s_seq_lock);
+        bool capture = s_synth_capture_seq != 0 && s_synth_capture_seq == seq;
+        if (capture) s_synth_capture_seq = 0;
+        portEXIT_CRITICAL(&s_seq_lock);
+        if (capture) {
+            log_synth_capture(seq, payload, len);
+            return;
+        }
         parse_live_payload(payload, len);
     } else if (opcode == OP_READ_PRESET) {
         /*
@@ -896,7 +987,7 @@ static void handle_segmented_reply(const uint8_t *msg, size_t len)
         if (s_reassembly.received == s_reassembly.total) {
             ESP_LOGI(TAG, "SysEx reply reassembled op=0x%02X bytes=%u",
                      opcode, s_reassembly.total);
-            dispatch_complete_reply(opcode,
+            dispatch_complete_reply(opcode, seq,
                                     s_reassembly.data,
                                     s_reassembly.total);
         } else {
@@ -1004,6 +1095,9 @@ esp_err_t nanocore_protocol_init(void)
 void nanocore_protocol_set_connected(bool connected)
 {
     s_connected = connected;
+    portENTER_CRITICAL(&s_seq_lock);
+    s_synth_capture_seq = 0;
+    portEXIT_CRITICAL(&s_seq_lock);
     memset(&s_reassembly, 0, sizeof(s_reassembly));
     memset(&s_catalog_reply, 0, sizeof(s_catalog_reply));
 
@@ -1016,6 +1110,29 @@ esp_err_t nanocore_protocol_request_live_state(void)
 {
     if (!s_connected) return ESP_ERR_INVALID_STATE;
     return send_short_command(OP_LIVE_STATE);
+}
+
+esp_err_t nanocore_protocol_request_synth_capture(uint16_t *seq_out)
+{
+    if (!seq_out) return ESP_ERR_INVALID_ARG;
+    if (!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+
+    uint8_t seq = next_seq();
+    uint8_t msg[] = {
+        0xF0, NC_MFR, NC_TAG_N, NC_TAG_C, NC_DIR_HOST,
+        0x00, 0x02, seq, 0x00, OP_LIVE_STATE, 0x00, 0x00, 0x00, 0xF7
+    };
+    portENTER_CRITICAL(&s_seq_lock);
+    s_synth_capture_seq = seq;
+    portEXIT_CRITICAL(&s_seq_lock);
+    *seq_out = seq;
+    esp_err_t rc = nanocore_midi_send_sysex(msg, sizeof(msg));
+    if (rc != ESP_OK) {
+        portENTER_CRITICAL(&s_seq_lock);
+        if (s_synth_capture_seq == seq) s_synth_capture_seq = 0;
+        portEXIT_CRITICAL(&s_seq_lock);
+    }
+    return rc;
 }
 
 esp_err_t nanocore_protocol_request_preset_name(uint8_t slot)

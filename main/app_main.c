@@ -70,6 +70,7 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CATALOG_AMP_INFO_GAP_MS 3000
 #define CATALOG_MAX_FAILURES      3
 #define CATALOG_TOTAL          (2 * NC_PROTO_MODEL_COUNT)
+#define SYNMAP_TIMEOUT_MS 3000
 
 static bool s_target_found;
 static bool s_ble_connected;
@@ -100,6 +101,10 @@ static char s_catalog_names[2][NC_PROTO_MODEL_COUNT][NC_PROTO_MODEL_NAME_LEN + 1
 /* 0 = unknown/unread, 1 = real name, 2 = empty slot. */
 static uint8_t s_catalog_state[2][NC_PROTO_MODEL_COUNT];
 static bool s_catalog_inflight;
+static bool s_synmap_enabled;
+static bool s_synmap_inflight;
+static uint16_t s_synmap_seq;
+static int64_t s_synmap_sent_us;
 static bool s_catalog_amp_info_sent;
 static uint16_t s_catalog_seq;
 static uint8_t s_catalog_cursor;
@@ -483,7 +488,7 @@ static void catalog_failed(void)
 static void service_model_catalog(void)
 {
     if (!s_midi_ready || !catalog_link_current() ||
-        s_catalog_cursor >= CATALOG_TOTAL) return;
+        s_synmap_enabled || s_catalog_cursor >= CATALOG_TOTAL) return;
     int64_t now = esp_timer_get_time();
 
     if (s_catalog_inflight) {
@@ -1737,7 +1742,7 @@ static void handle_name_editor_event(input_event_t e)
 
 static void handle_encoder_delta(uint8_t encoder, int delta)
 {
-    if (delta == 0) return;
+    if (delta == 0 || s_synmap_enabled) return;
 
     if (s_screen == UI_SCREEN_NAME_EDITOR) {
         if (encoder == 1) {
@@ -1770,8 +1775,52 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
     }
 }
 
+/* Stage 08A discovery uses the existing TOP+TOP / ENC2 gesture, but
+ * captures the full live payload rather than targeting one legacy block.
+ * No controller writes are allowed while this temporary mode is active. */
 static void handle_input(input_event_t e)
 {
+    if (s_synmap_enabled) {
+        if (e == INPUT_CHORD_MAPPER) {
+            if (s_synmap_inflight) {
+                show_notice("CAPTURE IN PROGRESS");
+                return;
+            }
+            s_synmap_enabled = false;
+            ESP_LOGI(TAG, "SYNMAP|OFF");
+            show_notice("SYNTH MAP OFF");
+            if (s_midi_ready) {
+                (void)nanocore_protocol_request_live_state();
+            }
+        } else if (e == INPUT_ENC2_CLICK && !s_synmap_inflight) {
+            esp_err_t rc = nanocore_protocol_request_synth_capture(&s_synmap_seq);
+            if (rc == ESP_OK) {
+                s_synmap_inflight = true;
+                s_synmap_sent_us = esp_timer_get_time();
+                show_notice("SYNTH CAPTURE");
+            } else {
+                ESP_LOGW(TAG, "SYNMAP|TX_FAILED|%s", esp_err_to_name(rc));
+                show_notice("CAPTURE FAILED");
+            }
+        }
+        return;
+    }
+
+    if (e == INPUT_CHORD_MAPPER && s_screen == UI_SCREEN_PERFORMANCE &&
+        !s_tuner_on && !nanocore_mapper_is_enabled()) {
+        if (!s_midi_ready || s_recall_pending || s_recall_poll_inflight ||
+            s_catalog_inflight || s_catalog_cursor < CATALOG_TOTAL ||
+            s_runtime.mode == CTRL_MODE_SCENE || tempo_engine_tap_active()) {
+            show_notice("WAIT SYNC - PRESET MODE");
+            return;
+        }
+        s_synmap_enabled = true;
+        s_synmap_inflight = false;
+        ESP_LOGI(TAG, "SYNMAP|ON|ENC2 manual capture; controller writes locked");
+        show_notice("SYNTH MAP - ENC2 CAPTURE");
+        return;
+    }
+
     if (s_screen == UI_SCREEN_NAME_EDITOR) {
         handle_name_editor_event(e);
         return;
@@ -1913,6 +1962,18 @@ static void handle_input(input_event_t e)
 static void handle_protocol_event(const nanocore_protocol_event_t *e)
 {
     if (!e) return;
+
+    if (e->type == NC_PROTO_EVENT_SYNTH_CAPTURE) {
+        if (s_synmap_enabled && s_synmap_inflight &&
+            e->catalog_seq == s_synmap_seq) {
+            s_synmap_inflight = false;
+            show_notice("SYNTH CAPTURE OK");
+        }
+        return;
+    }
+    /* Physical changes during discovery are evidence, not local edits.
+     * In particular do not trigger Scene overlays, recall or NVS writes. */
+    if (s_synmap_enabled) return;
 
     if (e->type == NC_PROTO_EVENT_MODEL_CATALOG) {
         handle_catalog_event(e);
@@ -2177,7 +2238,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07.1B / AMP 31-BYTE CATALOG");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 08A / SYNTH READ-ONLY DISCOVERY");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -2212,6 +2273,17 @@ void app_main(void)
 
     while (1) {
         catalog_reset_if_needed();
+        if (s_synmap_enabled && !s_midi_ready) {
+            s_synmap_enabled = false;
+            s_synmap_inflight = false;
+            ESP_LOGW(TAG, "SYNMAP|ABORT|BLE disconnected");
+        }
+        if (s_synmap_enabled && s_synmap_inflight &&
+            esp_timer_get_time() - s_synmap_sent_us >= SYNMAP_TIMEOUT_MS * 1000LL) {
+            s_synmap_inflight = false;
+            ESP_LOGW(TAG, "SYNMAP|TIMEOUT|seq=%u", s_synmap_seq);
+            show_notice("CAPTURE TIMEOUT");
+        }
         /*
          * Rotation is coalesced: one fast physical turn may arrive as +20
          * detents, which updates the model once and renders once instead of

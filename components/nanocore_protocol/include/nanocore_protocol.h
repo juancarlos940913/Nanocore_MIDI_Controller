@@ -26,6 +26,7 @@ typedef enum {
     NC_PROTO_EVENT_PRESET_MODELS,
     NC_PROTO_EVENT_PARAM_VALUE,
     NC_PROTO_EVENT_MODEL_CATALOG,
+    NC_PROTO_EVENT_SYNTH_CAPTURE,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
@@ -84,6 +85,10 @@ void nanocore_protocol_set_connected(bool connected);
 
 /* Known-safe ToneCommand protocol operations captured from real hardware. */
 esp_err_t nanocore_protocol_request_live_state(void);
+
+/* Stage 08A: raw, read-only 0x63 capture, isolated from the normal editor.
+ * Completion is NC_PROTO_EVENT_SYNTH_CAPTURE with catalog_seq as request id. */
+esp_err_t nanocore_protocol_request_synth_capture(uint16_t *seq_out);
 esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
 
 /*

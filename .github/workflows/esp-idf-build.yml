@@ -8,6 +8,7 @@ on:
       - stage-05-hardware-v2
       - stage-06-live-mapper
       - stage-07-full-dynamic-editor
+      - stage-08-synth-mode
   workflow_dispatch:
 
 jobs:
