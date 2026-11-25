@@ -62,6 +62,32 @@ typedef struct {
     controller_scene_t scene[CTRL_SCENE_COUNT];
 } controller_preset_t;
 
+/* Stage 08E scene snapshots live in a separate NVS partition. Never change
+ * the layout of controller_scene_t/controller_preset_t (legacy NVS v2). */
+#define CTRL_PROFILE_VERSION 1
+#define CTRL_PROFILE_PARAMS 9
+#define CTRL_PROFILE_SYNTH_PARAMS 8
+
+typedef struct {
+    uint8_t on;
+    uint8_t type;
+    uint8_t count;
+    uint8_t reserved;
+    float params[CTRL_PROFILE_PARAMS];
+} controller_scene_block_t;
+
+typedef struct {
+    uint8_t version;
+    uint8_t synth_mode;
+    uint8_t synth_on;
+    uint8_t synth_voice;
+    uint8_t synth_count;
+    uint8_t reserved[3];
+    char name[CTRL_NAME_LEN];
+    controller_scene_block_t block[BLOCK_COUNT];
+    float synth_params[CTRL_PROFILE_SYNTH_PARAMS];
+} controller_scene_profile_t;
+
 typedef struct {
     uint8_t version;
     uint8_t current_preset;

@@ -24,6 +24,12 @@ esp_err_t controller_storage_save_preset(uint8_t index,
 void controller_storage_default_preset(uint8_t index,
                                        controller_preset_t *preset);
 
+/* Independent full scene records: missing key means legacy/no snapshot. */
+esp_err_t controller_storage_scene_load(uint8_t preset, uint8_t scene,
+                                        controller_scene_profile_t *profile);
+esp_err_t controller_storage_scene_save(uint8_t preset, uint8_t scene,
+                                        const controller_scene_profile_t *profile);
+
 bool controller_assignment_get(const midi_assignment_t *items,
                                size_t count,
                                uint8_t cc,

@@ -9,6 +9,9 @@
 
 #define STORAGE_NS       "nc_ctrl2"
 #define STORAGE_VERSION   2
+#define SCENE_PARTITION "scene_data"
+#define SCENE_NAMESPACE "nc_scene1"
+static bool s_scene_storage_ready;
 
 static const char *TAG = "NC_STORAGE";
 
@@ -48,6 +51,11 @@ esp_err_t controller_storage_init(void)
     if (rc != ESP_OK) return rc;
     nvs_close(h);
     ESP_LOGI(TAG, "NVS storage ready");
+    /* Do not erase this partition on init errors. Legacy storage remains
+     * usable even if a board still has the old partition table. */
+    rc = nvs_flash_init_partition(SCENE_PARTITION);
+    s_scene_storage_ready = rc == ESP_OK;
+    ESP_LOGI(TAG, "SCENE|STORAGE|%s", esp_err_to_name(rc));
     return ESP_OK;
 }
 
@@ -207,4 +215,49 @@ esp_err_t controller_assignment_set(midi_assignment_t *items,
     }
 
     return ESP_ERR_NO_MEM;
+}
+
+static void scene_key(uint8_t preset, uint8_t scene, char key[12])
+{
+    snprintf(key, 12, "p%02u_s%u", (unsigned)preset, (unsigned)scene);
+}
+
+esp_err_t controller_storage_scene_load(uint8_t preset, uint8_t scene,
+                                        controller_scene_profile_t *profile)
+{
+    if (!profile || preset >= CTRL_PRESET_COUNT || scene >= CTRL_SCENE_COUNT)
+        return ESP_ERR_INVALID_ARG;
+    if (!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    memset(profile, 0, sizeof(*profile));
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open_from_partition(SCENE_PARTITION, SCENE_NAMESPACE, NVS_READONLY, &h);
+    if (rc != ESP_OK) return rc;
+    char key[12];
+    scene_key(preset, scene, key);
+    size_t len = sizeof(*profile);
+    rc = nvs_get_blob(h, key, profile, &len);
+    nvs_close(h);
+    if (rc != ESP_OK) return rc;
+    if (len != sizeof(*profile) || profile->version != CTRL_PROFILE_VERSION ||
+        profile->synth_mode > 1 || profile->synth_on > 1)
+        return ESP_ERR_INVALID_SIZE;
+    profile->name[CTRL_NAME_LEN - 1] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t controller_storage_scene_save(uint8_t preset, uint8_t scene,
+                                        const controller_scene_profile_t *profile)
+{
+    if (!profile || preset >= CTRL_PRESET_COUNT || scene >= CTRL_SCENE_COUNT ||
+        profile->version != CTRL_PROFILE_VERSION) return ESP_ERR_INVALID_ARG;
+    if (!s_scene_storage_ready) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t h;
+    esp_err_t rc = nvs_open_from_partition(SCENE_PARTITION, SCENE_NAMESPACE, NVS_READWRITE, &h);
+    if (rc != ESP_OK) return rc;
+    char key[12];
+    scene_key(preset, scene, key);
+    rc = nvs_set_blob(h, key, profile, sizeof(*profile));
+    if (rc == ESP_OK) rc = nvs_commit(h);
+    nvs_close(h);
+    return rc;
 }

@@ -32,6 +32,7 @@ typedef enum {
 typedef struct {
     nanocore_protocol_event_type_t type;
     uint8_t slot;
+    uint16_t live_seq; /* matched 0x63 reply sequence */
     controller_block_t block;
     bool on;
 
@@ -88,6 +89,10 @@ void nanocore_protocol_set_connected(bool connected);
 
 /* Known-safe ToneCommand protocol operations captured from real hardware. */
 esp_err_t nanocore_protocol_request_live_state(void);
+esp_err_t nanocore_protocol_request_live_state_seq(uint16_t *seq_out);
+esp_err_t nanocore_protocol_set_synth_mode(bool enabled);
+esp_err_t nanocore_protocol_set_synth_voice(uint8_t voice, const float *params, uint8_t count);
+esp_err_t nanocore_protocol_set_synth_param(uint8_t index, float normalized);
 
 /* Stage 08A: raw, read-only 0x63 capture, isolated from the normal editor.
  * Completion is NC_PROTO_EVENT_SYNTH_CAPTURE with catalog_seq as request id. */

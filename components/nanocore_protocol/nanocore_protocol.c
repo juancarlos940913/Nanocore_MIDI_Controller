@@ -44,6 +44,8 @@
 #define FIELD_AMP_MODEL        0x06
 #define FIELD_CAB_MODEL        0x07
 #define FIELD_PRESET_NAME      0x08
+#define FIELD_SYNTH_MODE       0x0A
+#define WIRE_SYNTH_BLOCK       10
 
 #define SEG_MORE               0x10
 #define SEG_LAST               0x11
@@ -221,12 +223,12 @@ static esp_err_t send_scalar_field(uint8_t field_id, uint8_t value)
     return nanocore_midi_send_sysex(msg, sizeof(msg));
 }
 
-static esp_err_t send_block_type(controller_block_t block,
+static esp_err_t send_block_type(uint8_t block,
                                  uint8_t type_id,
                                  const float *defaults,
                                  uint8_t count)
 {
-    if (block >= BLOCK_COUNT ||
+    if ((block >= BLOCK_COUNT && block != WIRE_SYNTH_BLOCK) ||
         count > NC_PROTO_MAX_PARAMS ||
         (count > 0 && !defaults)) {
         return ESP_ERR_INVALID_ARG;
@@ -278,11 +280,11 @@ static esp_err_t send_block_type(controller_block_t block,
     return nanocore_midi_send_sysex(msg, pos);
 }
 
-static esp_err_t send_block_param(controller_block_t block,
+static esp_err_t send_block_param(uint8_t block,
                                   uint8_t param_index,
                                   float normalized)
 {
-    if (block >= BLOCK_COUNT || param_index >= NC_PROTO_MAX_PARAMS) {
+    if ((block >= BLOCK_COUNT && block != WIRE_SYNTH_BLOCK) || param_index >= NC_PROTO_MAX_PARAMS) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -594,7 +596,7 @@ static bool decode_synth_tail(nanocore_protocol_event_t *e,
     return true;
 }
 
-static void parse_live_payload(const uint8_t *p, size_t len)
+static void parse_live_payload(const uint8_t *p, size_t len, uint16_t seq)
 {
     if (!p || len < 6 || p[0] != 0x03) {
         ESP_LOGW(TAG, "0x63 live payload too short/unexpected (%u)",
@@ -605,6 +607,7 @@ static void parse_live_payload(const uint8_t *p, size_t len)
     nanocore_protocol_event_t *e =
         scratch_event(NC_PROTO_EVENT_LIVE_STATE);
     e->slot = p[1];
+    e->live_seq = seq;
 
     size_t pos = 3;
 
@@ -854,7 +857,7 @@ static void dispatch_complete_reply(uint16_t opcode, uint16_t seq,
             queue_synth_capture(seq, payload, len);
             return;
         }
-        parse_live_payload(payload, len);
+        parse_live_payload(payload, len, seq);
     } else if (opcode == OP_READ_PRESET) {
         /*
          * 0x41 replies echo slot + offset at payload[0..2].
@@ -1182,10 +1185,52 @@ void nanocore_protocol_set_connected(bool connected)
     }
 }
 
+esp_err_t nanocore_protocol_request_live_state_seq(uint16_t *seq_out)
+{
+    if (!s_connected || !nanocore_midi_is_ready() || !seq_out)
+        return ESP_ERR_INVALID_STATE;
+    uint8_t seq = next_seq();
+    uint8_t msg[] = {
+        0xF0, NC_MFR, NC_TAG_N, NC_TAG_C, NC_DIR_HOST,
+        0x00, 0x02, seq, 0x00, OP_LIVE_STATE, 0x00, 0x00, 0x00, 0xF7
+    };
+    *seq_out = seq;
+    return nanocore_midi_send_sysex(msg, sizeof(msg));
+}
+
 esp_err_t nanocore_protocol_request_live_state(void)
 {
-    if (!s_connected) return ESP_ERR_INVALID_STATE;
-    return send_short_command(OP_LIVE_STATE);
+    uint16_t seq;
+    return nanocore_protocol_request_live_state_seq(&seq);
+}
+
+esp_err_t nanocore_protocol_set_synth_mode(bool enabled)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    ESP_LOGI(TAG, "SYNTH|MODE_TX|value=%u", enabled);
+    return send_scalar_field(FIELD_SYNTH_MODE, enabled ? 1 : 0);
+}
+
+esp_err_t nanocore_protocol_set_synth_voice(uint8_t voice, const float *params, uint8_t count)
+{
+    static const uint8_t counts[] = {6,5,3,5,5,5,5,3,5,3};
+    if (!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (voice >= sizeof(counts) || count != counts[voice] || !params)
+        return ESP_ERR_INVALID_ARG;
+    for (uint8_t i = 0; i < count; ++i)
+        if (!(params[i] >= 0.0f && params[i] <= 1.0f)) return ESP_ERR_INVALID_ARG;
+    esp_err_t rc = send_type_prime();
+    if (rc != ESP_OK) return rc;
+    vTaskDelay(1);
+    return send_block_type(WIRE_SYNTH_BLOCK, voice, params, count);
+}
+
+esp_err_t nanocore_protocol_set_synth_param(uint8_t index, float normalized)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (index >= NC_PROTO_SYNTH_MAX_PARAMS || !(normalized >= 0.0f && normalized <= 1.0f))
+        return ESP_ERR_INVALID_ARG;
+    return send_block_param(WIRE_SYNTH_BLOCK, index, normalized);
 }
 
 esp_err_t nanocore_protocol_request_synth_capture(uint16_t *seq_out)
