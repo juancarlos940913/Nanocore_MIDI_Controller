@@ -1,5 +1,5 @@
 /*
- * Nanocore MIDI Controller - Stage 07 / Full Dynamic Editor
+ * Nanocore MIDI Controller - Stage 07.1 / Dynamic AMP/CAB Catalog
  *
  * ESP32-S3 N16R8 + ST7796S 3.5" + 2 encoders + 5 footswitches + 2 LEDs.
  *
@@ -60,6 +60,15 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define RECALL_TIMEOUT_MS      3500
 #define NOTICE_MS              1800
 
+/* Stage 07.1: one bounded background catalog sweep per BLE connection. */
+#define CATALOG_START_MS       2000
+#define CATALOG_IDLE_MS         950
+#define CATALOG_EVENT_GAP_MS    300
+#define CATALOG_GAP_MS          150
+#define CATALOG_TIMEOUT_MS      900
+#define CATALOG_MAX_FAILURES      3
+#define CATALOG_TOTAL          (2 * NC_PROTO_MODEL_COUNT)
+
 static bool s_target_found;
 static bool s_ble_connected;
 static bool s_midi_ready;
@@ -78,6 +87,26 @@ static bool s_cab_model_known;
 static uint8_t s_amp_model;
 static uint8_t s_cab_model;
 static bool s_editor_models_after_live;
+
+/* Only app_main advances the sweep. The BLE task publishes link epochs
+ * and can render the UI, so protect the tiny cache/epoch copies. */
+static portMUX_TYPE s_catalog_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_catalog_link_epoch;
+static uint32_t s_catalog_cache_epoch;
+static bool s_catalog_link_active;
+static char s_catalog_names[2][NC_PROTO_MODEL_COUNT][NC_PROTO_MODEL_NAME_LEN + 1];
+/* 0 = unknown/unread, 1 = real name, 2 = empty slot. */
+static uint8_t s_catalog_state[2][NC_PROTO_MODEL_COUNT];
+static bool s_catalog_inflight;
+static uint16_t s_catalog_seq;
+static uint8_t s_catalog_cursor;
+static uint8_t s_catalog_retry;
+static uint8_t s_catalog_failures;
+static uint8_t s_catalog_read_count;
+static uint8_t s_catalog_empty_count;
+static int64_t s_catalog_sent_us;
+static int64_t s_catalog_next_us;
+static int64_t s_catalog_quiet_until_us;
 
 static char s_notice[64];
 static int64_t s_notice_until_us;
@@ -307,6 +336,235 @@ static bool current_type_raw(controller_block_t block, uint8_t *raw)
     return effective_cc(nanocore_block_type_cc(block), raw);
 }
 
+static void catalog_link_changed(bool active)
+{
+    portENTER_CRITICAL(&s_catalog_lock);
+    s_catalog_link_active = active;
+    ++s_catalog_link_epoch;
+    portEXIT_CRITICAL(&s_catalog_lock);
+}
+
+static bool catalog_link_current(void)
+{
+    portENTER_CRITICAL(&s_catalog_lock);
+    bool current = s_catalog_link_active &&
+                   s_catalog_link_epoch == s_catalog_cache_epoch;
+    portEXIT_CRITICAL(&s_catalog_lock);
+    return current;
+}
+
+static void catalog_reset_if_needed(void)
+{
+    bool changed = false;
+    bool active;
+    portENTER_CRITICAL(&s_catalog_lock);
+    active = s_catalog_link_active;
+    if (s_catalog_cache_epoch != s_catalog_link_epoch) {
+        memset(s_catalog_names, 0, sizeof(s_catalog_names));
+        memset(s_catalog_state, 0, sizeof(s_catalog_state));
+        s_catalog_cache_epoch = s_catalog_link_epoch;
+        changed = true;
+    }
+    portEXIT_CRITICAL(&s_catalog_lock);
+    if (!changed) return;
+
+    s_catalog_inflight = false;
+    s_catalog_cursor = 0;
+    s_catalog_retry = 0;
+    s_catalog_failures = 0;
+    s_catalog_read_count = 0;
+    s_catalog_empty_count = 0;
+    s_catalog_sent_us = 0;
+    s_catalog_quiet_until_us = 0;
+    s_catalog_next_us = esp_timer_get_time() + CATALOG_START_MS * 1000LL;
+    if (active) {
+        ESP_LOGI(TAG, "CATALOG|START|AMP=30|CAB=30");
+    }
+}
+
+static void catalog_defer(unsigned ms)
+{
+    int64_t until = esp_timer_get_time() + ms * 1000LL;
+    if (until > s_catalog_quiet_until_us) {
+        s_catalog_quiet_until_us = until;
+    }
+}
+
+static void format_model_name(controller_block_t block, uint8_t id,
+                              char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    if (id >= NC_PROTO_MODEL_COUNT ||
+        (block != BLOCK_AMP && block != BLOCK_CAB)) {
+        snprintf(out, out_len, "UNKNOWN");
+        return;
+    }
+
+    unsigned group = block == BLOCK_AMP ? 0 : 1;
+    uint8_t state = 0;
+    char name[NC_PROTO_MODEL_NAME_LEN + 1] = {0};
+    portENTER_CRITICAL(&s_catalog_lock);
+    if (s_catalog_link_active && s_catalog_link_epoch == s_catalog_cache_epoch) {
+        state = s_catalog_state[group][id];
+        memcpy(name, s_catalog_names[group][id], sizeof(name));
+    }
+    portEXIT_CRITICAL(&s_catalog_lock);
+
+    if (state == 1 && name[0]) {
+        snprintf(out, out_len, "%s", name);
+    } else if (state == 2) {
+        snprintf(out, out_len, "SLOT %02u EMPTY", id);
+    } else {
+        const char *factory = block == BLOCK_AMP
+            ? nanocore_spec_amp_model_name(id)
+            : nanocore_spec_cab_model_name(id);
+        /* '?' is a deliberate indication that this is not a device read. */
+        snprintf(out, out_len, "%s ?", factory ? factory : "UNKNOWN");
+    }
+}
+
+static controller_block_t catalog_current_block(void)
+{
+    return s_catalog_cursor < NC_PROTO_MODEL_COUNT ? BLOCK_AMP : BLOCK_CAB;
+}
+
+static uint8_t catalog_current_id(void)
+{
+    return (uint8_t)(s_catalog_cursor % NC_PROTO_MODEL_COUNT);
+}
+
+static void catalog_advance(bool success)
+{
+    s_catalog_inflight = false;
+    s_catalog_retry = 0;
+    ++s_catalog_cursor;
+
+    if (success) {
+        s_catalog_failures = 0;
+    } else {
+        ++s_catalog_failures;
+        /* Do not hammer a firmware/transport that rejects this opcode. */
+        if (s_catalog_failures >= CATALOG_MAX_FAILURES &&
+            s_catalog_cursor % NC_PROTO_MODEL_COUNT != 0) {
+            ESP_LOGW(TAG, "CATALOG|SKIP|remaining %s records after %u failures",
+                     s_catalog_cursor < NC_PROTO_MODEL_COUNT ? "AMP" : "CAB",
+                     s_catalog_failures);
+            s_catalog_cursor = s_catalog_cursor < NC_PROTO_MODEL_COUNT
+                ? NC_PROTO_MODEL_COUNT : CATALOG_TOTAL;
+        }
+    }
+    if (s_catalog_cursor % NC_PROTO_MODEL_COUNT == 0) {
+        s_catalog_failures = 0;
+    }
+    s_catalog_next_us = esp_timer_get_time() + CATALOG_GAP_MS * 1000LL;
+    if (s_catalog_cursor >= CATALOG_TOTAL) {
+        ESP_LOGI(TAG, "CATALOG|DONE|read=%u/%u|empty=%u|unread=%u",
+                 s_catalog_read_count, (unsigned)CATALOG_TOTAL,
+                 s_catalog_empty_count,
+                 (unsigned)(CATALOG_TOTAL - s_catalog_read_count));
+    }
+}
+
+static void catalog_failed(void)
+{
+    s_catalog_inflight = false;
+    if (s_catalog_retry == 0) {
+        s_catalog_retry = 1;
+        s_catalog_next_us = esp_timer_get_time() + CATALOG_EVENT_GAP_MS * 1000LL;
+    } else {
+        catalog_advance(false);
+    }
+}
+
+static void service_model_catalog(void)
+{
+    if (!s_midi_ready || !catalog_link_current() ||
+        s_catalog_cursor >= CATALOG_TOTAL) return;
+    int64_t now = esp_timer_get_time();
+
+    if (s_catalog_inflight) {
+        if (now - s_catalog_sent_us >= CATALOG_TIMEOUT_MS * 1000LL) {
+            ESP_LOGW(TAG, "CATALOG|TIMEOUT|%s|slot=%u|seq=%u",
+                     catalog_current_block() == BLOCK_AMP ? "AMP" : "CAB",
+                     catalog_current_id(), s_catalog_seq);
+            catalog_failed();
+        }
+        return;
+    }
+
+    /* User input, preset recall and mapper capture take precedence. */
+    if (s_recall_pending || s_recall_poll_inflight ||
+        s_tuner_on || s_screen == UI_SCREEN_NAME_EDITOR ||
+        nanocore_mapper_is_enabled() ||
+        now < s_catalog_next_us || now < s_catalog_quiet_until_us) {
+        return;
+    }
+
+    esp_err_t rc = nanocore_protocol_request_model_catalog(
+        catalog_current_block(), catalog_current_id(), &s_catalog_seq);
+    if (rc == ESP_OK) {
+        s_catalog_inflight = true;
+        s_catalog_sent_us = now;
+    } else {
+        ESP_LOGW(TAG, "CATALOG|TX_FAILED|%s|slot=%u|%s",
+                 catalog_current_block() == BLOCK_AMP ? "AMP" : "CAB",
+                 catalog_current_id(), esp_err_to_name(rc));
+        catalog_failed();
+    }
+}
+
+static void handle_catalog_event(const nanocore_protocol_event_t *e)
+{
+    if (!s_midi_ready || !s_catalog_inflight ||
+        s_catalog_cursor >= CATALOG_TOTAL ||
+        e->catalog_seq != s_catalog_seq ||
+        e->block != catalog_current_block()) return;
+
+    uint8_t id = catalog_current_id();
+    if (e->catalog_status != 0) {
+        ESP_LOGW(TAG, "CATALOG|REJECTED|%s|slot=%u|status=%u",
+                 e->block == BLOCK_AMP ? "AMP" : "CAB", id, e->catalog_status);
+        catalog_advance(false);
+        return;
+    }
+    if (e->slot != id) {
+        /* A stale or mismatched record must never label a different slot. */
+        return;
+    }
+    if (e->model_present && !e->model_name[0]) {
+        ESP_LOGW(TAG, "CATALOG|EMPTY_NAME|%s|slot=%u",
+                 e->block == BLOCK_AMP ? "AMP" : "CAB", id);
+        catalog_failed();
+        return;
+    }
+
+    unsigned group = e->block == BLOCK_AMP ? 0 : 1;
+    bool accepted = false;
+    portENTER_CRITICAL(&s_catalog_lock);
+    if (s_catalog_link_active && s_catalog_link_epoch == s_catalog_cache_epoch) {
+        s_catalog_state[group][id] = e->model_present ? 1 : 2;
+        memcpy(s_catalog_names[group][id], e->model_name,
+               sizeof(s_catalog_names[group][id]));
+        accepted = true;
+    }
+    portEXIT_CRITICAL(&s_catalog_lock);
+    if (!accepted) return;
+
+    ++s_catalog_read_count;
+    if (!e->model_present) ++s_catalog_empty_count;
+    ESP_LOGI(TAG, "CATALOG|%s|slot=%u|name=%s",
+             e->block == BLOCK_AMP ? "AMP" : "CAB", id,
+             e->model_present ? e->model_name : "<EMPTY>");
+    catalog_advance(true);
+
+    uint8_t selected_id;
+    if (s_screen == UI_SCREEN_BLOCK_EDITOR && s_selected_parameter == 1 &&
+        s_selected_block == e->block &&
+        current_type_raw(e->block, &selected_id) && selected_id == id) {
+        render_ui();
+    }
+}
+
 static const nanocore_effect_type_info_t *current_type_info(
     controller_block_t block)
 {
@@ -366,10 +624,16 @@ static esp_err_t set_profile_param(controller_block_t block,
             &info->params[param_index], normalized,
             value, sizeof(value));
 
+        char model_text[48];
+        const char *type_name = info->name;
+        if (nanocore_spec_editor_is_model_block(block)) {
+            format_model_name(block, info->id, model_text, sizeof(model_text));
+            type_name = model_text;
+        }
         ESP_LOGI(TAG,
                  "%s %s %s -> norm=%.6f value=%s",
                  nanocore_block_name(block),
-                 info->name,
+                 type_name,
                  info->params[param_index].name,
                  (double)normalized,
                  value);
@@ -420,12 +684,18 @@ static esp_err_t send_editor_type_raw(controller_block_t block,
     }
 
     if (rc == ESP_OK) {
+        char model_text[48];
+        const char *type_name = info->name;
+        if (nanocore_spec_editor_is_model_block(block)) {
+            format_model_name(block, raw_type, model_text, sizeof(model_text));
+            type_name = model_text;
+        }
         ESP_LOGI(TAG,
                  "%s %s -> %s (raw=%u params=%u)",
                  nanocore_block_name(block),
                  nanocore_spec_editor_is_model_block(block)
                      ? "MODEL" : "TYPE",
-                 info->name, raw_type, info->expected_param_count);
+                 type_name, raw_type, info->expected_param_count);
     }
 
     return rc;
@@ -1089,7 +1359,13 @@ static void render_ui(void)
                 nanocore_spec_editor_type_by_selector(
                     s_selected_block, (size_t)selector);
             if (selected_type) {
-                u.parameter_text = selected_type->name;
+                if (nanocore_spec_editor_is_model_block(s_selected_block)) {
+                    format_model_name(s_selected_block, selected_type->id,
+                                      parameter_text, sizeof(parameter_text));
+                    u.parameter_text = parameter_text;
+                } else {
+                    u.parameter_text = selected_type->name;
+                }
             }
         }
     } else if (info && s_selected_block == BLOCK_DELAY &&
@@ -1339,6 +1615,7 @@ static void ble_event_handler(void *handler_args,
             nanocore_protocol_set_connected(true);
             render_ui();
             restore_current_preset_to_nanocore();
+            catalog_link_changed(true);
         }
         break;
 
@@ -1357,6 +1634,7 @@ static void ble_event_handler(void *handler_args,
         clear_block_state();
         s_ble_connected = false;
         s_midi_ready = false;
+        catalog_link_changed(false);
         s_tuner_on = false;
         s_conn_handle = BLE_CONN_HANDLE_INVALID;
         s_midi_char_handle = 0;
@@ -1617,6 +1895,14 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 {
     if (!e) return;
 
+    if (e->type == NC_PROTO_EVENT_MODEL_CATALOG) {
+        handle_catalog_event(e);
+        return;
+    }
+    catalog_defer(e->type == NC_PROTO_EVENT_LIVE_STATE ||
+                  e->type == NC_PROTO_EVENT_PRESET_NAME
+                      ? CATALOG_IDLE_MS : CATALOG_EVENT_GAP_MS);
+
     switch (e->type) {
     case NC_PROTO_EVENT_LIVE_STATE:
         s_recall_poll_inflight = false;
@@ -1812,10 +2098,11 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         }
         s_editor_models_after_live = false;
 
-        const char *amp_name = e->amp_model_known
-            ? nanocore_spec_amp_model_name(e->amp_model) : NULL;
-        const char *cab_name = e->cab_model_known
-            ? nanocore_spec_cab_model_name(e->cab_model) : NULL;
+        char amp_text[48], cab_text[48];
+        format_model_name(BLOCK_AMP, e->amp_model, amp_text, sizeof(amp_text));
+        format_model_name(BLOCK_CAB, e->cab_model, cab_text, sizeof(cab_text));
+        const char *amp_name = e->amp_model_known ? amp_text : NULL;
+        const char *cab_name = e->cab_model_known ? cab_text : NULL;
 
         ESP_LOGI(TAG,
                  "MODEL|slot=%u|AMP=%s(%u)|CAB=%s(%u)",
@@ -1871,7 +2158,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07 / FULL DYNAMIC EDITOR");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 07.1 / AMP CAB CATALOG");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
@@ -1905,6 +2192,7 @@ void app_main(void)
     bool last_tap_active = tempo_engine_tap_active();
 
     while (1) {
+        catalog_reset_if_needed();
         /*
          * Rotation is coalesced: one fast physical turn may arrive as +20
          * detents, which updates the model once and renders once instead of
@@ -1912,6 +2200,7 @@ void app_main(void)
          */
         int enc1 = input_manager_take_encoder_delta(1);
         int enc2 = input_manager_take_encoder_delta(2);
+        if (enc1 || enc2) catalog_defer(CATALOG_IDLE_MS);
         if (enc1) handle_encoder_delta(1, enc1);
         if (enc2) handle_encoder_delta(2, enc2);
 
@@ -1919,6 +2208,7 @@ void app_main(void)
         TickType_t input_wait = pdMS_TO_TICKS(10);
         if (input_wait < 1) input_wait = 1;
         if (input_manager_get_event(&e, input_wait)) {
+            catalog_defer(CATALOG_IDLE_MS);
             handle_input(e);
         }
 
@@ -1933,6 +2223,7 @@ void app_main(void)
         }
 
         service_recall_sync();
+        service_model_catalog();
         nanocore_mapper_service(
             s_midi_ready,
             s_recall_pending || s_recall_poll_inflight);

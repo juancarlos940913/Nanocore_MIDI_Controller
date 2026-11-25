@@ -14,6 +14,8 @@ extern "C" {
 
 #define NC_PROTO_MAX_PARAMS       9
 #define NC_PROTO_SYNTH_MAX_PARAMS 8
+#define NC_PROTO_MODEL_COUNT      30
+#define NC_PROTO_MODEL_NAME_LEN   16
 
 typedef enum {
     NC_PROTO_EVENT_NONE = 0,
@@ -23,6 +25,7 @@ typedef enum {
     NC_PROTO_EVENT_PRESET_NAME,
     NC_PROTO_EVENT_PRESET_MODELS,
     NC_PROTO_EVENT_PARAM_VALUE,
+    NC_PROTO_EVENT_MODEL_CATALOG,
 } nanocore_protocol_event_type_t;
 
 typedef struct {
@@ -68,6 +71,12 @@ typedef struct {
 
     uint8_t param_index;
     float param_value;
+
+    /* Read-only AMP/CAB catalog record (0x36 / 0x56). */
+    uint16_t catalog_seq;
+    uint8_t catalog_status;
+    bool model_present;
+    char model_name[NC_PROTO_MODEL_NAME_LEN + 1];
 } nanocore_protocol_event_t;
 
 esp_err_t nanocore_protocol_init(void);
@@ -82,6 +91,11 @@ esp_err_t nanocore_protocol_request_preset_name(uint8_t slot);
  * indices. Unlike live opcode 0x63, these values are the real 0..29 model ids.
  */
 esp_err_t nanocore_protocol_request_preset_models(uint8_t slot);
+
+/* Request a single read-only model catalog record. The echoed sequence,
+ * block and slot identify its reply; no model data or presets are written. */
+esp_err_t nanocore_protocol_request_model_catalog(
+    controller_block_t block, uint8_t model_id, uint16_t *seq_out);
 
 /*
  * Set one block's effect type using the same 0x6D live-edit command family

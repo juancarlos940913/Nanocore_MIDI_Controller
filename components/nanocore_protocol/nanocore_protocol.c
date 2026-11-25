@@ -32,8 +32,10 @@
 #define OP_ACTIVE_SLOT         0x01
 #define OP_BLOCK_STATE         0x02
 #define OP_PARAM_VALUE         0x06
+#define OP_AMP_CATALOG         0x36
 #define OP_READ_PRESET         0x41
 #define OP_SAVE_PRESET         0x46
+#define OP_CAB_CATALOG         0x56
 #define OP_LIVE_STATE          0x63
 #define OP_PING                0x68
 #define OP_SET_FIELD           0x6D
@@ -43,6 +45,8 @@
 
 #define SEG_MORE               0x10
 #define SEG_LAST               0x11
+#define CATALOG_RECORD_LEN       30
+#define CATALOG_NAME_OFFSET      14
 
 #define PROTO_EVENT_QUEUE      16
 #define REASSEMBLY_MAX       2048
@@ -67,6 +71,7 @@ static nanocore_protocol_event_t s_event_scratch;
 
 static volatile bool s_connected;
 static uint8_t s_seq;
+static portMUX_TYPE s_seq_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t s_wait_save_slot = 0xFF;
 
 typedef struct {
@@ -80,6 +85,16 @@ typedef struct {
 
 static reassembly_t s_reassembly;
 
+/* Catalog records are short, and must never replace the in-progress
+ * 0x63/0x41 reassembly if a user action arrives during the background read. */
+static struct {
+    bool active;
+    uint16_t seq;
+    uint16_t opcode;
+    uint16_t received;
+    uint8_t data[CATALOG_RECORD_LEN];
+} s_catalog_reply;
+
 static float read_float32_le(const uint8_t *p)
 {
     float value = 0.0f;
@@ -89,9 +104,12 @@ static float read_float32_le(const uint8_t *p)
 
 static uint8_t next_seq(void)
 {
+    portENTER_CRITICAL(&s_seq_lock);
     s_seq = (uint8_t)((s_seq + 1) & 0x7F);
     if (s_seq == 0) s_seq = 1;
-    return s_seq;
+    uint8_t seq = s_seq;
+    portEXIT_CRITICAL(&s_seq_lock);
+    return seq;
 }
 
 static nanocore_protocol_event_t *scratch_event(
@@ -692,6 +710,103 @@ static void dispatch_complete_reply(uint16_t opcode,
     }
 }
 
+/* USB captures document a normal status-0 response; BLE may deliver the
+ * same record through the 0x10/0x11 segmented envelope. Decode both without
+ * touching the normal live/preset reassembly buffer. */
+static void emit_catalog_reply(uint16_t opcode, uint16_t seq, uint8_t status,
+                               const uint8_t *payload, size_t len)
+{
+    if (status == 0) {
+        if (len != CATALOG_RECORD_LEN ||
+            payload[0] >= NC_PROTO_MODEL_COUNT ||
+            payload[1] > 1) {
+            ESP_LOGW(TAG, "Invalid catalog record op=0x%02X len=%u",
+                     opcode, (unsigned)len);
+            return;
+        }
+        if (payload[1] != 0) {
+            for (size_t i = 0; i < NC_PROTO_MODEL_NAME_LEN; ++i) {
+                uint8_t c = payload[CATALOG_NAME_OFFSET + i];
+                if (c == 0) break;
+                if (c < 0x20 || c > 0x7E) {
+                    ESP_LOGW(TAG, "Invalid ASCII catalog name op=0x%02X slot=%u",
+                             opcode, payload[0]);
+                    return;
+                }
+            }
+        }
+    }
+
+    nanocore_protocol_event_t *e =
+        scratch_event(NC_PROTO_EVENT_MODEL_CATALOG);
+    e->block = opcode == OP_AMP_CATALOG ? BLOCK_AMP : BLOCK_CAB;
+    e->catalog_seq = seq;
+    e->catalog_status = status;
+    if (status == 0) {
+        e->slot = payload[0];
+        e->model_present = payload[1] != 0;
+        if (e->model_present) {
+            for (size_t i = 0; i < NC_PROTO_MODEL_NAME_LEN; ++i) {
+                uint8_t c = payload[CATALOG_NAME_OFFSET + i];
+                if (c == 0) break;
+                e->model_name[i] = (char)c;
+            }
+        }
+    }
+    queue_event(e);
+}
+
+static void handle_catalog_reply(const uint8_t *msg, size_t len)
+{
+    uint8_t raw[96] = {0};
+    size_t raw_len = unpack7(&msg[5], len - 6, raw, sizeof(raw));
+    if (raw_len < 8 || raw[0] != 0x02) return;
+
+    uint16_t seq = (uint16_t)(raw[1] | ((uint16_t)raw[2] << 8));
+    uint16_t opcode = (uint16_t)(raw[3] | ((uint16_t)raw[4] << 8));
+    uint8_t status = raw[5];
+    uint16_t body_len = (uint16_t)(raw[6] | ((uint16_t)raw[7] << 8));
+    if ((opcode != OP_AMP_CATALOG && opcode != OP_CAB_CATALOG) ||
+        raw_len != (size_t)8 + body_len) return;
+
+    const uint8_t *body = &raw[8];
+    if (status != SEG_MORE && status != SEG_LAST) {
+        s_catalog_reply.active = false;
+        emit_catalog_reply(opcode, seq, status, body, body_len);
+        return;
+    }
+
+    if (body_len < 4) return;
+    uint16_t total = (uint16_t)(body[0] | ((uint16_t)body[1] << 8));
+    uint16_t offset = (uint16_t)(body[2] | ((uint16_t)body[3] << 8));
+    size_t data_len = body_len - 4;
+    if (total != CATALOG_RECORD_LEN || data_len == 0 ||
+        (size_t)offset + data_len > total) {
+        s_catalog_reply.active = false;
+        return;
+    }
+
+    if (offset == 0) {
+        s_catalog_reply.active = true;
+        s_catalog_reply.seq = seq;
+        s_catalog_reply.opcode = opcode;
+        s_catalog_reply.received = 0;
+    }
+    if (!s_catalog_reply.active || s_catalog_reply.seq != seq ||
+        s_catalog_reply.opcode != opcode ||
+        s_catalog_reply.received != offset) return;
+
+    memcpy(&s_catalog_reply.data[offset], &body[4], data_len);
+    s_catalog_reply.received += (uint16_t)data_len;
+    if (status == SEG_LAST) {
+        if (s_catalog_reply.received == CATALOG_RECORD_LEN) {
+            emit_catalog_reply(opcode, seq, 0, s_catalog_reply.data,
+                               CATALOG_RECORD_LEN);
+        }
+        s_catalog_reply.active = false;
+    }
+}
+
 static void handle_segmented_reply(const uint8_t *msg, size_t len)
 {
     if (len < 14) return;
@@ -851,6 +966,7 @@ void nanocore_protocol_set_connected(bool connected)
 {
     s_connected = connected;
     memset(&s_reassembly, 0, sizeof(s_reassembly));
+    memset(&s_catalog_reply, 0, sizeof(s_catalog_reply));
 
     if (connected && nanocore_midi_is_ready()) {
         (void)send_short_command(OP_PING);
@@ -885,6 +1001,29 @@ esp_err_t nanocore_protocol_request_preset_models(uint8_t slot)
      * splitting it exactly at the 59-byte boundary.
      */
     return send_read_preset_window(slot, 220, 59);
+}
+
+esp_err_t nanocore_protocol_request_model_catalog(
+    controller_block_t block, uint8_t model_id, uint16_t *seq_out)
+{
+    if (!s_connected || !nanocore_midi_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!seq_out || model_id >= NC_PROTO_MODEL_COUNT ||
+        (block != BLOCK_AMP && block != BLOCK_CAB)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t opcode = block == BLOCK_AMP ? OP_AMP_CATALOG : OP_CAB_CATALOG;
+    uint8_t seq = next_seq();
+    const uint8_t logical[] = {0x02, seq, 0, opcode, 0, 1, 0, model_id};
+    uint8_t msg[24] = {0xF0, NC_MFR, NC_TAG_N, NC_TAG_C, NC_DIR_HOST};
+    size_t packed = pack7(logical, sizeof(logical), &msg[5],
+                          sizeof(msg) - 6);
+    if (!packed) return ESP_FAIL;
+    msg[5 + packed] = 0xF7;
+    *seq_out = seq;
+    return nanocore_midi_send_sysex(msg, 6 + packed);
 }
 
 esp_err_t nanocore_protocol_set_block_type(
@@ -1006,6 +1145,11 @@ void nanocore_protocol_on_sysex(const uint8_t *msg, size_t len)
     // also prevents a one-segment 0x68 reply from disturbing a larger 0x63
     // or 0x41 BLE reassembly in progress.
     if (msg[9] == OP_PING) return;
+
+    if (msg[9] == OP_AMP_CATALOG || msg[9] == OP_CAB_CATALOG) {
+        handle_catalog_reply(msg, len);
+        return;
+    }
 
     /* Short save ACK uses the verified direct, non-packed shape. */
     if (msg[9] == OP_SAVE_PRESET &&

@@ -237,3 +237,8 @@ Preset SAVE remains NanoCore-authoritative:
 - controller NVS mirror follows only after device ACK
 
 Synth Mode is the next stage only after this matrix passes.
+
+
+## Stage 07.1 follow-up: real AMP/CAB catalog
+
+See [STAGE07_1_MODEL_CATALOG.md](STAGE07_1_MODEL_CATALOG.md) for the new read-only model-name synchronization and physical validation plan. Stage 07's type/model IDs, parameter ranges, SAVE and NVS semantics remain unchanged.
