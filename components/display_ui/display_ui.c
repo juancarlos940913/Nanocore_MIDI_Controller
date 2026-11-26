@@ -362,20 +362,20 @@ static void levels_screen(const display_ui_state_t *s)
     text(30,119,"INPUT GAIN",C_WHITE,2);
     if(s->levels_known) snprintf(buf,sizeof(buf),"%d dB",(int)s->input_gain_db);
     else snprintf(buf,sizeof(buf),"UNKNOWN");
-    text(300,119,buf,s->levels_known?C_GREEN:C_YELLOW,2);
-    text(30,145,s->levels_row==0 && s->levels_wait?"WAIT READBACK":s->levels_row==0 && s->levels_edit?"ENC2: -20 TO +20 dB (1 dB STEPS)":"ENC1 EDIT / READ (-20 TO +20 dB)",C_MUTED,1);
+    text(300,119,buf,s->levels_edit && s->levels_row==0?C_ORANGE:s->levels_known?C_GREEN:C_YELLOW,2);
+    text(30,145,s->levels_row==0 && s->levels_wait?"WAIT READBACK":s->levels_row==0 && s->levels_edit?"ENC2 ADJUST / ENC1 APPLY":"ENC1 EDIT / READ (-20 TO +20 dB)",C_MUTED,1);
     fill_rect(18,173,444,70,s->levels_row==1?C_PANEL2:C_PANEL);
     rect(18,173,444,70,s->levels_row==1?C_CYAN:C_MUTED,2);
     text(30,185,"PRESET VOLUME",C_WHITE,2);
     if(s->level_raw_known) snprintf(buf,sizeof(buf),"%u%%",(unsigned)s->level_raw);
     else snprintf(buf,sizeof(buf),"--");
-    text(340,185,buf,s->level_raw_known?C_GREEN:C_YELLOW,2);
+    text(340,185,buf,s->levels_edit && s->levels_row==1?C_ORANGE:s->level_raw_known?C_GREEN:C_YELLOW,2);
     rect(30,208,200,10,C_MUTED,1);
     if(s->level_raw_known && s->level_raw>0)
         fill_rect(31,209,198*(int)s->level_raw/100,8,C_GREEN);
     text(250,210,s->levels_row==1 && s->levels_wait?"WAIT READBACK":"0-100%",C_MUTED,1);
-    text(30,226,s->levels_row==1 && s->levels_edit?"ENC2 ADJUST 1%":"ENC1 EDIT / READ VOLUME",C_MUTED,1);
-    text_center(LCD_W/2,264,"TURN AMP DOWN BEFORE ADJUSTING",C_ORANGE,1);
+    text(30,226,s->levels_row==1 && s->levels_edit?"ENC2 ADJUST / ENC1 APPLY":"ENC1 EDIT / READ VOLUME",C_MUTED,1);
+    text_center(LCD_W/2,264,s->levels_edit?"ENC2 CLICK CANCEL / BACK":"TURN AMP DOWN BEFORE ADJUSTING",C_ORANGE,1);
 }
 
 static void block_editor(const display_ui_state_t *s)

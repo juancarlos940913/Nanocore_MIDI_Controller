@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_gatt.h"
+#include "host/ble_hs.h"
 
 static const char *TAG = "NC_MIDI";
 
@@ -27,6 +28,27 @@ static uint16_t midi_timestamp_ms(void)
 {
     // BLE-MIDI uses a rolling 13-bit millisecond timestamp.
     return (uint16_t)((esp_timer_get_time() / 1000ULL) & 0x1FFF);
+}
+
+/* ENOMEM (NimBLE rc=6) is local queue/buffer pressure, not a pedal ACK.
+ * Retry only the ATT packet that was rejected, never accepted fragments.
+ * Healthy writes incur no delay; cap retries and bind to original link. */
+static int write_packet_retry(uint16_t conn,uint16_t handle,const uint8_t *packet,
+                              uint16_t len,size_t offset)
+{
+    for(unsigned attempt=0;;++attempt) {
+        if(!nanocore_midi_is_ready() || conn!=s_conn_handle ||
+           handle!=s_midi_char_handle) return BLE_HS_ENOTCONN;
+        int rc=ble_gattc_write_no_rsp_flat(conn,handle,packet,len);
+        if(rc!=BLE_HS_ENOMEM || attempt>=8) {
+            if(!rc && attempt)
+                ESP_LOGI(TAG,"BLE|TX_RECOVERED|off=%u|retries=%u",(unsigned)offset,attempt);
+            return rc;
+        }
+        ESP_LOGW(TAG,"BLE|TX_BACKPRESSURE|off=%u|retry=%u",(unsigned)offset,attempt+1);
+        TickType_t ticks=pdMS_TO_TICKS(20);
+        vTaskDelay(ticks?ticks:1);
+    }
 }
 
 static esp_err_t send_ble_midi_message(const uint8_t *midi,
@@ -56,11 +78,8 @@ static esp_err_t send_ble_midi_message(const uint8_t *midi,
     }
 
     // BLE-MIDI MIDI I/O requires Write Without Response.
-    int rc = ble_gattc_write_no_rsp_flat(
-        s_conn_handle,
-        s_midi_char_handle,
-        packet,
-        (uint16_t)(midi_len + 2));
+    int rc = write_packet_retry(s_conn_handle,s_midi_char_handle,
+                                packet,(uint16_t)(midi_len+2),0);
 
     if (rc != 0) {
         ESP_LOGE(TAG,
@@ -161,6 +180,7 @@ esp_err_t nanocore_midi_send_sysex(const uint8_t *sysex, size_t len)
      * A long SysEx continues in the next packet without a second F0.
      */
     const size_t max_midi = 18;
+    const uint16_t conn=s_conn_handle, handle=s_midi_char_handle;
     size_t off = 0;
 
     while (off < len) {
@@ -173,11 +193,7 @@ esp_err_t nanocore_midi_send_sysex(const uint8_t *sysex, size_t len)
         packet[1] = 0x80 | (ts & 0x7F);
         memcpy(&packet[2], &sysex[off], chunk);
 
-        int rc = ble_gattc_write_no_rsp_flat(
-            s_conn_handle,
-            s_midi_char_handle,
-            packet,
-            (uint16_t)(chunk + 2));
+        int rc = write_packet_retry(conn,handle,packet,(uint16_t)(chunk+2),off);
 
         if (rc != 0) {
             ESP_LOGE(TAG, "BLE SysEx write failed rc=%d off=%u",

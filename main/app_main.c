@@ -156,6 +156,7 @@ static bool s_synth_selected;
 static bool s_levels_selected, s_levels_known, s_levels_wait, s_levels_edit;
 static bool s_levels_write_ready, s_levels_write_pending;
 static int8_t s_levels_target_db;
+static int s_levels_draft;
 static uint8_t s_levels_row, s_level_raw;
 static bool s_level_raw_known;
 static bool s_volume_write_pending;
@@ -203,6 +204,7 @@ static uint16_t s_scene_seq;
 static int64_t s_scene_deadline;
 static bool s_scene_target_mode;
 static uint8_t s_scene_read_retries;
+static bool s_scene_repair_full;
 static bool s_scene_fault;
 static controller_scene_profile_t s_scene_profile;
 static controller_scene_profile_t s_scene_name_scratch;
@@ -364,6 +366,7 @@ static void clear_block_state(void)
     s_level_raw_known=false;
     s_volume_write_pending=false;
     s_base_volume_known=false;
+    s_levels_edit=false;
     s_levels_selected=false;
     s_sound_origin_valid = false;
     s_discard_action = DISCARD_NONE;
@@ -492,6 +495,48 @@ static void levels_read(void)
         s_levels_deadline=esp_timer_get_time()+2500000LL;
         slot_probe_request(true);
     } else show_notice("LEVEL READ FAILED");
+}
+
+/* ENC1 finishes a local draft. No per-detent MIDI and no optimistic mirror.
+ * ENC2 back cancels an uncommitted draft. Saving remains the existing chord. */
+static void levels_commit(void)
+{
+    if(!s_levels_edit || !s_midi_ready || scene_busy() || s_scene_fault ||
+       s_recall_pending || s_recall_poll_inflight || s_catalog_inflight ||
+       s_slot_probe_pending || s_slot_probe_inflight || s_levels_wait ||
+       s_volume_write_pending) return;
+    s_levels_edit=false;
+    if(s_levels_row==0) {
+        if(!s_levels_known || !s_levels_write_ready) return;
+        if(s_levels_draft==s_input_gain_db) return;
+        int8_t target=(int8_t)s_levels_draft;
+        mark_edit_dirty();
+        if(nanocore_protocol_set_input_gain(target,&s_levels_seq)!=ESP_OK) {
+            s_levels_known=false;
+            s_levels_write_ready=false;
+            show_notice("INPUT GAIN TX FAILED");
+            return;
+        }
+        s_levels_wait=true;
+        s_levels_write_pending=true;
+        s_levels_target_db=target;
+        s_levels_deadline=esp_timer_get_time()+2500000LL;
+        ESP_LOGI(TAG,"LEVEL|COMMIT|input_db=%d",(int)target);
+    } else {
+        if(!s_level_raw_known || s_levels_draft==s_level_raw) return;
+        uint8_t target=(uint8_t)s_levels_draft;
+        mark_edit_dirty();
+        if(nanocore_protocol_set_preset_volume(target)!=ESP_OK) {
+            s_level_raw_known=false;
+            show_notice("VOLUME TX FAILED");
+            return;
+        }
+        s_volume_target=target;
+        s_volume_write_pending=true;
+        s_volume_deadline=esp_timer_get_time()+4000000LL;
+        slot_probe_request(false);
+        ESP_LOGI(TAG,"LEVEL|COMMIT|volume=%u",target);
+    }
 }
 
 static void service_recall_sync(void)
@@ -1363,12 +1408,22 @@ static bool scene_send_model_redundant(controller_block_t block, uint8_t model)
     return true;
 }
 
-static bool scene_send_profile(void)
+static bool scene_send_profile(bool repair)
 {
     const controller_scene_profile_t *p = &s_scene_profile;
     esp_err_t rc;
     if (!s_midi_ready || !s_synth_mode_known ||
         s_synth_mode != (p->synth_mode != 0)) return false;
+
+    /* Prioritize bypass of a delay that must be OFF, before model/type
+     * traffic. Final on/off write below still follows type selection. */
+    if(!p->block[BLOCK_DELAY].on &&
+       (!s_block_known[BLOCK_DELAY] || s_block_on[BLOCK_DELAY])) {
+        rc=send_cc(nanocore_block_onoff_cc(BLOCK_DELAY),0);
+        if(rc!=ESP_OK) return false;
+        ESP_LOGI(TAG,"SCENE|DELAY_OFF_EARLY");
+        vTaskDelay(pdMS_TO_TICKS(MIDI_ACTION_GAP_MS));
+    }
 
     if (p->synth_mode &&
         (!s_synth_voice_known || s_synth_voice != p->synth_voice ||
@@ -1396,8 +1451,8 @@ static bool scene_send_profile(void)
              * also gets three transmissions on a changed/unknown ID or
              * after a failed/cross-mode recall, but leave unchanged CAB
              * alone to avoid unnecessary IR reloads. */
-            bool reassert=block==BLOCK_AMP || s_scene_force_models ||
-                          !same_type || !s_cab_model_known;
+            bool reassert=(!repair && block==BLOCK_AMP) || s_scene_force_models ||
+                          !same_type || (block==BLOCK_AMP?!s_amp_model_known:!s_cab_model_known);
             if (reassert) {
                 if(!scene_send_model_redundant(block,r->type)) {
                     if(block==BLOCK_AMP) s_amp_model_known=false;
@@ -1414,7 +1469,7 @@ static bool scene_send_profile(void)
                 }
                 type_written = true;
             } else {
-                ESP_LOGI(TAG,"SCENE|MODEL_TX_SKIP|block=CAB|model=%u|unchanged_tx_target",r->type);
+                ESP_LOGI(TAG,"SCENE|MODEL_TX_SKIP|block=%s|model=%u|unchanged_tx_target",block==BLOCK_AMP?"AMP":"CAB",r->type);
             }
             if (!same_params || type_written) {
                 for (uint8_t i = 0; i < r->count; ++i) {
@@ -1465,11 +1520,18 @@ static void scene_send_and_verify(void)
 {
     s_scene_phase = SCENE_VERIFY;
     s_scene_read_retries = 0;
+    s_scene_repair_full=false;
     queue_notice("APPLYING SCENE");
-    if (!scene_send_profile()) {
-        scene_fail("SCENE EFFECT TX FAILED");
-        return;
-    }
+    if (!scene_send_profile(false)) {
+        if(!s_midi_ready || !nanocore_midi_is_ready()) {
+            scene_fail("SCENE EFFECT TX FAILED");
+            return;
+        }
+        /* Partial application: read actual state before one corrective pass.
+         * Even a coincidentally matching vector cannot prove model identity. */
+        s_scene_repair_full=true;
+        ESP_LOGW(TAG,"SCENE|TX_PARTIAL|refresh_before_repair");
+    } else s_scene_force_models=false;
     (void)scene_start_read(SCENE_VERIFY);
 }
 
@@ -1692,8 +1754,19 @@ static void scene_handle_live(const nanocore_protocol_event_t *e)
             scene_send_and_verify();
         }
     } else if (phase == SCENE_VERIFY) {
-        if (!scene_verify(e)) {
+        if (s_scene_repair_full || !scene_verify(e)) {
             if (s_scene_read_retries++ < 1) {
+                bool full=s_scene_repair_full;
+                s_scene_repair_full=false;
+                s_scene_force_models=full;
+                ESP_LOGW(TAG,"SCENE|REPAIR|full_models=%u",(unsigned)full);
+                /* LIVE has already refreshed all parameter/on-off mirrors.
+                 * Correct the mismatches rather than simply poll again. */
+                if(!scene_send_profile(true)) {
+                    scene_fail("SCENE REPAIR TX FAILED");
+                    return;
+                }
+                s_scene_force_models=false;
                 (void)scene_start_read(SCENE_VERIFY);
                 return;
             }
@@ -2424,9 +2497,9 @@ static void render_ui(void)
         .levels_wait=s_levels_wait || s_volume_write_pending || s_slot_probe_inflight,
         .levels_edit=s_levels_edit,
         .levels_row=s_levels_row,
-        .input_gain_db=s_input_gain_db,
+        .input_gain_db=(s_levels_edit && s_levels_row==0)?(int8_t)s_levels_draft:s_input_gain_db,
         .level_raw_known=s_level_raw_known,
-        .level_raw=s_level_raw,
+        .level_raw=(s_levels_edit && s_levels_row==1)?(uint8_t)s_levels_draft:s_level_raw,
         .synth_voice_known = s_synth_voice_known,
         .synth_voice_on = s_synth_voice_on,
         .editor_read_only = scene_busy() || s_scene_fault ||
@@ -2914,32 +2987,13 @@ static void handle_encoder_delta(uint8_t encoder, int delta)
         return; /* First rotation cancels only, never edits. */
     }
     if(s_screen==UI_SCREEN_LEVELS) {
-        if(s_volume_write_pending) return;
+        if(s_volume_write_pending || s_levels_wait) return;
         if(encoder==1 && !s_levels_edit) s_levels_row=(uint8_t)(delta>0?1:0);
-        else if(encoder==2 && s_levels_edit && s_levels_row==1 && s_level_raw_known &&
-                !s_levels_wait && !s_slot_probe_pending && !s_slot_probe_inflight &&
-                !s_recall_pending && !s_catalog_inflight && !s_scene_fault && s_midi_ready) {
-            int next=(int)s_level_raw+(delta>0?1:-1);
-            if(next>=0 && next<=100) {
-                if(nanocore_protocol_set_preset_volume((uint8_t)next)==ESP_OK) {
-                    mark_edit_dirty();
-                    s_volume_target=(uint8_t)next;
-                    s_volume_write_pending=true;
-                    s_volume_deadline=esp_timer_get_time()+4000000LL;
-                    slot_probe_request(false);
-                } else show_notice("VOLUME TX FAILED");
-            }
-        }
-        else if(encoder==2 && s_levels_edit && s_levels_row==0 && s_levels_known && s_levels_write_ready &&
-                !s_levels_wait && !s_slot_probe_inflight && s_midi_ready) {
-            int next=(int)s_input_gain_db+(delta>0?1:-1);
-            if(next>=-20 && next<=20 && nanocore_protocol_set_input_gain((int8_t)next,&s_levels_seq)==ESP_OK) {
-                mark_edit_dirty();
-                s_levels_wait=true;
-                s_levels_write_pending=true;
-                s_levels_target_db=(int8_t)next;
-                s_levels_deadline=esp_timer_get_time()+2500000LL;
-            }
+        else if(encoder==2 && s_levels_edit) {
+            int min=s_levels_row==0?-20:0, max=s_levels_row==0?20:100;
+            /* Consume the complete accumulated detent delta, not its sign. */
+            int next=s_levels_draft+delta;
+            s_levels_draft=next<min?min:next>max?max:next;
         }
         render_ui();
         return;
@@ -3069,19 +3123,22 @@ static void handle_input(input_event_t e)
     }
 
     if(s_screen==UI_SCREEN_LEVELS) {
+        if(s_levels_wait || s_volume_write_pending) return;
         if(e==INPUT_ENC2_CLICK) {
+            if(s_levels_edit) ESP_LOGI(TAG,"LEVEL|DRAFT_CANCEL");
             s_levels_edit=false;
             s_screen=UI_SCREEN_PERFORMANCE;
             nanocore_protocol_set_level_diagnostics(false);
             s_notice[0]='\0';
         } else if(e==INPUT_ENC1_CLICK) {
-            if(s_levels_row==1) {
-                if(s_volume_write_pending || s_slot_probe_pending || s_slot_probe_inflight) return;
-                if(!s_level_raw_known) { s_levels_edit=false; slot_probe_request(true); }
-                else s_levels_edit=!s_levels_edit;
-            }
-            else if(!s_levels_known || !s_levels_write_ready) levels_read();
-            else if(!s_levels_wait) s_levels_edit=!s_levels_edit;
+            if(s_slot_probe_pending || s_slot_probe_inflight || s_catalog_inflight ||
+               s_recall_pending || s_recall_poll_inflight || s_scene_fault || !s_midi_ready) return;
+            if(s_levels_edit) levels_commit();
+            else if(s_levels_row==1) {
+                if(!s_level_raw_known) slot_probe_request(true);
+                else { s_levels_draft=s_level_raw; s_levels_edit=true; }
+            } else if(!s_levels_known || !s_levels_write_ready) levels_read();
+            else { s_levels_draft=s_input_gain_db; s_levels_edit=true; }
         }
         render_ui();
         return;
@@ -3315,8 +3372,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             } else ESP_LOGI(TAG,"LEVEL|CONFIRMED|input_db=%d",(int)s_input_gain_db);
             s_levels_write_pending=false;
         } else if(e->global_push && !s_levels_wait) {
-            if(s_levels_known && s_input_gain_db!=e->input_gain_db && !scene_busy() && !s_recall_pending)
+            if(s_levels_known && s_input_gain_db!=e->input_gain_db && !scene_busy() && !s_recall_pending) {
+                if(s_levels_edit && s_levels_row==0) { s_levels_edit=false; queue_notice("GAIN CHANGED - EDIT AGAIN"); }
                 mark_edit_dirty();
+            }
             s_levels_known=true;
             s_input_gain_db=e->input_gain_db;
         }
@@ -3402,7 +3461,10 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
                 queue_notice("VOLUME NOT CONFIRMED");
             } else ESP_LOGI(TAG,"LEVEL|VOLUME_CONFIRMED|value=%u",e->live_header_byte);
         }
-        if(level_changed && !was_recall && s_scene_phase==SCENE_IDLE) mark_edit_dirty();
+        if(level_changed && !was_recall && s_scene_phase==SCENE_IDLE) {
+            if(s_levels_edit && s_levels_row==1) { s_levels_edit=false; queue_notice("VOLUME CHANGED - EDIT AGAIN"); }
+            mark_edit_dirty();
+        }
         if(level_known && (!s_level_raw_known || s_level_raw!=e->live_header_byte))
             ESP_LOGI(TAG,"LEVEL|PRESET_VOLUME|slot=%u|value=%u",e->slot,e->live_header_byte);
         s_level_raw_known=level_known;
@@ -3706,7 +3768,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10F / REDUNDANT SCENE MODEL TX");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10G / BLE RETRY + LEVEL DRAFT");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
