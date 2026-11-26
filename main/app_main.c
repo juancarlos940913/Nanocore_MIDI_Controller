@@ -57,6 +57,9 @@ static const uint8_t MIDI_CHAR_UUID[16]    = BLE_MIDI_CHAR_UUID128;
 #define CC_TUNER                 80
 
 #define MIDI_ACTION_GAP_MS       28
+#define SCENE_MODEL_TX_COUNT       3
+#define SCENE_MODEL_TX_GAP_MS     20
+#define SCENE_MODEL_SETTLE_MS     40
 #define RECALL_FIRST_SYNC_MS    600
 #define RECALL_RETRY_MS         250
 #define RECALL_REPLY_TIMEOUT_MS 900
@@ -206,7 +209,7 @@ static controller_scene_profile_t s_scene_name_scratch;
 static bool s_scene_saved[CTRL_SCENE_COUNT];
 static bool s_base_mode_known;
 static bool s_base_mode;
-static bool s_scene_verified_models;
+static bool s_scene_models_tx_completed;
 static bool s_scene_force_models;
 static int64_t s_scene_started_us;
 
@@ -357,7 +360,7 @@ static void show_notice(const char *text)
 static void clear_block_state(void)
 {
     /* Keep last mode as a write lock until the next authoritative read. */
-    s_scene_verified_models = false;
+    s_scene_models_tx_completed = false;
     s_level_raw_known=false;
     s_volume_write_pending=false;
     s_base_volume_known=false;
@@ -1268,7 +1271,7 @@ static void scene_fail(const char *notice)
     s_sound_origin_valid=false;
     s_discard_action=DISCARD_NONE;
     s_pending_scene_delta = 0;
-    s_scene_verified_models = false;
+    s_scene_models_tx_completed = false;
     s_parameter_editing = false;
     show_notice(notice);
 }
@@ -1313,7 +1316,7 @@ static void scene_select_mode(bool synth)
     if (s_synth_mode == synth && !s_scene_fault) return;
     sound_edit_begin();
     s_scene_target_mode = synth;
-    s_scene_verified_models = false;
+    s_scene_models_tx_completed = false;
     s_scene_read_retries = 0;
     s_scene_phase = SCENE_MODE_EDIT;
     s_scene_fault = false;
@@ -1333,6 +1336,33 @@ static bool scene_near(const float *a, const float *b, uint8_t count)
 }
 
 /* Exact float vectors, not default presets. Type writes also carry params. */
+/* Model selection is a live, absolute field write (0x6D/06 or /07).
+ * BLE Write Without Response cannot prove that the pedal applied it.
+ * Repeat with fresh protocol sequences; no model read or ACK wait.
+ * Retain the old settle interval after the FINAL write, since selecting
+ * a model may reload/reset parameters. Do not send model params early. */
+static bool scene_send_model_redundant(controller_block_t block, uint8_t model)
+{
+    unsigned accepted=0;
+    const char *name=block==BLOCK_AMP?"AMP":"CAB";
+    for(unsigned attempt=1;attempt<=SCENE_MODEL_TX_COUNT;++attempt) {
+        if(!s_midi_ready || !nanocore_midi_is_ready()) return false;
+        esp_err_t rc=nanocore_protocol_set_block_model(block,model);
+        if(rc==ESP_OK) ++accepted;
+        ESP_LOGI(TAG,"SCENE|MODEL_TX|block=%s|model=%u|attempt=%u/%u|%s",
+                 name,model,attempt,(unsigned)SCENE_MODEL_TX_COUNT,esp_err_to_name(rc));
+        if(attempt<SCENE_MODEL_TX_COUNT)
+            vTaskDelay(pdMS_TO_TICKS(SCENE_MODEL_TX_GAP_MS));
+    }
+    ESP_LOGI(TAG,"SCENE|MODEL_TX_RESULT|block=%s|model=%u|accepted=%u/%u",
+             name,model,accepted,(unsigned)SCENE_MODEL_TX_COUNT);
+    /* A failed enqueue is not an applied model. With fewer than two
+     * accepted sends, fail the scene and require a deliberate retry. */
+    if(accepted<2 || !s_midi_ready || !nanocore_midi_is_ready()) return false;
+    vTaskDelay(pdMS_TO_TICKS(SCENE_MODEL_SETTLE_MS));
+    return true;
+}
+
 static bool scene_send_profile(void)
 {
     const controller_scene_profile_t *p = &s_scene_profile;
@@ -1361,12 +1391,20 @@ static bool scene_send_profile(void)
             scene_near(s_block_params[b], r->params, r->count);
         bool type_written = false;
         if (model) {
-            /* Only elide a model write after a successful same-mode scene
-             * recall with an unchanged trusted TX mirror. Cross-mode or
-             * unknown state always writes explicitly. */
-            if (s_scene_force_models || !same_type) {
-                rc = nanocore_protocol_set_block_model(block, r->type);
-                if (rc != ESP_OK) return false;
+            /* Never skip AMP on a saved Guitar scene: even a same-ID
+             * local mirror may describe a missed previous write. CAB
+             * also gets three transmissions on a changed/unknown ID or
+             * after a failed/cross-mode recall, but leave unchanged CAB
+             * alone to avoid unnecessary IR reloads. */
+            bool reassert=block==BLOCK_AMP || s_scene_force_models ||
+                          !same_type || !s_cab_model_known;
+            if (reassert) {
+                if(!scene_send_model_redundant(block,r->type)) {
+                    if(block==BLOCK_AMP) s_amp_model_known=false;
+                    else s_cab_model_known=false;
+                    return false;
+                }
+                /* TX target mirror only, not physical model confirmation. */
                 if (block == BLOCK_AMP) {
                     s_amp_model = r->type;
                     s_amp_model_known = true;
@@ -1375,7 +1413,8 @@ static bool scene_send_profile(void)
                     s_cab_model_known = true;
                 }
                 type_written = true;
-                vTaskDelay(pdMS_TO_TICKS(40));
+            } else {
+                ESP_LOGI(TAG,"SCENE|MODEL_TX_SKIP|block=CAB|model=%u|unchanged_tx_target",r->type);
             }
             if (!same_params || type_written) {
                 for (uint8_t i = 0; i < r->count; ++i) {
@@ -1541,6 +1580,10 @@ static void scene_save_from_live(const nanocore_protocol_event_t *e)
              p->synth_mode, p->name);
     ESP_LOGI(TAG,"SCENE|VOLUME_SAVED|value=%u",p->preset_volume);
     ESP_LOGI(TAG,"SCENE|GAIN_SAVED|db=%d",(int)s_gain_capture_db);
+    if(!p->synth_mode)
+        ESP_LOGI(TAG,"SCENE|MODELS_SAVED|preset=%u|scene=%c|AMP=%u|CAB=%u|source=local_target",
+                 s_runtime.current_preset,'A'+s_runtime.current_scene,
+                 p->block[BLOCK_AMP].type,p->block[BLOCK_CAB].type);
     show_notice("SCENE SAVED TO CONTROLLER");
 }
 
@@ -1549,7 +1592,7 @@ static void scene_finish_ready(void)
         s_scene_phase = SCENE_IDLE;
         s_scene_fault = false;
         clear_edit_dirty();
-        s_scene_verified_models = !s_scene_profile.synth_mode &&
+        s_scene_models_tx_completed = !s_scene_profile.synth_mode &&
                                   s_amp_model_known && s_cab_model_known;
         s_preset.active_scene = s_runtime.current_scene;
         (void)persist_runtime();
@@ -1559,6 +1602,9 @@ static void scene_finish_ready(void)
                  s_scene_profile.synth_mode, s_scene_profile.name);
         if(s_scene_profile.volume_valid) ESP_LOGI(TAG,"SCENE|VOLUME_OK|value=%u",s_level_raw);
         ESP_LOGI(TAG,"SCENE|GAIN_OK|db=%d",(int)s_input_gain_db);
+        if(!s_scene_profile.synth_mode)
+            ESP_LOGI(TAG,"SCENE|MODELS_TARGET|AMP=%u|CAB=%u|verification=tx_only",
+                     s_scene_profile.block[BLOCK_AMP].type,s_scene_profile.block[BLOCK_CAB].type);
         show_notice("SCENE READY");
 }
 
@@ -1714,10 +1760,14 @@ static void apply_current_scene(void)
     }
     s_scene_fault = false;
     s_scene_target_mode = s_scene_profile.synth_mode != 0;
-    s_scene_force_models = !s_scene_verified_models || s_synth_mode != s_scene_target_mode;
-    s_scene_verified_models = false;
+    s_scene_force_models = !s_scene_models_tx_completed || s_synth_mode != s_scene_target_mode;
+    s_scene_models_tx_completed = false;
     s_scene_started_us = esp_timer_get_time();
     s_scene_read_retries = 0;
+    if(!s_scene_profile.synth_mode)
+        ESP_LOGI(TAG,"SCENE|MODELS_REQUESTED|preset=%u|scene=%c|AMP=%u|CAB=%u",
+                 s_runtime.current_preset,'A'+s_runtime.current_scene,
+                 s_scene_profile.block[BLOCK_AMP].type,s_scene_profile.block[BLOCK_CAB].type);
     ESP_LOGI(TAG, "SCENE|APPLY|preset=%u|scene=%c|mode=%u",
              s_runtime.current_preset + 1, 'A' + s_runtime.current_scene,
              s_scene_profile.synth_mode);
@@ -2003,7 +2053,7 @@ static void toggle_tuner(void)
 
 static void toggle_block(controller_block_t block)
 {
-    s_scene_verified_models = false;
+    s_scene_models_tx_completed = false;
     uint8_t cc = nanocore_block_onoff_cc(block);
     uint8_t current = 0;
 
@@ -2040,7 +2090,7 @@ static void adjust_parameter(int delta)
     if (delta == 0 || scene_busy() || s_scene_fault || s_selected_block >= BLOCK_COUNT) return;
     if ((s_runtime.mode == CTRL_MODE_SCENE || s_synth_mode) &&
         (!s_midi_ready || !s_synth_mode_known || s_recall_pending)) return;
-    s_scene_verified_models = false;
+    s_scene_models_tx_completed = false;
 
     if (s_synth_selected) {
         if (!s_synth_voice_known) return;
@@ -3362,7 +3412,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             if (changed && !was_recall && s_scene_phase == SCENE_IDLE && s_synth_mode_known) {
                 sound_edit_begin();
                 sound_edit_confirm(e);
-                s_scene_verified_models = false;
+                s_scene_models_tx_completed = false;
             }
             s_synth_mode_known = true;
             s_synth_mode = e->synth_mode;
@@ -3480,7 +3530,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
         if (s_runtime.mode == CTRL_MODE_SCENE || s_synth_mode) {
             if (changed) {
                 mark_edit_dirty();
-                s_scene_verified_models = false;
+                s_scene_models_tx_completed = false;
             }
             render_ui();
             break;
@@ -3614,7 +3664,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
             s_synth_params[e->param_index] = e->param_value;
             if (changed) {
                 mark_edit_dirty();
-                s_scene_verified_models = false;
+                s_scene_models_tx_completed = false;
             }
             render_ui();
         }
@@ -3642,7 +3692,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
              */
             if (changed) {
                 mark_edit_dirty();
-                s_scene_verified_models = false;
+                s_scene_models_tx_completed = false;
             }
             render_ui();
         }
@@ -3656,7 +3706,7 @@ static void handle_protocol_event(const nanocore_protocol_event_t *e)
 void app_main(void)
 {
     ESP_LOGI(TAG, "==============================================");
-    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10E / PRESET + SCENE GAIN AND VOLUME");
+    ESP_LOGI(TAG, " NANOCORE MIDI CONTROLLER - STAGE 10F / REDUNDANT SCENE MODEL TX");
     ESP_LOGI(TAG, " ESP32-S3 N16R8 + ST7796S 3.5");
     ESP_LOGI(TAG, "==============================================");
 
